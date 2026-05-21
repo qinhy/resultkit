@@ -12,11 +12,26 @@ ColorFormat = Model4Mat.ImageMat.ColorFormat
 img = store.add_new_obj(Model4Mat.ImageMat.from_url("./examples/img1.jpg",
                                                 color_format=ColorFormat.RGB))
 
-imgv = store.add_new_obj(Model4Mat.ImageMatView(data=np.array([[0, 0],[0.8, 0.9]]),
+imgv = [store.add_new_obj(Model4Mat.ImageMatView(data=np.array([[0, 0],[0.5, 0.5]]),
                                                 scale=Model4Mat.ImageMatView.ScaleFormat.ZERO_ONE,
                                                 mode=Model4Mat.ImageMatView.Mode.HWxyxy,
-                                                controller=img.controller))
+                                                controller=img.controller)),
+        store.add_new_obj(Model4Mat.ImageMatView(data=np.array([[0.5, 0.5],[1.0, 1.0]]),
+                                                scale=Model4Mat.ImageMatView.ScaleFormat.ZERO_ONE,
+                                                mode=Model4Mat.ImageMatView.Mode.HWxyxy,
+                                                controller=img.controller)),
+        store.add_new_obj(Model4Mat.ImageMatView(data=np.array([[0, 0.5],[0.5, 1.0]]),
+                                                scale=Model4Mat.ImageMatView.ScaleFormat.ZERO_ONE,
+                                                mode=Model4Mat.ImageMatView.Mode.HWxyxy,
+                                                controller=img.controller)),
+        store.add_new_obj(Model4Mat.ImageMatView(data=np.array([[0.5, 0],[1.0, 0.5]]),
+                                                scale=Model4Mat.ImageMatView.ScaleFormat.ZERO_ONE,
+                                                mode=Model4Mat.ImageMatView.Mode.HWxyxy,
+                                                controller=img.controller)),
+        ]
 
+
+img.safe_update_data((np.random.rand(512, 512)*255.0).astype(np.uint8))
 img = img.to_torch()
 
 person_bbox = store.add_new_obj(BoundingBox(data=np.array([[10, 20, 220, 440]], dtype=np.float32),
@@ -30,7 +45,7 @@ person_bbox = store.add_new_obj(BoundingBox(data=np.array([[10, 20, 220, 440]], 
 face_bbox = store.add_new_obj(person_bbox.model_copy())
 
 person_bbox.controller.add_child(face_bbox.get_id())
-imgv.controller.add_child(person_bbox.get_id())
+# imgv.controller.add_child(person_bbox.get_id())
 
 def AI_detetion(person_bbox=person_bbox,face_bbox=face_bbox):
     person_bbox.update(data=np.array([[80,992,3488,2608]]),
@@ -46,7 +61,12 @@ def AI_detetion(person_bbox=person_bbox,face_bbox=face_bbox):
 AI_detetion(person_bbox,face_bbox)
 
 img.pil_show()
-imgv.pil_show()
+[r.pil_show() for r in imgv]
+
+
+
+def AI_detetions(imgs=imgv):
+    data = [i.get_data() for i in imgv]
 
 # print(np.shares_memory(img.get_data(),imgv.get_data()))
 

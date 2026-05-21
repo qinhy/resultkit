@@ -67,7 +67,7 @@ class Model4Mat:
             return self.controller.update(**kwargs).model
 
         def safe_update_data(self,data:Union[np.ndarray,torch.Tensor]):
-            model = self.__class__(**{**self.model_dump(),'data':data})
+            model = self.__class__(**{**self.model_dump(exclude=['lib','device','dtype']),'data':data})
             model.validate()
             return self.controller.update(**{**model.model_dump(),'data':model.data}).model
 
@@ -153,13 +153,19 @@ class Model4Mat:
         color_format: ColorFormat = ColorFormat.GRAY
         shape_type: ShapeType = ShapeType.UNKNOWN
         dtype: DataType = DataType.UNKNOWN
+        BCHW: tuple[int, int, int, int] = Field(default=(0, 0, 0, 0))
         path: Optional[str] = None
+
         data: Union[np.ndarray, torch.Tensor] = Field(
             default_factory=lambda: np.zeros((1, 1), dtype=np.uint8),
             exclude=True,
         )
-        BCHW: tuple[int, int, int, int] = Field(default=(0, 0, 0, 0))
 
+
+        def safe_update_data(self,data:Union[np.ndarray,torch.Tensor]):
+            model = self.__class__(**{'color_format':Model4Mat.ImageMat.ColorFormat.UNKNOWN,'data':data})
+            return self.controller.update(**{**model.model_dump(),'data':model.data}).model
+        
         def init(self):
             super().init()
 
@@ -174,9 +180,9 @@ class Model4Mat:
 
             if self.color_format == cls.ColorFormat.UNKNOWN:
                 if C == 1:
-                    self.color_format = cls.ColorFormat.GRAY
+                    self.color_format = cls.ColorFormat.GRAY # or Bayer
                 elif C == 3:
-                    self.color_format = cls.ColorFormat.RGB
+                    self.color_format = cls.ColorFormat.RGB # or BGR
                 else:
                     raise ValueError(f"Unsupported number of channels: {C}")
                 
@@ -333,10 +339,10 @@ class Model4Mat:
                 color_format=color_format,
                 data=data)
         
-        def pil_show(self):
+        def pil_show(self,title=None):
             tmp = self.to_numpy(tmp=True)
             img = Image.fromarray(tmp.data)
-            img.show()
+            img.show(title=title)
 
         def crop_bbox(self,bbox:"Model4Mat.BoundingBox", copy=True):
             xyxy = bbox.get_raw_xyxy()
@@ -344,15 +350,17 @@ class Model4Mat:
             ops = self.get_ops()
             res = []
             for i in range(len(xyxy)):
-                crop = self.data[int(y1[i]):int(y2[i]),int(x1[i]):int(x2[i])]
+                crop = self.get_data()[int(y1[i]):int(y2[i]),int(x1[i]):int(x2[i])]
                 crop = ops.copy_mat(crop) if copy else crop
-                img = self.model_copy(update={'data':crop})
-                img.init()
-                img.validate()
+                img = Model4Mat.ImageMat(**{'color_format':self.color_format,
+                                        'shape_type':self.shape_type,
+                                        'dtype':self.dtype,
+                                        'BCHW':self.BCHW,
+                                        'data':crop})
                 res.append(img)
             return res
         
-        def crop_by_children(self):
+        def crop_by_children(self)->List["Model4Mat.ImageMat"]:
             res = []
             for child, depth in self.yield_children_recursive():
                 if isinstance(child, Model4Mat.BoundingBox):
@@ -414,33 +422,49 @@ class Model4Mat:
                 raise ValueError(f"Unsupported mode: {self.mode}")
 
             res = (int(H_from), int(H_to), int(W_from), int(W_to))
-
-            # target2view3x3 = np.array([
-            #     [1, 0, -W_from],
-            #     [0, 1, -H_from],
-            #     [0, 0, 1],
-            # ], dtype=dtype)
-
             return res
 
+        def unsafe_get_data(self):
+            img:Model4Mat.ImageMat = self.controller.storage().get(self.target_img_id)
+            res_func,H_from,H_to,W_from,W_to = self._ranges["last"]
+            return res_func(img.get_data(),H_from,H_to,W_from,W_to)
+        
         def get_data(self):
             img:Model4Mat.ImageMat = self.controller.storage().get(self.target_img_id)
+            self.color_format = img.color_format
+            self.shape_type = img.shape_type
+            self.dtype = img.dtype
+            self.BCHW = img.BCHW
+
             if self.mode == self.Mode.ALL:
                 return self.view_from_ranges(img.get_data(), self.data)
         
             (a,b),(c,d) = self.data
             data = ((a,b),(c,d))
-            key = (img.shape_type, self.mode, data)
+            key = (img.shape_type, img.shape(), self.mode, data)
             res = self._ranges.get(key)
             if res is not None:
                 res_func,H_from,H_to,W_from,W_to = res
+                self.target2view3x3 = [
+                    [1, 0, -W_from],
+                    [0, 1, -H_from],
+                    [0, 0, 1]]
+                self.view2target3x3 = [
+                    [1, 0, W_from],
+                    [0, 1, H_from],
+                    [0, 0, 1]]                
+                self._ranges["last"] = res
                 return res_func(img.get_data(),H_from,H_to,W_from,W_to)
-            
-            self.color_format = img.color_format
-            self.shape_type = img.shape_type
-            self.dtype = img.dtype
 
             H_from,H_to,W_from,W_to = self.calc_hw_range(self.data, img.size())
+            self.target2view3x3 = [
+                [1, 0, -W_from],
+                [0, 1, -H_from],
+                [0, 0, 1]]
+            self.view2target3x3 = [
+                [1, 0, W_from],
+                [0, 1, H_from],
+                [0, 0, 1]]
             
             if img.shape_type == Model4Mat.ImageMat.ShapeType.BCHW:
                 res_func = lambda data,H_from,H_to,W_from,W_to:data[:,:,H_from:H_to,W_from:W_to]
@@ -451,7 +475,7 @@ class Model4Mat:
             else:
                 raise ValueError(f"Unsupported shape type: {img.shape_type}")
             
-            self._ranges[key] = (res_func,H_from,H_to,W_from,W_to)
+            self._ranges["last"] = self._ranges[key] = res_func,H_from,H_to,W_from,W_to
             return res_func(img.get_data(),H_from,H_to,W_from,W_to)
             
         @staticmethod
@@ -483,10 +507,10 @@ class Model4Mat:
                     data = data.squeeze(0)
             return data.numpy()
         
-        def pil_show(self):
+        def pil_show(self,title=None):
             tmp = self.get_data_numpy()
             img = Image.fromarray(tmp)
-            img.show()
+            img.show(title=title)
 
 
     class BoundingBox(Mat):        
