@@ -312,7 +312,7 @@ class Model4Mat:
                 return res
         
         @staticmethod
-        def from_url(url,color_format=ColorFormat.RGB):
+        def from_url(url:str,color_format=ColorFormat.RGB):
             if url.startswith("http"):
                 response = requests.get(url)
                 img = Image.open(BytesIO(response.content))
@@ -469,55 +469,3 @@ class MatStore(BasicStore):
         res = self.find_all(f'*:{id}') if fa else []
         return res[0] if len(res) == 1 else None
     
-if __name__ == '__main__':
-    store = MatStore()
-    mat = store.add_new_obj(Model4Mat.ImageMat(
-                color_format=Model4Mat.ImageMat.ColorFormat.GRAY,
-                data=np.ones((4,4),dtype=np.uint8)))
-    
-    print(mat.get_id())
-    print(mat.data)
-
-    mat = mat.to_torch()
-    print(mat.get_id())
-    print(mat.data)
-
-    mat = mat.to_numpy()
-    print(mat.get_id())
-    print(mat.data)
-
-    cmat = store.add_new_obj(Model4Mat.BoundingBox())
-    mat.controller.add_child(cmat.get_id())
-    print(cmat.get_ops())
-    cmat.to_cxcywh()
-    print(store.get(mat.get_id()))
-    print(store.get(cmat.get_id()))
-
-    
-    # BoundingBox, Keypoints, ResultNode, ResultSet, TextSpan, Vector
-    lib = MatStore()
-    BoundingBox = Model4Mat.BoundingBox
-    ColorFormat = Model4Mat.ImageMat.ColorFormat
-
-    img = lib.add_new_obj(Model4Mat.ImageMat.from_url("./examples/img1.jpg",
-                                                    color_format=ColorFormat.RGB))
-
-    person_bbox = lib.add_new_obj(BoundingBox(data=np.array([[10, 20, 220, 440]], dtype=np.float32),
-                                            labels=['person'],
-                                            labels_id=np.array([0], dtype=np.int32),
-                                            scores=np.array([0.98], dtype=np.float32),
-                                            scale=BoundingBox.ScaleFormat.RAW,
-                                            format=BoundingBox.AxisFormat.XYXY,
-                                            image_size=img.size()))
-
-    img.controller.add_child(person_bbox.get_id())
-
-    from ultralytics import YOLO
-    yolo = YOLO("yolov8n.pt")
-    results = yolo.predict(img.data)[0] #one image
-
-    person_bbox.update(data=results.boxes.xyxy,
-                    labels_id=results.boxes.cls,
-                    scores=results.boxes.conf,
-                    labels=[results.names[int(i)] for i in results.boxes.cls],
-                    )

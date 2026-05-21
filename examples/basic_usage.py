@@ -5,14 +5,14 @@ import numpy as np
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from resultkit.MatModel import Model4Mat, MatStore
 # BoundingBox, Keypoints, ResultNode, ResultSet, TextSpan, Vector
-lib = MatStore()
+store = MatStore.build()
 BoundingBox = Model4Mat.BoundingBox
 ColorFormat = Model4Mat.ImageMat.ColorFormat
 
-img = lib.add_new_obj(Model4Mat.ImageMat.from_url("./examples/img1.jpg",
+img = store.add_new_obj(Model4Mat.ImageMat.from_url("./examples/img1.jpg",
                                                 color_format=ColorFormat.RGB))
 
-person_bbox = lib.add_new_obj(BoundingBox(data=np.array([[10, 20, 220, 440]], dtype=np.float32),
+person_bbox = store.add_new_obj(BoundingBox(data=np.array([[10, 20, 220, 440]], dtype=np.float32),
                                           labels=['person'],
                                           labels_id=np.array([0], dtype=np.int32),
                                           scores=np.array([0.98], dtype=np.float32),
@@ -20,7 +20,7 @@ person_bbox = lib.add_new_obj(BoundingBox(data=np.array([[10, 20, 220, 440]], dt
                                           format=BoundingBox.AxisFormat.XYWH,
                                           image_size=img.size()))
 
-face_bbox = lib.add_new_obj(person_bbox.model_copy())
+face_bbox = store.add_new_obj(person_bbox.model_copy())
 
 person_bbox.controller.add_child(face_bbox.get_id())
 img.controller.add_child(person_bbox.get_id())

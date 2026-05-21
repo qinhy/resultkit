@@ -7,9 +7,9 @@ from uuid import uuid4
 from datetime import datetime, timezone
 from pydantic import BaseModel, ConfigDict, Field
 try:
-    from Storages import SingletonKeyValueStorage, DictStorage
+    from Storages import DictStorageController, DictStorage
 except Exception as e:
-    from .Storages import SingletonKeyValueStorage, DictStorage
+    from .Storages import DictStorageController, DictStorage
 try:
     from typing import ParamSpec  # Py 3.10+
 except ImportError:               # Py <3.10 -> pip install typing_extensions
@@ -64,11 +64,11 @@ class Controller4Basic:
             
         def store(self):
             assert self.model._id is not None
-            self.storage().conn.set(self.model._id,self.model.model_dump_json_dict())
+            self.storage().set(self.model._id,self.model.model_dump_json_dict())
             return self
 
         def delete(self):
-            self.storage().conn.delete(self.model.get_id())
+            self.storage().delete(self.model.get_id())
             self.model.controller = None
 
         def update_metadata(self, key, value):
@@ -233,13 +233,12 @@ class Model4Basic:
         def get_child(self, child_id: str):
             if child_id in self.children_id:
                 return self.controller.storage().find(child_id)
-        
-class BasicStore(SingletonKeyValueStorage):
+     
+class BasicStore(DictStorageController):
     MODEL_CLASS_GROUP = Model4Basic
     
-    def __init__(self, version_controll=False) -> None:
-        super().__init__(version_controll)
-        self.switch_backend(DictStorage.build_tmp())
+    @staticmethod
+    def build(): return BasicStore(DictStorage().get_singleton())
 
     def _get_class(self, id: str, modelclass=MODEL_CLASS_GROUP):
         class_type = id.split(':')[0]
@@ -257,8 +256,11 @@ class BasicStore(SingletonKeyValueStorage):
     
     def _get_as_obj(self,id,data_dict)->MODEL_CLASS_GROUP.AbstractObj:
         if data_dict is None : return None
-        obj:Model4Basic.AbstractObj = self._get_class(id)(**data_dict)
-        obj.set_id(id).init_controller(self)
+        if isinstance(data_dict,str):
+            obj:Model4Basic.AbstractObj = self._get_class(id)(**data_dict)
+        else:
+            obj:Model4Basic.AbstractObj = data_dict
+        obj.set_id(id,ast=False).init_controller(self)
         return obj
     
     def _add_new_obj(self, obj:MODEL_CLASS_GROUP.AbstractObj, id:str=None):
@@ -286,7 +288,7 @@ class BasicStore(SingletonKeyValueStorage):
         return self._add_new_obj(obj,id)
     
     def find(self,id:str, fa:bool=True) -> MODEL_CLASS_GROUP.AbstractObj:
-        if self.conn.exists(id): return self._get_as_obj(id, self.get(id) )
+        if self.exists(id): return self._get_as_obj(id, self.get(id) )
         res = self.find_all(f'*:{id}') if fa else []
         return res[0] if len(res) == 1 else None
     
