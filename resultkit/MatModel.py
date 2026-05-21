@@ -1,6 +1,6 @@
 # from https://github.com/qinhy/singleton-key-value-storage.git
 import enum
-from typing import Any, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 import numpy as np
 from pydantic import ConfigDict, Field
 import torch
@@ -19,7 +19,8 @@ class Controller4Mat:
     class AbstractObjController(Controller4Basic.AbstractObjController):pass        
     class AbstractGroupController(Controller4Basic.AbstractGroupController):pass  
     class MatController(AbstractGroupController):pass        
-    class ImageMatController(MatController):pass        
+    class ImageMatController(MatController):pass 
+    class ImageMatViewController(ImageMatController):pass        
     class BoundingBoxController(MatController):pass
 
 class Model4Mat:
@@ -39,19 +40,22 @@ class Model4Mat:
         model_config = ConfigDict(arbitrary_types_allowed=True)
 
         def model_post_init(self, context):
-            self.init(self.data)
+            self.init()
             self.validate()
             return super().model_post_init(context)
 
+        def get_data(self):
+            return self.data
+        
         def get_ops(self):
             if self._ops is None:
                 self._ops = self.get_mat_ops(self.lib)
             return self._ops
 
-        def init(self, data):            
-            self.lib = MatLib.which(data)
-            self.device = MatDevice.which(data)
-            self.dtype = DataType.which(data)
+        def init(self):            
+            self.lib = MatLib.which(self.get_data())
+            self.device = MatDevice.which(self.get_data())
+            self.dtype = DataType.which(self.get_data())
             return self
         
         def validate(self):
@@ -156,8 +160,8 @@ class Model4Mat:
         )
         BCHW: tuple[int, int, int, int] = Field(default=(0, 0, 0, 0))
 
-        def init(self, data):
-            super().init(data)
+        def init(self):
+            super().init()
 
             cls = type(self)
             self.color_format = cls.ColorFormat(self.color_format)
@@ -166,7 +170,7 @@ class Model4Mat:
             if self.shape_type == cls.ShapeType.UNKNOWN:
                 self.shape_type = self._infer_shape_type()
 
-            B,C,H,W = self.BCHW = cls.ShapeType.to_bchw(self.shape_type, self.data)
+            B,C,H,W = self.BCHW = cls.ShapeType.to_bchw(self.shape_type, self.get_data())
 
             if self.color_format == cls.ColorFormat.UNKNOWN:
                 if C == 1:
@@ -176,7 +180,6 @@ class Model4Mat:
                 else:
                     raise ValueError(f"Unsupported number of channels: {C}")
                 
-            self.data = data
             return self
 
         def _infer_shape_type(self):
@@ -251,11 +254,11 @@ class Model4Mat:
                 if self.dtype not in {DataType.FLOAT32, DataType.FLOAT16, DataType.BFLOAT16}:
                     raise TypeError(f"Expected float dtype for torch data, got {self.dtype}")
 
-                if not bool(torch.isfinite(self.data).all()):
+                if not bool(torch.isfinite(self.get_data()).all()):
                     raise ValueError("Torch image data contains NaN or infinite values")
 
-                mi = self._to_scalar(self.get_ops().min(self.get_ops().flatten(self.data)))
-                ma = self._to_scalar(self.get_ops().max(self.get_ops().flatten(self.data)))
+                mi = self._to_scalar(self.get_ops().min(self.get_ops().flatten(self.get_data())))
+                ma = self._to_scalar(self.get_ops().max(self.get_ops().flatten(self.get_data())))
                 if mi < 0.0 or ma > 1.0:
                     raise ValueError(f"Expected torch image values in [0, 1], got {mi}~{ma}")
 
@@ -272,28 +275,37 @@ class Model4Mat:
             B,C,Height,Width = self.BCHW
             return Width, Height
         
+        
         # local edit
         def to_numpy(self, tmp=False):
             if self.lib == MatLib.NUMPY:return self
             B,C,H,W = self.BCHW
             data = (self.data*255.0).to(dtype=torch.uint8).detach().cpu()
+            shape_type = self.ShapeType.UNKNOWN
             if C==1:
-                data = data.squeeze(1).numpy()
+                data = data.squeeze(1)
+                shape_type = self.ShapeType.BHW
+                if data.shape[0]==1:
+                    data = data.squeeze(0)
+                    shape_type = self.ShapeType.HW
             else:
-                data = data.permute(0,2,3,1).numpy()
+                data = data.permute(0,2,3,1)
+                shape_type = self.ShapeType.BHWC
+                if data.shape[0]==1:
+                    data = data.squeeze(0)
+                    shape_type = self.ShapeType.HWC
 
-            self.shape_type = self.ShapeType.UNKNOWN
-            if tmp:
+            data = data.numpy()
+            if not tmp:
+                self.shape_type = shape_type
                 return self.safe_update_data(data)
             else:
-                res = self.model_copy()
-                res.data = data
-                return res
+                return self.model_copy(update={'data':data, 'shape_type':shape_type})
         
         def to_torch(self,device=None,dtype=torch.float32, tmp=False):
             if self.lib == MatLib.TORCH:return self
             B,C,H,W = self.BCHW
-            data = torch.from_numpy(self.data).to(device=device).div(255.0).to(dtype=dtype)
+            data = torch.from_numpy(self.data.copy()).to(device=device).div(255.0).to(dtype=dtype)
             if self.shape_type == self.ShapeType.HWC:
                 data = data.permute(2,0,1).unsqueeze(0)
             elif self.shape_type == self.ShapeType.BHWC:
@@ -303,14 +315,12 @@ class Model4Mat:
             elif self.shape_type == self.ShapeType.HW:
                 data = data.unsqueeze(0).unsqueeze(0)
             
-            self.shape_type = self.ShapeType.UNKNOWN
-            if tmp:
+            if not tmp:
+                self.shape_type = self.ShapeType.BCHW
                 return self.safe_update_data(data)
             else:
-                res = self.model_copy()
-                res.data = data
-                return res
-        
+                return self.model_copy(update={'data':data, 'shape_type':self.ShapeType.BCHW})
+            
         @staticmethod
         def from_url(url:str,color_format=ColorFormat.RGB):
             if url.startswith("http"):
@@ -334,9 +344,10 @@ class Model4Mat:
             ops = self.get_ops()
             res = []
             for i in range(len(xyxy)):
-                img = self.model_copy()
                 crop = self.data[int(y1[i]):int(y2[i]),int(x1[i]):int(x2[i])]
-                img.init(ops.copy_mat(crop) if copy else crop)
+                crop = ops.copy_mat(crop) if copy else crop
+                img = self.model_copy(update={'data':crop})
+                img.init()
                 img.validate()
                 res.append(img)
             return res
@@ -347,6 +358,135 @@ class Model4Mat:
                 if isinstance(child, Model4Mat.BoundingBox):
                     res += self.crop_bbox(child)
             return res
+
+
+    class ImageMatView(ImageMat):
+        class Mode(str, enum.Enum):
+            HWxyxy = "HWxyxy"
+            HWxyhw = "HWxyhw"
+            ALL = "ALL"
+
+        class ScaleFormat(str, enum.Enum):
+            ZERO_ONE = "01"
+            RAW = "raw"
+        
+        target_img_id: str=None
+        view2target3x3: list = Field(default_factory=list)
+        target2view3x3: list = Field(default_factory=list)
+        # axis info , target mat=a[:,:,:], data = [(from_a,to_a),(from_b,to_b),(from_c,to_c)...]
+        data: Union[np.ndarray, torch.Tensor] = Field(
+            default_factory=lambda: np.zeros((1, 2), dtype=np.int32),
+            exclude=True,
+        )
+        mode:Mode = Mode.HWxyxy
+        scale:ScaleFormat = ScaleFormat.RAW
+        _ranges:Dict = None
+
+        def model_post_init(self, context):
+            self.target_img_id = self.controller.model.get_id()
+            self._ranges={}
+            return super().model_post_init(context)
+        
+        def calc_hw_range(self,data,img_size):
+            width, height = img_size
+
+            if self.mode == self.Mode.HWxyxy:
+                if self.scale == self.ScaleFormat.ZERO_ONE:
+                    (H_from, W_from), (H_to, W_to) = data
+                    H_from *= height
+                    H_to *= height
+                    W_from *= width
+                    W_to *= width
+                else:
+                    (H_from, W_from), (H_to, W_to) = data
+
+            elif self.mode == self.Mode.HWxyhw:
+                if self.scale == self.ScaleFormat.ZERO_ONE:
+                    (H_from, W_from), (H_len, W_len) = data
+                    H_to = H_from + H_len * height
+                    W_to = W_from + W_len * width
+                else:
+                    (H_from, W_from), (H_len, W_len) = data
+                    H_to = H_from + H_len
+                    W_to = W_from + W_len
+
+            else:
+                raise ValueError(f"Unsupported mode: {self.mode}")
+
+            res = (int(H_from), int(H_to), int(W_from), int(W_to))
+
+            # target2view3x3 = np.array([
+            #     [1, 0, -W_from],
+            #     [0, 1, -H_from],
+            #     [0, 0, 1],
+            # ], dtype=dtype)
+
+            return res
+
+        def get_data(self):
+            img:Model4Mat.ImageMat = self.controller.storage().get(self.target_img_id)
+            if self.mode == self.Mode.ALL:
+                return self.view_from_ranges(img.get_data(), self.data)
+        
+            (a,b),(c,d) = self.data
+            data = ((a,b),(c,d))
+            key = (img.shape_type, self.mode, data)
+            res = self._ranges.get(key)
+            if res is not None:
+                res_func,H_from,H_to,W_from,W_to = res
+                return res_func(img.get_data(),H_from,H_to,W_from,W_to)
+            
+            self.color_format = img.color_format
+            self.shape_type = img.shape_type
+            self.dtype = img.dtype
+
+            H_from,H_to,W_from,W_to = self.calc_hw_range(self.data, img.size())
+            
+            if img.shape_type == Model4Mat.ImageMat.ShapeType.BCHW:
+                res_func = lambda data,H_from,H_to,W_from,W_to:data[:,:,H_from:H_to,W_from:W_to]
+            elif img.shape_type in [Model4Mat.ImageMat.ShapeType.HWC,Model4Mat.ImageMat.ShapeType.HW]:
+                res_func = lambda data,H_from,H_to,W_from,W_to:data[H_from:H_to,W_from:W_to]
+            elif img.shape_type in [Model4Mat.ImageMat.ShapeType.BHWC,Model4Mat.ImageMat.ShapeType.BHW]:
+                res_func = lambda data,H_from,H_to,W_from,W_to:data[:,H_from:H_to,W_from:W_to]
+            else:
+                raise ValueError(f"Unsupported shape type: {img.shape_type}")
+            
+            self._ranges[key] = (res_func,H_from,H_to,W_from,W_to)
+            return res_func(img.get_data(),H_from,H_to,W_from,W_to)
+            
+        @staticmethod
+        def view_from_ranges(mat, idx):
+            """
+            idx: sequence of (start, stop) pairs, one per axis.
+            Returns a NumPy view when only slices are used.
+            """
+            key = tuple(slice(start, stop) for start, stop in idx)
+            return mat[key]
+        
+        def to_numpy(self, tmp=False):raise ValueError("ImageMatView not supported!")        
+        def to_torch(self,device=None,dtype=torch.float32, tmp=False):raise ValueError("ImageMatView not supported!")        
+        @staticmethod
+        def from_url(url:str,color_format=None):raise ValueError("ImageMatView not supported!")
+        
+        def get_data_numpy(self):
+            data = self.get_data()
+            if isinstance(data,np.ndarray):return data
+            B,C,H,W = self.BCHW
+            data = (data*255.0).to(dtype=torch.uint8).detach().cpu()
+            if C==1:
+                data = data.squeeze(1)
+                if data.shape[0]==1:
+                    data = data.squeeze(0)
+            else:
+                data = data.permute(0,2,3,1)
+                if data.shape[0]==1:
+                    data = data.squeeze(0)
+            return data.numpy()
+        
+        def pil_show(self):
+            tmp = self.get_data_numpy()
+            img = Image.fromarray(tmp)
+            img.show()
 
 
     class BoundingBox(Mat):        
