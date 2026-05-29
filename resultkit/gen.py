@@ -11,10 +11,11 @@ class FrameGenerator(BaseModel):
     name: str = "gen" 
     fps: PositiveFloat = 30.0
     draw_overlay: bool = True
-    overlay_prefix: str = "OAK-D-POE SIM"
+    overlay_prefix: str = "Steam SIM"
     enable_stereo_offset: bool = True
     stereo_offset_px: int = 12
     is_mono: bool = False
+    frame_idx: int = 0
 
     @property
     def color(self):
@@ -24,15 +25,20 @@ class FrameGenerator(BaseModel):
         self.is_mono = (self.color in [Model4Mat.ImageMat.ColorFormat.GRAY, Model4Mat.ImageMat.ColorFormat.BAYER])
         return super().model_post_init(context)
     
-    def read(self) -> np.ndarray:
+    def read(self) -> Model4Mat.ImageMat:
         frame = self._make_synthetic_frame()
 
         if self.draw_overlay:
             self._draw_overlay(frame)
 
         self.frame_idx += 1
-        return frame
-
+        self.img.unsafe_update_data(frame)
+        return self.img
+    
+    def as_generator(self):
+        while True:
+            yield self.read()
+    
     def _make_synthetic_frame(self) -> np.ndarray:
         t = self.frame_idx / max(self.fps, 1.0)
 

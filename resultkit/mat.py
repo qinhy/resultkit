@@ -2,10 +2,9 @@ from __future__ import annotations
 
 import enum
 from typing import Any, ClassVar, Optional, Sequence, Union
-from uuid import uuid4
 
 import numpy as np
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict
 import torch
 
 ArrayLike = Union[np.ndarray,torch.Tensor]
@@ -364,7 +363,6 @@ class MatLib(str, enum.Enum):
         if isinstance(data, torch.Tensor):
             return MatLib.TORCH
         raise ValueError(f"Unsupported data type: {type(data)}")
-
 
 class MatDevice(str, enum.Enum):
     CPU = "cpu"
