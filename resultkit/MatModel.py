@@ -667,9 +667,9 @@ class Model4Mat:
 
     try:
         import cupy as cp
-        from .msg import Iox2CUDAIPCFrameSignal
         class ImageMatCUDAPubSub(ImageMatPubSub):
-            class MatSignal(Iox2CUDAIPCFrameSignal):pass   
+            from .msg import Iox2CUDAIPCFrameSignal
+            class MatSignal(Iox2CUDAIPCFrameSignal):pass
             
             magic:str = "CUDASI1"
             version:int = 1
