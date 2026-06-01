@@ -12,7 +12,7 @@ from resultkit.gen import FrameGenerator
 from resultkit.vis import FrameGeneratorVisualizer
 
 
-def build_image(width: int, height: int, mode: str) -> Model4Mat.ImageMat:
+def build_image(width: int, height: int, mode: str):
     if mode in {"gray", "left", "right"}:
         res = Model4Mat.ImageMatPubSub(
             color_format=Model4Mat.ImageMat.ColorFormat.GRAY,
@@ -40,6 +40,7 @@ def main() -> None:
     img = build_image(args.width, args.height, args.mode)
 
     if not args.sub:
+        img.is_pub=True
         gen = FrameGenerator(
             img=img,
             name=args.mode,
@@ -50,11 +51,11 @@ def main() -> None:
         cnt = 0
         st = time.time()
         while True:
-            gen.read().pub()
+            gen.read().assume_init().send()
             cnt += 1
-            if cnt % 100 == 0:
-                fps = 100 / (time.time() - st)
-                st = time.time()
+            te = time.time() - st
+            if cnt % 1000 == 0 and te>0:
+                fps = cnt / te
                 print(f"FPS : {fps:.2f}")
     else:
         vis = FrameGeneratorVisualizer(

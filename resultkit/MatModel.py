@@ -97,6 +97,7 @@ class Model4Mat:
             default_factory=lambda: np.random.rand(5, 5).astype(np.float32),
             exclude=True,
         )
+        is_pub: bool = Field(default=False)
 
         model_config = ConfigDict(arbitrary_types_allowed=True)
 
@@ -190,27 +191,40 @@ class Model4Mat:
 
             return self._sub
 
-        def pub(self):
+        def get_data(self):
+            if not self.is_pub:
+                return self.data
+            
+            sample = self.get_pub().loan_slice_uninit(self._n_elements)
+            self.data = self._slice_to_numpy(sample.payload())
+            return sample,self.data
+        
+        def pub(self,data=None):
             """
             Publish a NumPy matrix through iceoryx2 shared memory.
             """
-            # if data is None: data = self.data
-            data = np.asarray(self.data, dtype=self._np_dtype(), order="C")
-            n = self._n_elements
-            publisher = self.get_pub()
-            sample = publisher.loan_slice_uninit(n)
+            self.is_pub = True
+            if data is None:
+                sample,_ = self.get_data()
+                sample.assume_init().send()
+                return self
+            
+            data = np.asarray(data, dtype=self._np_dtype(), order="C")
+            sample = self.get_pub().loan_slice_uninit(self._n_elements)
             out = self._slice_to_numpy(sample.payload())
+            
             out[...] = data
             sample.assume_init().send()
             return self
 
-        def sub(self):
+        def sub(self,copy=False):
             """
             Receive one matrix.
 
             This version assumes the receiver already knows `self.data.shape`.
             For a real generic MatPubSub, publish shape metadata separately.
             """
+            self.is_pub = False
             subscriber = self.get_sub()
             sample = subscriber.receive()
             if sample is None: return self
@@ -218,7 +232,7 @@ class Model4Mat:
             # Copy before returning so the caller does not hold a dangling
             # shared-memory view after `sample` is destroyed.
             view = self._slice_to_numpy(sample.payload())
-            self.unsafe_update_data(view.copy())
+            self.unsafe_update_data(view.copy() if copy else view)
             return self
 
     class ImageMat(Mat):

@@ -28,20 +28,35 @@ class FrameGenerator(BaseModel):
         return super().model_post_init(context)
     
     def read(self):
-        frame = self._make_synthetic_frame()
+        frame = self.img.get_data()
 
-        if self.draw_overlay:
-            self._draw_overlay(frame)
+        if self.img.is_pub:
+            iox2_sample,frame = frame
 
+        self.draw(frame)
         self.frame_idx += 1
         self.img.unsafe_update_data(frame)
+
+        if self.img.is_pub:
+            return iox2_sample
+
         return self.img
     
     def as_generator(self):
         while True:
             yield self.read()
+
+    def draw(self,frame=None):        
+        # frame = self._make_synthetic_frame(frame)
+        # if self.draw_overlay:
+        #     self._draw_overlay(frame)
+        # frame[:] = (np.random.rand(*frame.shape)*255).astype(np.uint8)
+        frame.fill(0)
+        idx = np.random.choice(len(frame), int(0.1 * len(frame)), replace=False)
+        frame[idx, ...] = 125
+        return frame
     
-    def _make_synthetic_frame(self) -> np.ndarray:
+    def _make_synthetic_frame(self,frame=None) -> np.ndarray:
         t = self.frame_idx / max(self.fps, 1.0)
 
         if self.is_mono:
@@ -49,7 +64,7 @@ class FrameGenerator(BaseModel):
             frame = self._apply_stereo_offset(frame)
             return frame
 
-        return self._make_bgr_frame(t)
+        return self._make_bgr_frame(t,frame)
 
     def _make_gray_frame(self, t: float) -> np.ndarray:
         yy, xx = np.indices(
@@ -80,17 +95,18 @@ class FrameGenerator(BaseModel):
 
         return frame
 
-    def _make_bgr_frame(self, t: float) -> np.ndarray:
+    def _make_bgr_frame(self, t: float, frame=None) -> np.ndarray:
         x = np.linspace(0, 255, self.img.BCHW[-1], dtype=np.uint8)
         y = np.linspace(0, 255, self.img.BCHW[-2], dtype=np.uint8)
 
         xv = np.tile(x, (self.img.BCHW[-2], 1))
         yv = np.tile(y[:, None], (1, self.img.BCHW[-1]))
 
-        frame = np.empty(
-            (self.img.BCHW[-2], self.img.BCHW[-1], 3),
-            dtype=np.uint8,
-        )
+        if frame is None:
+            frame = np.empty(
+                (self.img.BCHW[-2], self.img.BCHW[-1], 3),
+                dtype=np.uint8,
+            )
 
         frame[..., 0] = (xv.astype(np.uint16) + self.frame_idx * 3) % 256
         frame[..., 1] = (yv.astype(np.uint16) + self.frame_idx * 2) % 256
