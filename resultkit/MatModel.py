@@ -1,7 +1,7 @@
 # from https://github.com/qinhy/singleton-key-value-storage.git
 import ctypes
 import enum
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, ClassVar, Dict, List, Optional, Tuple, Union
 import numpy as np
 from pydantic import ConfigDict, Field, PrivateAttr
 import torch
@@ -9,15 +9,26 @@ import requests
 from PIL import Image
 from io import BytesIO
 import iceoryx2 as iox2
-from resultkit.mat import to_ctypes_type, to_np_type
 
 try:    
+    from cuda import ImageMatCUDAPubSub
+    from mat import to_ctypes_type, to_np_type
     from BasicModel import Controller4Basic, Model4Basic, BasicStore
     from mat import DataType, MatOps, NumpyMatOps, TorchMatOps, MatLib, MatDevice
 except Exception as e:    
+    from .cuda import ImageMatCUDAPubSub
+    from .mat import to_ctypes_type, to_np_type
     from .BasicModel import Controller4Basic, Model4Basic, BasicStore
     from .mat import DataType, MatOps, NumpyMatOps, TorchMatOps, MatLib, MatDevice
 
+try:
+    import pycuda.driver as cuda
+    import pycuda.gpuarray as gpuarray
+except ImportError:
+    print("warning: pycuda is not available")
+    cuda = None
+    gpuarray = None
+    
 class Controller4Mat:
     class AbstractObjController(Controller4Basic.AbstractObjController):pass        
     class AbstractGroupController(Controller4Basic.AbstractGroupController):pass  
@@ -109,10 +120,38 @@ class Model4Mat:
         _np_type: Any = PrivateAttr(default=None)
         _c_type: Any = PrivateAttr(default=None)
         _n_elements: int = PrivateAttr(default=0)
+        _last_sample: Any = PrivateAttr(default=None)
 
         def model_post_init(self, context):
-            self._n_elements = int(np.prod(self.data.shape))
+            self._refresh_pubsub_layout()
             return super().model_post_init(context)
+
+        def _refresh_pubsub_layout(self):
+            """Refresh cached slice metadata from ``self.data``.
+
+            This makes ``obj.set_id(...).init()`` safe after construction and
+            keeps the iceoryx2 slice length/dtype aligned with the current
+            NumPy array.  Use ``self.data`` directly here; calling
+            ``get_data()`` would loan a publish sample when ``is_pub=True``.
+            """
+            if not isinstance(self.data, np.ndarray):
+                # CUDA subclasses may be constructed with a CuPy array before
+                # their own ``init`` runs.  They publish a fixed ctypes control
+                # message, not a CPU slice, so there is no CPU slice layout to
+                # refresh here.
+                if hasattr(self.data, "__cuda_array_interface__"):
+                    return self
+                raise TypeError(f"MatPubSub expects a NumPy array, got {type(self.data)!r}")
+            if not self.data.flags.c_contiguous:
+                self.data = np.ascontiguousarray(self.data)
+            self._n_elements = int(np.prod(self.data.shape))
+            self._np_type = None
+            self._c_type = None
+            return self
+
+        def init(self):
+            self._refresh_pubsub_layout()
+            return super().init()
 
         def topic_name(self) -> str:
             return self.get_id().replace(":", "/")
@@ -199,40 +238,61 @@ class Model4Mat:
             self.data = self._slice_to_numpy(sample.payload())
             return sample,self.data
         
-        def pub(self,data=None,edit_func=None):
-            """
-            Publish a NumPy matrix through iceoryx2 shared memory.
+        def _coerce_publish_data(self, data) -> np.ndarray:
+            arr = np.asarray(data, dtype=self._np_dtype(), order="C")
+            if arr.shape != self.shape():
+                raise ValueError(
+                    f"published data shape must be {self.shape()}, got {arr.shape}. "
+                    "Create publisher/subscriber with the same shape on both sides."
+                )
+            return arr
+
+        def pub(self, data=None, edit_func=None):
+            """Publish one NumPy matrix through iceoryx2 shared memory.
+
+            Supported fast path used by your demo::
+
+                img.pub(edit_func=draw)
+
+            ``edit_func`` receives the borrowed shared-memory NumPy array.  It
+            may edit in-place and may also return an array; a non-``None``
+            return value is copied back into the shared-memory loan.
             """
             self.is_pub = True
-            if data is None:
-                sample,data = self.get_data()
-                if edit_func is not None:
-                    edit_func(data)
-                sample.assume_init().send()
-                return self
-            
-            data = np.asarray(data, dtype=self._np_dtype(), order="C")
             sample = self.get_pub().loan_slice_uninit(self._n_elements)
             out = self._slice_to_numpy(sample.payload())
-            
-            out[...] = data
+
+            if data is not None:
+                out[...] = self._coerce_publish_data(data)
+            elif edit_func is None:
+                # No edit function means "publish the current model data".
+                out[...] = self._coerce_publish_data(self.data)
+
+            if edit_func is not None:
+                edited = edit_func(out)
+                if edited is not None and edited is not out:
+                    out[...] = self._coerce_publish_data(edited)
+
             sample.assume_init().send()
             return self
 
-        def sub(self,copy=False):
-            """
-            Receive one matrix.
+        def sub(self, copy=False):
+            """Receive one matrix.
 
-            This version assumes the receiver already knows `self.data.shape`.
-            For a real generic MatPubSub, publish shape metadata separately.
+            ``copy=False`` keeps the received iceoryx2 sample alive on the model
+            so ``img.sub().get_data()`` returns a valid NumPy view for OpenCV.
+            Use ``copy=True`` when you want a detached array that remains valid
+            after the next ``sub()`` call.
             """
             self.is_pub = False
-            subscriber = self.get_sub()
-            sample = subscriber.receive()
-            if sample is None: return self
+            sample = self.get_sub().receive()
+            if sample is None:
+                return self
 
-            # Copy before returning so the caller does not hold a dangling
-            # shared-memory view after `sample` is destroyed.
+            # Keep the sample alive while exposing a zero-copy NumPy view.
+            # Without this, the local `sample` can be destroyed before cv2.imshow
+            # consumes `img.sub().get_data()`.
+            self._last_sample = sample
             view = self._slice_to_numpy(sample.payload())
             self.unsafe_update_data(view.copy() if copy else view)
             return self
@@ -668,118 +728,86 @@ class Model4Mat:
         pass
 
     try:
-        import cupy as cp
-        CUDA_IPC_MEM_HANDLE_BYTES = 64
-        CUDA_IPC_EVENT_HANDLE_BYTES = 64
+        class ImageMatCUDAPubSub(ImageMatCUDAPubSub,ImageMatPubSub):
+            def _update_image_metadata_from_array(self, arr):
+                cls = Model4Mat.ImageMat
+                self.color_format = cls.ColorFormat(self.color_format)
+                self.shape_type = cls.ShapeType(self.shape_type)
 
-        STREAM_NAME_BYTES = 128
-        LAYOUT_BYTES = 32
-        MAX_DIMS = 8
-        
-        class ImageMatCUDAPubSub(ImageMatPubSub):
+                if self.shape_type == cls.ShapeType.UNKNOWN:
+                    ndim = int(len(arr.shape))
+                    if ndim == 2:
+                        self.shape_type = cls.ShapeType.HW
+                    elif ndim == 3:
+                        if self.color_format == cls.ColorFormat.UNKNOWN:
+                            raise ValueError(
+                                "Cannot infer 3-D PyCUDA image layout. "
+                                "Set shape_type to BHW or HWC and set color_format."
+                            )
+                        expected = cls.ColorFormat.channels(self.color_format)
+                        if int(arr.shape[-1]) == expected:
+                            self.shape_type = cls.ShapeType.HWC
+                        elif expected == 1:
+                            self.shape_type = cls.ShapeType.BHW
+                        else:
+                            raise ValueError(
+                                f"Cannot infer 3-D PyCUDA layout for shape={arr.shape} "
+                                f"and color_format={self.color_format}"
+                            )
+                    elif ndim == 4:
+                        self.shape_type = cls.ShapeType.BHWC
+                    else:
+                        raise ValueError(f"Unsupported PyCUDA image shape: {arr.shape}")
 
-            class Iox2CUDAIPCFrameSignal(ctypes.Structure):
-                """
-                Minimal CUDA IPC frame signal.
+                b, c, h, w = self.BCHW = cls.ShapeType.to_bchw(self.shape_type, arr)
 
-                Publishes:
-                - CUDA IPC memory handle
-                - CUDA IPC event handle
-                - sequence number
-                - ring-buffer slot index
-                - frame_bytes for pointer offset calculation
-                """
+                if self.color_format == cls.ColorFormat.UNKNOWN:
+                    if c == 1:
+                        self.color_format = cls.ColorFormat.GRAY
+                    elif c == 3:
+                        self.color_format = cls.ColorFormat.RGB
+                    else:
+                        raise ValueError(f"Unsupported number of channels: {c}")
 
-                payload_type = "CudaIpcFrameSignalV1"
+                try:
+                    self.dtype = DataType.which(np.empty((0,), dtype=np.dtype(arr.dtype)))
+                except Exception:
+                    pass
 
-                _fields_ = [
-                    ("magic", ctypes.c_char * 8),       # b"CUDAFS1"
-                    ("version", ctypes.c_uint32),
-                    ("slot_index", ctypes.c_uint32),
+            def init(self):
+                if isinstance(self.data, gpuarray.GPUArray):
+                    self.lib = "pycuda"
+                    self.device = MatDevice.CUDA if hasattr(MatDevice, "CUDA") else self.device
+                    self._update_image_metadata_from_array(self.data)
+                    self.validate()
+                    return self
+                return super().init()
 
-                    ("sequence", ctypes.c_uint64),
-                    ("frame_bytes", ctypes.c_uint64),
+            def validate(self):
+                if not isinstance(self.data, gpuarray.GPUArray):
+                    return super().validate()
 
-                    ("mem_handle_len", ctypes.c_uint64),
-                    ("cuda_ipc_mem_handle", ctypes.c_uint8 * CUDA_IPC_MEM_HANDLE_BYTES),
+                cls = Model4Mat.ImageMat
+                b, c, h, w = self.BCHW
+                if min(b, c, h, w) <= 0:
+                    raise ValueError(f"Invalid BCHW dimensions: {self.BCHW}")
 
-                    ("event_handle_len", ctypes.c_uint64),
-                    ("cuda_ipc_event_handle", ctypes.c_uint8 * CUDA_IPC_EVENT_HANDLE_BYTES),
-                ]
+                expected_channels = cls.ColorFormat.channels(self.color_format)
+                if c != expected_channels:
+                    raise TypeError(
+                        f"Expected {expected_channels} channels for {self.color_format}, "
+                        f"got {c} from shape_type={self.shape_type} and shape={self.shape()}"
+                    )
 
-                @classmethod
-                def new(
-                    cls,
-                    *,
-                    sequence: int,
-                    slot_index: int,
-                    frame_bytes: int,
-                    mem_handle: bytes,
-                    event_handle: bytes,
-                ) -> "Iox2CUDAIPCFrameSignal":
-                    msg = cls()
-                    msg.magic = b"CUDAFS1"
-                    msg.version = 1
-                    msg.slot_index = int(slot_index)
-                    msg.sequence = int(sequence)
-                    msg.frame_bytes = int(frame_bytes)
+                np_dtype = np.dtype(self.data.dtype)
+                if self.shape_type == cls.ShapeType.BCHW:
+                    if np_dtype not in {np.dtype("float16"), np.dtype("float32")}:
+                        raise TypeError(f"Expected float dtype for BCHW PyCUDA image data, got {np_dtype}")
+                else:
+                    if np_dtype != np.dtype("uint8"):
+                        raise TypeError(f"Expected uint8 dtype for PyCUDA image data, got {np_dtype}")
 
-                    if len(mem_handle) > CUDA_IPC_MEM_HANDLE_BYTES:
-                        raise ValueError("CUDA IPC memory handle too large")
-                    if len(event_handle) > CUDA_IPC_EVENT_HANDLE_BYTES:
-                        raise ValueError("CUDA IPC event handle too large")
-
-                    msg.mem_handle_len = len(mem_handle)
-                    msg.cuda_ipc_mem_handle[: len(mem_handle)] = mem_handle
-
-                    msg.event_handle_len = len(event_handle)
-                    msg.cuda_ipc_event_handle[: len(event_handle)] = event_handle
-
-                    return msg
-
-                def mem_handle_bytes(self) -> bytes:
-                    return bytes(self.cuda_ipc_mem_handle[: self.mem_handle_len])
-
-                def event_handle_bytes(self) -> bytes:
-                    return bytes(self.cuda_ipc_event_handle[: self.event_handle_len])
-
-                def validate(self) -> None:
-                    if bytes(self.magic).rstrip(b"\x00") != b"CUDAFS1":
-                        raise ValueError(f"bad magic: {bytes(self.magic)!r}")
-                    if self.version != 1:
-                        raise ValueError(f"unsupported version: {self.version}")
-                    if self.mem_handle_len > CUDA_IPC_MEM_HANDLE_BYTES:
-                        raise ValueError("bad CUDA IPC memory handle length")
-                    if self.event_handle_len > CUDA_IPC_EVENT_HANDLE_BYTES:
-                        raise ValueError("bad CUDA IPC event handle length")
-            
-            magic:str = "CUDASI1"
-            version:int = 1
-
-            # Device that produced/exported the CUDA allocation.
-            # Usually useful for debugging and validation.
-            # device_id:int
-            # producer_pid:int
-
-            # Ring-buffer layout.
-            num_slots:int
-            ndim:int
-
-            shape:int
-            strides:int
-
-            # Data type.
-            dtype_code:int
-            itemsize:int
-
-            # Size info.
-            frame_bytes:int
-            total_bytes:int
-
-            # CUDA IPC memory handle for the whole ring buffer.
-            mem_handle_len:str
-            cuda_ipc_mem_handle:str
-    except:
+    except Exception:
         pass
 
     class BoundingBox(Mat):        
