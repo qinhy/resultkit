@@ -27,20 +27,20 @@ class FrameGenerator(BaseModel):
         self.is_mono = (self.color in [Model4Mat.ImageMat.ColorFormat.GRAY, Model4Mat.ImageMat.ColorFormat.BAYER])
         return super().model_post_init(context)
     
-    def read(self):
-        frame = self.img.get_data()
+    # def read(self,frame=None):
+    #     if frame is None:
+    #         frame = self.img.get_data()
 
-        if self.img.is_pub:
-            iox2_sample,frame = frame
+    #     if self.img.is_pub:
+    #         iox2_sample,frame = frame
 
-        self.draw(frame)
-        self.frame_idx += 1
-        self.img.unsafe_update_data(frame)
+    #     self.draw(frame)
+    #     self.img.unsafe_update_data(frame)
 
-        if self.img.is_pub:
-            return iox2_sample
+    #     if self.img.is_pub:
+    #         return iox2_sample
 
-        return self.img
+    #     return self.img
     
     def as_generator(self):
         while True:
@@ -54,6 +54,7 @@ class FrameGenerator(BaseModel):
         frame.fill(0)
         idx = np.random.choice(len(frame), int(0.1 * len(frame)), replace=False)
         frame[idx, ...] = 125
+        self.frame_idx += 1
         return frame
     
     def _make_synthetic_frame(self,frame=None) -> np.ndarray:

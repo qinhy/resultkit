@@ -199,13 +199,15 @@ class Model4Mat:
             self.data = self._slice_to_numpy(sample.payload())
             return sample,self.data
         
-        def pub(self,data=None):
+        def pub(self,data=None,edit_func=None):
             """
             Publish a NumPy matrix through iceoryx2 shared memory.
             """
             self.is_pub = True
             if data is None:
-                sample,_ = self.get_data()
+                sample,data = self.get_data()
+                if edit_func is not None:
+                    edit_func(data)
                 sample.assume_init().send()
                 return self
             
@@ -667,9 +669,89 @@ class Model4Mat:
 
     try:
         import cupy as cp
+        CUDA_IPC_MEM_HANDLE_BYTES = 64
+        CUDA_IPC_EVENT_HANDLE_BYTES = 64
+
+        STREAM_NAME_BYTES = 128
+        LAYOUT_BYTES = 32
+        MAX_DIMS = 8
+        
         class ImageMatCUDAPubSub(ImageMatPubSub):
-            from .msg import Iox2CUDAIPCFrameSignal
-            class MatSignal(Iox2CUDAIPCFrameSignal):pass
+
+            class Iox2CUDAIPCFrameSignal(ctypes.Structure):
+                """
+                Minimal CUDA IPC frame signal.
+
+                Publishes:
+                - CUDA IPC memory handle
+                - CUDA IPC event handle
+                - sequence number
+                - ring-buffer slot index
+                - frame_bytes for pointer offset calculation
+                """
+
+                payload_type = "CudaIpcFrameSignalV1"
+
+                _fields_ = [
+                    ("magic", ctypes.c_char * 8),       # b"CUDAFS1"
+                    ("version", ctypes.c_uint32),
+                    ("slot_index", ctypes.c_uint32),
+
+                    ("sequence", ctypes.c_uint64),
+                    ("frame_bytes", ctypes.c_uint64),
+
+                    ("mem_handle_len", ctypes.c_uint64),
+                    ("cuda_ipc_mem_handle", ctypes.c_uint8 * CUDA_IPC_MEM_HANDLE_BYTES),
+
+                    ("event_handle_len", ctypes.c_uint64),
+                    ("cuda_ipc_event_handle", ctypes.c_uint8 * CUDA_IPC_EVENT_HANDLE_BYTES),
+                ]
+
+                @classmethod
+                def new(
+                    cls,
+                    *,
+                    sequence: int,
+                    slot_index: int,
+                    frame_bytes: int,
+                    mem_handle: bytes,
+                    event_handle: bytes,
+                ) -> "Iox2CUDAIPCFrameSignal":
+                    msg = cls()
+                    msg.magic = b"CUDAFS1"
+                    msg.version = 1
+                    msg.slot_index = int(slot_index)
+                    msg.sequence = int(sequence)
+                    msg.frame_bytes = int(frame_bytes)
+
+                    if len(mem_handle) > CUDA_IPC_MEM_HANDLE_BYTES:
+                        raise ValueError("CUDA IPC memory handle too large")
+                    if len(event_handle) > CUDA_IPC_EVENT_HANDLE_BYTES:
+                        raise ValueError("CUDA IPC event handle too large")
+
+                    msg.mem_handle_len = len(mem_handle)
+                    msg.cuda_ipc_mem_handle[: len(mem_handle)] = mem_handle
+
+                    msg.event_handle_len = len(event_handle)
+                    msg.cuda_ipc_event_handle[: len(event_handle)] = event_handle
+
+                    return msg
+
+                def mem_handle_bytes(self) -> bytes:
+                    return bytes(self.cuda_ipc_mem_handle[: self.mem_handle_len])
+
+                def event_handle_bytes(self) -> bytes:
+                    return bytes(self.cuda_ipc_event_handle[: self.event_handle_len])
+
+                def validate(self) -> None:
+                    if bytes(self.magic).rstrip(b"\x00") != b"CUDAFS1":
+                        raise ValueError(f"bad magic: {bytes(self.magic)!r}")
+                    if self.version != 1:
+                        raise ValueError(f"unsupported version: {self.version}")
+                    if self.mem_handle_len > CUDA_IPC_MEM_HANDLE_BYTES:
+                        raise ValueError("bad CUDA IPC memory handle length")
+                    if self.event_handle_len > CUDA_IPC_EVENT_HANDLE_BYTES:
+                        raise ValueError("bad CUDA IPC event handle length")
             
             magic:str = "CUDASI1"
             version:int = 1
