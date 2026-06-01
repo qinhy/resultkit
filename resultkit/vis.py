@@ -61,3 +61,8 @@ class FrameGeneratorVisualizer(BaseModel):
             cv2.destroyWindow(self.title)
         except cv2.error:
             pass
+
+
+
+
+
