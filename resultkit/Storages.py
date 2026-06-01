@@ -7,8 +7,6 @@ import base64
 import sys
 import uuid
 import fnmatch
-import json
-from pathlib import Path
 from collections import OrderedDict
 
 # HEAVY_LEVEL: Light

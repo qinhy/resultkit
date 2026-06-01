@@ -1,6 +1,7 @@
 import argparse
 import os
 import sys
+import time
 
 import numpy as np
 
@@ -13,15 +14,17 @@ from resultkit.vis import FrameGeneratorVisualizer
 
 def build_image(width: int, height: int, mode: str) -> Model4Mat.ImageMat:
     if mode in {"gray", "left", "right"}:
-        return Model4Mat.ImageMat(
+        res = Model4Mat.ImageMatPubSub(
             color_format=Model4Mat.ImageMat.ColorFormat.GRAY,
             data=np.zeros((height, width), dtype=np.uint8),
         )
-
-    return Model4Mat.ImageMat(
-        color_format=Model4Mat.ImageMat.ColorFormat.BGR,
-        data=np.zeros((height, width, 3), dtype=np.uint8),
-    )
+    else:
+        res = Model4Mat.ImageMatPubSub(
+            color_format=Model4Mat.ImageMat.ColorFormat.BGR,
+            data=np.zeros((height, width, 3), dtype=np.uint8),
+        )
+    res.set_id("ImageMatPubSub:test").init()
+    return res
 
 
 def main() -> None:
@@ -31,22 +34,35 @@ def main() -> None:
     parser.add_argument("--height", type=int, default=540)
     parser.add_argument("--fps", type=float, default=30.0)
     parser.add_argument("--max-frames", type=int, default=None)
+    parser.add_argument("--sub", action="store_true")
     args = parser.parse_args()
 
     img = build_image(args.width, args.height, args.mode)
-    gen = FrameGenerator(
-        img=img,
-        name=args.mode,
-        fps=args.fps,
-        overlay_prefix="ResultKit GEN",
-    )
 
-    vis = FrameGeneratorVisualizer(
-        generator=gen,
-        window_name=f"resultkit gen: {args.mode}",
-        delay_ms=max(1, int(1000 / args.fps)),
-    )
-    vis.run(max_frames=args.max_frames)
+    if not args.sub:
+        gen = FrameGenerator(
+            img=img,
+            name=args.mode,
+            fps=args.fps,
+            overlay_prefix="ResultKit GEN",
+        )
+        fps = 0.0
+        cnt = 0
+        st = time.time()
+        while True:
+            gen.read().pub()
+            cnt += 1
+            if cnt % 100 == 0:
+                fps = 100 / (time.time() - st)
+                st = time.time()
+                print(f"FPS : {fps:.2f}")
+    else:
+        vis = FrameGeneratorVisualizer(
+            generator=img,
+            window_name=f"resultkit gen: {args.mode}",
+            delay_ms=max(1, int(1000 / args.fps)),
+        )
+        vis.run(max_frames=args.max_frames)
 
 
 if __name__ == "__main__":

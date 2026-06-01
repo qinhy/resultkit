@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ctypes
 import enum
 from typing import Any, ClassVar, Optional, Sequence, Union
 
@@ -447,3 +448,67 @@ class DataType(str, enum.Enum):
             return cls.from_dtype(data.dtype, strict=strict)
 
         return cls.from_dtype(data, strict=strict)
+
+TypeMap = {
+    "uint8":   (np.uint8,   torch.uint8,   ctypes.c_uint8),
+    "int8":    (np.int8,    torch.int8,    ctypes.c_int8),
+
+    "uint16":  (np.uint16,  getattr(torch, "uint16", None), ctypes.c_uint16),
+    "int16":   (np.int16,   torch.int16,   ctypes.c_int16),
+
+    "uint32":  (np.uint32,  getattr(torch, "uint32", None), ctypes.c_uint32),
+    "int32":   (np.int32,   torch.int32,   ctypes.c_int32),
+
+    "uint64":  (np.uint64,  getattr(torch, "uint64", None), ctypes.c_uint64),
+    "int64":   (np.int64,   torch.int64,   ctypes.c_int64),
+
+    "float32": (np.float32, torch.float32, ctypes.c_float),
+    "float64": (np.float64, torch.float64, ctypes.c_double),
+
+    "bool":    (np.bool_,   torch.bool,    ctypes.c_bool),
+}
+
+def to_type_name(dtype: Any) -> str:
+    """
+    Convert a numpy / torch / ctypes dtype into the canonical string key
+    used by TypeMap.
+
+    Examples:
+        np.uint8          -> "uint8"
+        np.dtype("uint8") -> "uint8"
+        torch.uint8       -> "uint8"
+        ctypes.c_uint8    -> "uint8"
+        "uint8"           -> "uint8"
+    """
+    if isinstance(dtype, str):
+        if dtype in TypeMap:
+            return dtype
+        raise KeyError(f"Unknown dtype name: {dtype!r}")
+
+    # Normalize NumPy dtype inputs:
+    # np.uint8, np.dtype("uint8"), "uint8"-like objects, etc.
+    try:
+        np_dtype = np.dtype(dtype)
+    except TypeError:
+        np_dtype = None
+
+    for name, info in TypeMap.items():
+        if np_dtype is not None and np_dtype == info[0]:
+            return name
+
+        if dtype is info[1]:
+            return name
+
+        if dtype is info[2]:
+            return name
+
+    raise TypeError(f"Unsupported dtype: {dtype!r}")
+
+def to_np_type(dtype: Any) -> np.dtype:
+    return TypeMap[to_type_name(dtype)][0]
+
+def to_torch_type(dtype: Any) -> torch.dtype:
+    return TypeMap[to_type_name(dtype)][1]
+
+def to_ctypes_type(dtype: Any):
+    return TypeMap[to_type_name(dtype)][2]

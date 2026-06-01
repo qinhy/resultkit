@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Optional
+from typing import Optional, Union
 
 import cv2
 import numpy as np
@@ -11,20 +11,30 @@ from .gen import FrameGenerator
 
 
 class FrameGeneratorVisualizer(BaseModel):
-    generator: FrameGenerator
+    generator: Union[FrameGenerator, Model4Mat.ImageMatPubSub]
     window_name: Optional[str] = None
     delay_ms: PositiveInt = 1
     batch_index: NonNegativeInt = 0
     convert_rgb_to_bgr: bool = True
+    _is_gen: bool = True
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    def model_post_init(self, context):
+        self._is_gen =  isinstance(self.generator, FrameGenerator)
+        return super().model_post_init(context)
 
     @property
     def title(self) -> str:
         return self.window_name or self.generator.name
 
     def read(self) -> np.ndarray:
-        return self.image_to_cv_frame(self.generator.read(), self.batch_index, self.convert_rgb_to_bgr)
+        if self._is_gen:
+           res = self.generator.read()
+        else:
+            img:Model4Mat.ImageMatPubSub = self.generator
+            res = img.sub()
+        return self.image_to_cv_frame(res, self.batch_index, self.convert_rgb_to_bgr)
 
     def show_once(self) -> int:
         frame = self.read()

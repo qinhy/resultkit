@@ -1,12 +1,15 @@
 # from https://github.com/qinhy/singleton-key-value-storage.git
+import ctypes
 import enum
 from typing import Any, Dict, List, Optional, Tuple, Union
 import numpy as np
-from pydantic import ConfigDict, Field
+from pydantic import ConfigDict, Field, PrivateAttr
 import torch
 import requests
 from PIL import Image
 from io import BytesIO
+import iceoryx2 as iox2
+from resultkit.mat import to_ctypes_type, to_np_type
 
 try:    
     from BasicModel import Controller4Basic, Model4Basic, BasicStore
@@ -83,7 +86,141 @@ class Model4Mat:
             if mat_lib == MatLib.TORCH:
                 return TorchMatOps()
             raise ValueError(f"Unsupported matrix library: {lib}")
-        
+
+
+    class MatPubSub(Mat):
+        lib: str = "iceoryx2"
+        dtype: DataType = DataType.FLOAT32
+        device: MatDevice = MatDevice.CPU
+
+        data: Union[np.ndarray] = Field(
+            default_factory=lambda: np.random.rand(5, 5).astype(np.float32),
+            exclude=True,
+        )
+
+        model_config = ConfigDict(arbitrary_types_allowed=True)
+
+        _ops: MatOps = PrivateAttr(default=None)
+        _node: Any = PrivateAttr(default=None)
+        _service: Any = PrivateAttr(default=None)
+        _pub: Any = PrivateAttr(default=None)
+        _sub: Any = PrivateAttr(default=None)
+        _np_type: Any = PrivateAttr(default=None)
+        _c_type: Any = PrivateAttr(default=None)
+        _n_elements: int = PrivateAttr(default=0)
+
+        def model_post_init(self, context):
+            self._n_elements = int(np.prod(self.data.shape))
+            return super().model_post_init(context)
+
+        def topic_name(self) -> str:
+            return self.get_id().replace(":", "/")
+
+        def topic2id(self, topic: str) -> str:
+            return topic.replace("/", ":")
+
+        def _np_dtype(self) -> np.dtype:
+            if self._np_type is None:
+                self._np_type = np.dtype(to_np_type(self.dtype))
+            return self._np_type
+
+        def _ctypes_type(self):
+            if self._c_type is None:
+                self._c_type = to_ctypes_type(self.dtype)
+            return self._c_type
+
+        def _slice_cls(self):
+            return iox2.Slice[self._ctypes_type()]
+
+        def _slice_to_numpy(self, payload) -> np.ndarray:
+            """
+            Return a NumPy view over an iceoryx2 Slice payload.
+
+            Important:
+            - The returned array is only valid while the sample/loan is alive.
+            - Use `shape`, not payload.len(), as the source of truth.
+            """
+            c_type = self._ctypes_type()
+            n = self._n_elements
+
+            ptr = ctypes.cast(
+                int(payload.as_ptr()),
+                ctypes.POINTER(c_type),
+            )
+
+            arr = np.ctypeslib.as_array(ptr, shape=(n,))
+            return arr.reshape(self.shape())
+
+        def _get_node(self):
+            if self._node is None:
+                self._node = iox2.NodeBuilder.new().create(iox2.ServiceType.Ipc)
+            return self._node
+
+        def _get_service(self):
+            if self._service is None:
+                self._service = (
+                    self._get_node()
+                    .service_builder(iox2.ServiceName.new(self.topic_name()))
+                    .publish_subscribe(self._slice_cls())
+                    .open_or_create()
+                )
+            return self._service
+
+        def get_pub(self):
+            if self._pub is None:
+                max_len = self._n_elements
+
+                self._pub = (
+                    self._get_service()
+                    .publisher_builder()
+                    .initial_max_slice_len(max_len)
+                    .allocation_strategy(iox2.AllocationStrategy.PowerOfTwo)
+                    .create()
+                )
+
+            return self._pub
+
+        def get_sub(self):
+            if self._sub is None:
+                self._sub = (
+                    self._get_service()
+                    .subscriber_builder()
+                    .create()
+                )
+
+            return self._sub
+
+        def pub(self):
+            """
+            Publish a NumPy matrix through iceoryx2 shared memory.
+            """
+            # if data is None: data = self.data
+            data = np.asarray(self.data, dtype=self._np_dtype(), order="C")
+            n = self._n_elements
+            publisher = self.get_pub()
+            sample = publisher.loan_slice_uninit(n)
+            out = self._slice_to_numpy(sample.payload())
+            out[...] = data
+            sample.assume_init().send()
+            return self
+
+        def sub(self):
+            """
+            Receive one matrix.
+
+            This version assumes the receiver already knows `self.data.shape`.
+            For a real generic MatPubSub, publish shape metadata separately.
+            """
+            subscriber = self.get_sub()
+            sample = subscriber.receive()
+            if sample is None: return self
+
+            # Copy before returning so the caller does not hold a dangling
+            # shared-memory view after `sample` is destroyed.
+            view = self._slice_to_numpy(sample.payload())
+            self.unsafe_update_data(view.copy())
+            return self
+
     class ImageMat(Mat):
         class ColorFormat(str, enum.Enum):
             RGB = "RGB"
@@ -367,7 +504,6 @@ class Model4Mat:
                     res += self.crop_bbox(child)
             return res
 
-
     class ImageMatView(ImageMat):
         class Mode(str, enum.Enum):
             HWxyxy = "HWxyxy"
@@ -512,6 +648,43 @@ class Model4Mat:
             img = Image.fromarray(tmp)
             img.show(title=title)
 
+    class ImageMatPubSub(MatPubSub,ImageMat):
+        pass
+
+    try:
+        import cupy as cp
+        from .msg import Iox2CUDAIPCFrameSignal
+        class ImageMatCUDAPubSub(ImageMatPubSub):
+            class MatSignal(Iox2CUDAIPCFrameSignal):pass   
+            
+            magic:str = "CUDASI1"
+            version:int = 1
+
+            # Device that produced/exported the CUDA allocation.
+            # Usually useful for debugging and validation.
+            # device_id:int
+            # producer_pid:int
+
+            # Ring-buffer layout.
+            num_slots:int
+            ndim:int
+
+            shape:int
+            strides:int
+
+            # Data type.
+            dtype_code:int
+            itemsize:int
+
+            # Size info.
+            frame_bytes:int
+            total_bytes:int
+
+            # CUDA IPC memory handle for the whole ring buffer.
+            mem_handle_len:str
+            cuda_ipc_mem_handle:str
+    except:
+        pass
 
     class BoundingBox(Mat):        
         class AxisFormat(str, enum.Enum):

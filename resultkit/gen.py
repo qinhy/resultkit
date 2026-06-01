@@ -1,3 +1,5 @@
+from typing import Union
+
 import cv2
 import numpy as np
 from pydantic import BaseModel, PositiveFloat
@@ -6,7 +8,7 @@ from .MatModel import Model4Mat
 
 
 class FrameGenerator(BaseModel):
-    img:Model4Mat.ImageMat
+    img:Union[Model4Mat.ImageMat, Model4Mat.ImageMatPubSub]
 
     name: str = "gen" 
     fps: PositiveFloat = 30.0
@@ -25,7 +27,7 @@ class FrameGenerator(BaseModel):
         self.is_mono = (self.color in [Model4Mat.ImageMat.ColorFormat.GRAY, Model4Mat.ImageMat.ColorFormat.BAYER])
         return super().model_post_init(context)
     
-    def read(self) -> Model4Mat.ImageMat:
+    def read(self):
         frame = self._make_synthetic_frame()
 
         if self.draw_overlay:
@@ -100,7 +102,6 @@ class FrameGenerator(BaseModel):
 
         cx, cy = self._moving_center(t)
         radius = max(20, min(self.img.BCHW[-1], self.img.BCHW[-2]) // 10)
-
         cv2.circle(
             frame,
             (cx, cy),

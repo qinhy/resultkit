@@ -334,6 +334,19 @@ wheels = [
 ]
 
 [[package]]
+name = "iceoryx2"
+version = "0.9.1"
+source = { registry = "https://pypi.org/simple" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/b1/82/c3c538573e0a0bded0fd047574b5829c7fa529c25520a6208922fa928ca9/iceoryx2-0.9.1-cp314-cp314t-macosx_11_0_arm64.whl", hash = "sha256:b9a7144c5fa6b3f4198a0321a629b882e9952d722c01017d09f376caac8b03c3", size = 1174521, upload-time = "2026-05-27T13:40:51.675Z" },
+    { url = "https://files.pythonhosted.org/packages/c3/7e/b215eb76c4bd79c69cb07d17f9aaf29ccd4fbd0baee846c97d92f0db2428/iceoryx2-0.9.1-cp314-cp314t-manylinux_2_34_x86_64.whl", hash = "sha256:25519f8f9da50ca90b2465f462d4e4ec368125f097b02b66f4fe3eba1809a4a7", size = 1437901, upload-time = "2026-05-27T13:40:53.216Z" },
+    { url = "https://files.pythonhosted.org/packages/08/1a/298da45f4538a504ca9406161e59c889be762756b0292abb0af1753adabe/iceoryx2-0.9.1-cp314-cp314t-win_amd64.whl", hash = "sha256:c34773b6da2d33ad6eb1dede332a9cf3f1d7cd1f988c1cfbf75ab3da92adc119", size = 1304497, upload-time = "2026-05-27T13:40:54.636Z" },
+    { url = "https://files.pythonhosted.org/packages/60/0d/0a4ec544e9ad0a9470cb7f0d6ea1a177274ff7b9e660ea643b9fed2eee92/iceoryx2-0.9.1-cp38-abi3-macosx_11_0_arm64.whl", hash = "sha256:4771ead96b4cb023a2e7f3856cd6266e34488afa6bcc8336fb1f171fc65aa5a4", size = 1177654, upload-time = "2026-05-27T13:40:56.027Z" },
+    { url = "https://files.pythonhosted.org/packages/15/d0/0d1220e29790a354474565dde83956df48d914d408c749ba599811aa1a52/iceoryx2-0.9.1-cp38-abi3-manylinux_2_34_x86_64.whl", hash = "sha256:dc0a6b5047cd2363458e916d8f53cf6b4219b30135eec8f7917a8c4cf80c9d57", size = 1448691, upload-time = "2026-05-27T13:40:57.381Z" },
+    { url = "https://files.pythonhosted.org/packages/5e/57/9974c550488a5792d195ef75a9772184e22b755e1bc3bbdd0784e896856a/iceoryx2-0.9.1-cp38-abi3-win_amd64.whl", hash = "sha256:88e5565b171d9c3f92e33cd0c58058f717fb9d60248a026eb638369f947f6493", size = 1310713, upload-time = "2026-05-27T13:40:58.735Z" },
+]
+
+[[package]]
 name = "idna"
 version = "3.15"
 source = { registry = "https://pypi.org/simple" }
@@ -1269,6 +1282,7 @@ name = "resultkit"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
+    { name = "iceoryx2" },
     { name = "numpy" },
     { name = "pillow" },
     { name = "pydantic" },
@@ -1285,6 +1299,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "iceoryx2", specifier = ">=0.9.1" },
     { name = "numpy", specifier = ">=2.4.6" },
     { name = "pillow", specifier = ">=12.2.0" },
     { name = "pydantic", specifier = ">=2.13.4" },
