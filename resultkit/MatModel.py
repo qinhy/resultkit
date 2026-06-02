@@ -729,6 +729,42 @@ class Model4Mat:
 
     try:
         class ImageMatCUDAPubSub(ImageMatCUDAPubSub,ImageMatPubSub):
+            dtype: DataType = DataType.FLOAT32
+            device: MatDevice = MatDevice.CUDA0
+            model_config = ConfigDict(arbitrary_types_allowed=True)
+            def init(self):
+                if isinstance(self.data, gpuarray.GPUArray):
+                    self.lib = "pycuda"
+                    self.device = MatDevice.CUDA if hasattr(MatDevice, "CUDA") else self.device
+                    self._update_image_metadata_from_array(self.data)
+                    self.validate()
+                    return self
+                return super().init()
+
+            def validate(self):
+                if not isinstance(self.data, gpuarray.GPUArray):
+                    return super().validate()
+                
+                cls = Model4Mat.ImageMat
+                b, c, h, w = self.BCHW
+                if min(b, c, h, w) <= 0:
+                    raise ValueError(f"Invalid BCHW dimensions: {self.BCHW}")
+
+                expected_channels = cls.ColorFormat.channels(self.color_format)
+                if c != expected_channels:
+                    raise TypeError(
+                        f"Expected {expected_channels} channels for {self.color_format}, "
+                        f"got {c} from shape_type={self.shape_type} and shape={self.shape()}"
+                    )
+
+                np_dtype = np.dtype(self.data.dtype)
+                if self.shape_type == cls.ShapeType.BCHW:
+                    if np_dtype not in {np.dtype("float16"), np.dtype("float32")}:
+                        raise TypeError(f"Expected float dtype for BCHW PyCUDA image data, got {np_dtype}")
+                else:
+                    if np_dtype != np.dtype("uint8"):
+                        raise TypeError(f"Expected uint8 dtype for PyCUDA image data, got {np_dtype}")
+
             def _update_image_metadata_from_array(self, arr):
                 cls = Model4Mat.ImageMat
                 self.color_format = cls.ColorFormat(self.color_format)
@@ -773,39 +809,6 @@ class Model4Mat:
                     self.dtype = DataType.which(np.empty((0,), dtype=np.dtype(arr.dtype)))
                 except Exception:
                     pass
-
-            def init(self):
-                if isinstance(self.data, gpuarray.GPUArray):
-                    self.lib = "pycuda"
-                    self.device = MatDevice.CUDA if hasattr(MatDevice, "CUDA") else self.device
-                    self._update_image_metadata_from_array(self.data)
-                    self.validate()
-                    return self
-                return super().init()
-
-            def validate(self):
-                if not isinstance(self.data, gpuarray.GPUArray):
-                    return super().validate()
-
-                cls = Model4Mat.ImageMat
-                b, c, h, w = self.BCHW
-                if min(b, c, h, w) <= 0:
-                    raise ValueError(f"Invalid BCHW dimensions: {self.BCHW}")
-
-                expected_channels = cls.ColorFormat.channels(self.color_format)
-                if c != expected_channels:
-                    raise TypeError(
-                        f"Expected {expected_channels} channels for {self.color_format}, "
-                        f"got {c} from shape_type={self.shape_type} and shape={self.shape()}"
-                    )
-
-                np_dtype = np.dtype(self.data.dtype)
-                if self.shape_type == cls.ShapeType.BCHW:
-                    if np_dtype not in {np.dtype("float16"), np.dtype("float32")}:
-                        raise TypeError(f"Expected float dtype for BCHW PyCUDA image data, got {np_dtype}")
-                else:
-                    if np_dtype != np.dtype("uint8"):
-                        raise TypeError(f"Expected uint8 dtype for PyCUDA image data, got {np_dtype}")
 
     except Exception:
         pass

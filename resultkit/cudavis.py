@@ -15,94 +15,161 @@ from OpenGL.GLUT import *
 
 import pycuda.driver as cuda
 import pycuda.gl as cudagl
-import pycuda.gpuarray as gpuarray
 from pycuda.compiler import SourceModule
 
-_GL_COPY_MODULE = None
-_GL_COPY_KERNEL = None
 
-GL_COPY_SRC = r'''
+def make_specialized_gl_copy_src(
+    *,
+    width: int,
+    height: int,
+    channels: int,
+    layout: int,
+    color_order: int,
+    flip_y: bool,
+) -> str:
+    """Generate a branch-minimized CUDA kernel specialized for one image format."""
+
+    plane = width * height
+
+    if flip_y:
+        src_y_code = f"int src_y = {height - 1} - y;"
+    else:
+        src_y_code = "int src_y = y;"
+
+    # layout:
+    #   0 = HW
+    #   1 = HWC
+    #   2 = BHW
+    #   3 = BHWC
+    #   4 = BCHW
+    #
+    # color_order:
+    #   0 = RGB/RGBA/GRAY
+    #   1 = BGR/BGRA
+
+    if layout in (0, 2):
+        load_store_code = """
+    unsigned char v = src[pix];
+
+    dst[dst_i + 0] = v;
+    dst[dst_i + 1] = v;
+    dst[dst_i + 2] = v;
+    dst[dst_i + 3] = 255;
+"""
+
+    elif layout == 4:
+        if channels == 1:
+            load_store_code = """
+    unsigned char v = src[pix];
+
+    dst[dst_i + 0] = v;
+    dst[dst_i + 1] = v;
+    dst[dst_i + 2] = v;
+    dst[dst_i + 3] = 255;
+"""
+        elif color_order == 1:
+            # BCHW + BGR/BGRA
+            if channels == 4:
+                load_store_code = f"""
+    dst[dst_i + 0] = src[2 * {plane} + pix];
+    dst[dst_i + 1] = src[1 * {plane} + pix];
+    dst[dst_i + 2] = src[0 * {plane} + pix];
+    dst[dst_i + 3] = src[3 * {plane} + pix];
+"""
+            else:
+                load_store_code = f"""
+    dst[dst_i + 0] = src[2 * {plane} + pix];
+    dst[dst_i + 1] = src[1 * {plane} + pix];
+    dst[dst_i + 2] = src[0 * {plane} + pix];
+    dst[dst_i + 3] = 255;
+"""
+        else:
+            # BCHW + RGB/RGBA
+            if channels == 4:
+                load_store_code = f"""
+    dst[dst_i + 0] = src[0 * {plane} + pix];
+    dst[dst_i + 1] = src[1 * {plane} + pix];
+    dst[dst_i + 2] = src[2 * {plane} + pix];
+    dst[dst_i + 3] = src[3 * {plane} + pix];
+"""
+            else:
+                load_store_code = f"""
+    dst[dst_i + 0] = src[0 * {plane} + pix];
+    dst[dst_i + 1] = src[1 * {plane} + pix];
+    dst[dst_i + 2] = src[2 * {plane} + pix];
+    dst[dst_i + 3] = 255;
+"""
+
+    else:
+        # HWC or BHWC
+        if channels == 1:
+            load_store_code = """
+    unsigned char v = src[pix];
+
+    dst[dst_i + 0] = v;
+    dst[dst_i + 1] = v;
+    dst[dst_i + 2] = v;
+    dst[dst_i + 3] = 255;
+"""
+        elif color_order == 1:
+            # HWC/BHWC + BGR/BGRA
+            if channels == 4:
+                load_store_code = f"""
+    int base = pix * {channels};
+
+    dst[dst_i + 0] = src[base + 2];
+    dst[dst_i + 1] = src[base + 1];
+    dst[dst_i + 2] = src[base + 0];
+    dst[dst_i + 3] = src[base + 3];
+"""
+            else:
+                load_store_code = f"""
+    int base = pix * {channels};
+
+    dst[dst_i + 0] = src[base + 2];
+    dst[dst_i + 1] = src[base + 1];
+    dst[dst_i + 2] = src[base + 0];
+    dst[dst_i + 3] = 255;
+"""
+        else:
+            # HWC/BHWC + RGB/RGBA
+            if channels == 4:
+                load_store_code = f"""
+    int base = pix * {channels};
+
+    dst[dst_i + 0] = src[base + 0];
+    dst[dst_i + 1] = src[base + 1];
+    dst[dst_i + 2] = src[base + 2];
+    dst[dst_i + 3] = src[base + 3];
+"""
+            else:
+                load_store_code = f"""
+    int base = pix * {channels};
+
+    dst[dst_i + 0] = src[base + 0];
+    dst[dst_i + 1] = src[base + 1];
+    dst[dst_i + 2] = src[base + 2];
+    dst[dst_i + 3] = 255;
+"""
+
+    return f'''
 extern "C" __global__
 void image_u8_to_rgba_pbo(
     const unsigned char *src,
-    unsigned char *dst,
-    int width,
-    int height,
-    int channels,
-    int layout,
-    int color_order,
-    int flip_y)
-{
+    unsigned char *dst)
+{{
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
-    if (x >= width || y >= height) return;
 
-    int src_y = flip_y ? (height - 1 - y) : y;
-    int pix = src_y * width + x;
-    int plane = width * height;
+    if (x >= {width} || y >= {height}) return;
 
-    unsigned char r = 255, g = 0, b = 255, a = 255;
+    {src_y_code}
+    int pix = src_y * {width} + x;
+    int dst_i = 4 * (y * {width} + x);
 
-    // layout:
-    //   0 = HW
-    //   1 = HWC
-    //   2 = BHW, first batch
-    //   3 = BHWC, first batch
-    //   4 = BCHW, first batch, channels-first
-    if (layout == 0 || layout == 2) {
-        unsigned char v = src[pix];
-        r = v; g = v; b = v;
-    } else if (layout == 4) {
-        if (channels == 1) {
-            unsigned char v = src[pix];
-            r = v; g = v; b = v;
-        } else {
-            unsigned char c0 = src[0 * plane + pix];
-            unsigned char c1 = src[1 * plane + pix];
-            unsigned char c2 = src[2 * plane + pix];
-            unsigned char c3 = channels >= 4 ? src[3 * plane + pix] : 255;
-            if (color_order == 1) { // BGR/BGRA
-                b = c0; g = c1; r = c2;
-            } else {                // RGB/RGBA
-                r = c0; g = c1; b = c2;
-            }
-            a = channels >= 4 ? c3 : 255;
-        }
-    } else {
-        int base = pix * channels;
-        if (channels == 1) {
-            unsigned char v = src[base];
-            r = v; g = v; b = v;
-        } else {
-            unsigned char c0 = src[base + 0];
-            unsigned char c1 = src[base + 1];
-            unsigned char c2 = src[base + 2];
-            unsigned char c3 = channels >= 4 ? src[base + 3] : 255;
-            if (color_order == 1) { // BGR/BGRA
-                b = c0; g = c1; r = c2;
-            } else {                // RGB/RGBA
-                r = c0; g = c1; b = c2;
-            }
-            a = channels >= 4 ? c3 : 255;
-        }
-    }
-
-    int dst_i = 4 * (y * width + x);
-    dst[dst_i + 0] = r;
-    dst[dst_i + 1] = g;
-    dst[dst_i + 2] = b;
-    dst[dst_i + 3] = a;
-}
+{load_store_code}
+}}
 '''
-
-
-def get_gl_copy_kernel():
-    global _GL_COPY_MODULE, _GL_COPY_KERNEL
-    if _GL_COPY_KERNEL is not None:
-        return _GL_COPY_KERNEL
-    _GL_COPY_MODULE = SourceModule(GL_COPY_SRC, options=["-O3", "--use_fast_math"])
-    _GL_COPY_KERNEL = _GL_COPY_MODULE.get_function("image_u8_to_rgba_pbo")
-    return _GL_COPY_KERNEL
 
 
 @dataclass(frozen=True, slots=True)
@@ -111,30 +178,105 @@ class GlViewerConfig:
     height: int = 3000
     fps: float = 60.0
     device: int = 0
-    num_slots: int = 3
-    topic_id: str = "ImageMatCUDAPubSub:test"
     flip_y: bool = True
     max_frames: Optional[int] = None
 
+    # Keep False for speed. True is useful only while debugging async CUDA errors.
+    debug_cuda_sync: bool = False
+
 
 class ImageMatCudaGlViewer:
-    """Model4Mat.ImageMatCUDAPubSub subscriber rendered through OpenGL/PBO."""
+    """Fast PyCUDA/OpenGL PBO viewer for ImageMatCUDAPubSub-like images."""
 
-    def __init__(self, config: GlViewerConfig):
-        self.config = config
+    def __init__(self, 
+                width, height,
+                fps: float = 60.0,
+                device: int = 0,
+                flip_y: bool = True,
+                max_frames: Optional[int] = None,
+    ):
+        self.config = GlViewerConfig(
+            width=width,
+            height=height,
+            fps=fps,
+            device=device,
+            flip_y=flip_y,
+            max_frames=max_frames,
+        )
         self.img = None
-        self.tex: Optional[int] = None
-        self.pbo: Optional[int] = None
+
+        self.tex = None
+        self.pbo = None
         self.cuda_pbo = None
         self.cuda_ctx = None
+
+        self.copy_module = None
         self.copy_kernel = None
-        self.closing = False
+
+        self.block = (16, 16, 1)
+        self.grid = (
+            (self.config.width + 15) // 16,
+            (self.config.height + 15) // 16,
+            1,
+        )
+
         self.frame_idx = 0
+        self.last_sequence = None
         self.last_status_time = 0.0
-        self.last_sequence: Optional[int] = None
+        self.closing = False
+
+    @staticmethod
+    def _enum_string(value) -> str:
+        return str(value.value if hasattr(value, "value") else value).upper()
+
+    @classmethod
+    def _layout_code(cls, shape_type) -> int:
+        st = cls._enum_string(shape_type)
+        mapping = {
+            "HW": 0,
+            "HWC": 1,
+            "BHW": 2,
+            "BHWC": 3,
+            "BCHW": 4,
+        }
+        return mapping[st]
+
+    @classmethod
+    def _color_order(cls, color_format) -> int:
+        cf = cls._enum_string(color_format)
+        return 1 if cf in {"BGR", "BGRA"} else 0
+
+    def _prepare_image_format(self) -> tuple[int, int, int, int]:
+        _, channels, height, width = self.img.BCHW
+
+        channels = int(channels)
+        height = int(height)
+        width = int(width)
+
+        if width != self.config.width or height != self.config.height:
+            raise RuntimeError(
+                f"Frame size {width}x{height} does not match viewer size "
+                f"{self.config.width}x{self.config.height}"
+            )
+
+        if channels not in (1, 3, 4):
+            raise RuntimeError(
+                f"Unsupported channel count: {channels}. Supported: 1, 3, 4."
+            )
+
+        layout = self._layout_code(self.img.shape_type)
+        color_order = self._color_order(self.img.color_format)
+
+        return channels, layout, color_order, width * height * channels
 
     def init_gl_window(self) -> None:
         glutInit(sys.argv)
+
+        try:
+            glutSetOption(GLUT_ACTION_ON_WINDOW_CLOSE, GLUT_ACTION_GLUTMAINLOOP_RETURNS)
+        except Exception:
+            pass
+
         glutInitDisplayMode(GLUT_RGBA | GLUT_DOUBLE)
         glutInitWindowSize(self.config.width, self.config.height)
         glutCreateWindow(b"resultkit ImageMatCUDAPubSub PyCUDA -> OpenGL")
@@ -142,6 +284,7 @@ class ImageMatCudaGlViewer:
         vendor = glGetString(GL_VENDOR)
         renderer = glGetString(GL_RENDERER)
         version = glGetString(GL_VERSION)
+
         print("[GL] vendor  :", vendor.decode(errors="replace") if vendor else None)
         print("[GL] renderer:", renderer.decode(errors="replace") if renderer else None)
         print("[GL] version :", version.decode(errors="replace") if version else None)
@@ -149,14 +292,23 @@ class ImageMatCudaGlViewer:
         glViewport(0, 0, self.config.width, self.config.height)
         glDisable(GL_DEPTH_TEST)
         glPixelStorei(GL_UNPACK_ALIGNMENT, 1)
+        glClearColor(0.0, 0.0, 0.0, 1.0)
 
     def init_gl_resources(self) -> None:
         self.tex = glGenTextures(1)
+
         glBindTexture(GL_TEXTURE_2D, self.tex)
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST)
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST)
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
+
+        try:
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_BASE_LEVEL, 0)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0)
+        except Exception:
+            pass
+
         glTexImage2D(
             GL_TEXTURE_2D,
             0,
@@ -177,86 +329,79 @@ class ImageMatCudaGlViewer:
             None,
             GL_STREAM_DRAW,
         )
+
         glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0)
+        glBindTexture(GL_TEXTURE_2D, 0)
 
     def init_cuda_after_gl_context_exists(self) -> None:
-        if self.pbo is None:
-            raise RuntimeError("OpenGL PBO has not been created")
         cuda.init()
-        self.cuda_ctx = cudagl.make_context(cuda.Device(self.config.device))
-        self.copy_kernel = get_gl_copy_kernel()
+
+        device = cuda.Device(self.config.device)
+        print("[CUDA] device :", device.name())
+
+        self.cuda_ctx = cudagl.make_context(device)
+
         self.cuda_pbo = cudagl.RegisteredBuffer(
             int(self.pbo),
             cudagl.graphics_map_flags.WRITE_DISCARD,
         )
 
-    @staticmethod
-    def _layout_code(shape_type) -> int:
-        st = str(shape_type.value if hasattr(shape_type, "value") else shape_type)
-        mapping = {
-            "HW": 0,
-            "HWC": 1,
-            "BHW": 2,
-            "BHWC": 3,
-            "BCHW": 4,
-        }
-        if st not in mapping:
-            raise ValueError(f"Unsupported shape_type for GL viewer: {shape_type}")
-        return mapping[st]
+    def compile_specialized_kernel(self) -> None:
+        channels, layout, color_order, _ = self._prepare_image_format()
 
-    @staticmethod
-    def _color_order(color_format) -> int:
-        cf = str(color_format.value if hasattr(color_format, "value") else color_format).upper()
-        # 0 = RGB/RGBA/GRAY, 1 = BGR/BGRA
-        return 1 if cf == "BGR" else 0
+        src = make_specialized_gl_copy_src(
+            width=self.config.width,
+            height=self.config.height,
+            channels=channels,
+            layout=layout,
+            color_order=color_order,
+            flip_y=self.config.flip_y,
+        )
 
-    def copy_frame_to_pbo(self, frame: gpuarray.GPUArray) -> bool:
-        if not isinstance(frame, gpuarray.GPUArray):
-            raise TypeError(f"expected pycuda.gpuarray.GPUArray, got {type(frame)!r}")
-        if np.dtype(frame.dtype) != np.dtype(np.uint8):
-            raise TypeError(f"GL viewer currently expects uint8 GPUArray, got {frame.dtype}")
+        self.copy_module = SourceModule(src, options=["-O3", "--use_fast_math"])
+        self.copy_kernel = self.copy_module.get_function("image_u8_to_rgba_pbo")
 
-        _, channels, height, width = self.img.BCHW
-        width = int(width)
-        height = int(height)
-        channels = int(channels)
-        if width != self.config.width or height != self.config.height:
-            raise RuntimeError(
-                f"Frame size {width}x{height} does not match GL window "
-                f"{self.config.width}x{self.config.height}. Start viewer with matching --width/--height."
-            )
+        print(
+            "[CUDA] specialized kernel:",
+            f"layout={layout}",
+            f"channels={channels}",
+            f"color_order={color_order}",
+            f"flip_y={self.config.flip_y}",
+            flush=True,
+        )
 
+    def init(self) -> None:
+        self.init_gl_window()
+        self.init_gl_resources()
+        self.init_cuda_after_gl_context_exists()
+
+    def attach_img_and_compile(self, img) -> None:
+        self.img = img
+        self.compile_specialized_kernel()
+
+    def copy_frame_to_pbo(self, frame) -> None:
         mapping = self.cuda_pbo.map()
-        try:
-            pbo_ptr, pbo_size = mapping.device_ptr_and_size()
-            needed = self.config.width * self.config.height * 4
-            if pbo_size < needed:
-                raise RuntimeError(f"PBO too small: {pbo_size} < {needed}")
 
-            block = (16, 16, 1)
-            grid = ((self.config.width + 15) // 16, (self.config.height + 15) // 16, 1)
+        try:
+            pbo_ptr, _ = mapping.device_ptr_and_size()
+
             self.copy_kernel(
                 np.uintp(int(frame.gpudata)),
                 np.uintp(int(pbo_ptr)),
-                np.int32(self.config.width),
-                np.int32(self.config.height),
-                np.int32(channels),
-                np.int32(self._layout_code(self.img.shape_type)),
-                np.int32(self._color_order(self.img.color_format)),
-                np.int32(1 if self.config.flip_y else 0),
-                block=block,
-                grid=grid,
+                block=self.block,
+                grid=self.grid,
             )
-            cuda.Context.synchronize()
+
+            if self.config.debug_cuda_sync:
+                cuda.Context.synchronize()
+
         finally:
             mapping.unmap()
-        return True
 
     def upload_pbo_to_texture(self) -> None:
-        if self.tex is None or self.pbo is None:
-            raise RuntimeError("OpenGL texture/PBO has not been created")
         glBindTexture(GL_TEXTURE_2D, self.tex)
         glBindBuffer(GL_PIXEL_UNPACK_BUFFER, self.pbo)
+
         glTexSubImage2D(
             GL_TEXTURE_2D,
             0,
@@ -268,77 +413,105 @@ class ImageMatCudaGlViewer:
             GL_UNSIGNED_BYTE,
             ctypes.c_void_p(0),
         )
+
         glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0)
 
     def draw_fullscreen_quad(self) -> None:
-        if self.tex is None:
-            return
         glClear(GL_COLOR_BUFFER_BIT)
         glEnable(GL_TEXTURE_2D)
         glBindTexture(GL_TEXTURE_2D, self.tex)
 
         glBegin(GL_QUADS)
-        glTexCoord2f(0.0, 0.0); glVertex2f(-1.0, -1.0)
-        glTexCoord2f(1.0, 0.0); glVertex2f(1.0, -1.0)
-        glTexCoord2f(1.0, 1.0); glVertex2f(1.0, 1.0)
-        glTexCoord2f(0.0, 1.0); glVertex2f(-1.0, 1.0)
+
+        glTexCoord2f(0.0, 0.0)
+        glVertex2f(-1.0, -1.0)
+
+        glTexCoord2f(1.0, 0.0)
+        glVertex2f(1.0, -1.0)
+
+        glTexCoord2f(1.0, 1.0)
+        glVertex2f(1.0, 1.0)
+
+        glTexCoord2f(0.0, 1.0)
+        glVertex2f(-1.0, 1.0)
+
         glEnd()
         glutSwapBuffers()
 
-    def receive_and_render_once(self) -> bool:
+    def receive_and_render_once(self) -> None:
         self.img.sub(copy=False, sync=False)
-        # No signal has arrived yet; keep the last texture on screen.
-        if getattr(self.img, "_remote_mem", None) is None:
-            return False
+
+        # # This is the main remaining necessary per-frame check:
+        # # no remote frame yet means keep showing the previous texture.
+        # if getattr(self.img, "_remote_mem", None) is None:
+        #     return
 
         frame = self.img.get_data()
-        if self.copy_frame_to_pbo(frame):
-            self.upload_pbo_to_texture()
-            self.frame_idx += 1
-            self.last_sequence = int(getattr(self.img, "sequence", self.frame_idx))
-            return True
-        return False
 
-    def display(self) -> None:
-        if self.closing:
-            return
-        try:
-            self.receive_and_render_once()
-            self.draw_fullscreen_quad()
-            self.print_status_if_due()
-        except Exception as exc:
-            print("[gl-viewer] display error:", repr(exc), flush=True)
+        self.copy_frame_to_pbo(frame)
+        self.upload_pbo_to_texture()
+
+        self.frame_idx += 1
+        self.last_sequence = getattr(self.img, "sequence", self.frame_idx)
+
+    def display(self) -> None:        
+        if self.closing:return
+        self.receive_and_render_once()
+        self.draw_fullscreen_quad()
+        self.print_status_if_due()
+
+    def display_limited(self) -> None:
+        if self.closing:return
+        self.receive_and_render_once()
+        self.draw_fullscreen_quad()
+        self.print_status_if_due()
+
+        if self.frame_idx >= self.config.max_frames:
             self.request_close()
-            return
 
-        if self.config.max_frames is not None and self.frame_idx >= self.config.max_frames:
+    def timer(self, value: int = 0) -> None:
+        glutPostRedisplay()
+        glutTimerFunc(self._timer_interval_ms, self.timer, 0)
+
+    def idle(self) -> None:
+        glutPostRedisplay()
+
+    def reshape(self, width: int, height: int) -> None:
+        glViewport(0, 0, max(1, width), max(1, height))
+
+    def keyboard(self, key, x, y) -> None:
+        if key in (b"q", b"\x1b"):
             self.request_close()
-            return
-
-        if not self.closing:
-            glutPostRedisplay()
 
     def print_status_if_due(self) -> None:
         now = time.time()
+
         if now - self.last_status_time < 1.0:
             return
+
         print(
             f"[gl-viewer] displayed={self.frame_idx} latest_seq={self.last_sequence}",
             flush=True,
         )
         self.last_status_time = now
 
-    def keyboard(self, key, x, y) -> None:
-        if key in (b"q", b"\x1b"):
-            self.request_close()
-
     def request_close(self) -> None:
+        if self.closing:
+            return
+
         self.closing = True
+
+        try:
+            glutIdleFunc(None)
+        except Exception:
+            pass
+
         self.cleanup()
+
         try:
             glutLeaveMainLoop()
         except Exception:
-            os._exit(0)
+            pass
 
     def cleanup(self) -> None:
         try:
@@ -349,7 +522,7 @@ class ImageMatCudaGlViewer:
             print("[cleanup] cuda_pbo:", exc, flush=True)
 
         try:
-            if self.img is not None:
+            if self.img is not None and hasattr(self.img, "close"):
                 self.img.close()
                 self.img = None
         except Exception as exc:
@@ -364,10 +537,13 @@ class ImageMatCudaGlViewer:
 
         try:
             if self.tex is not None:
-                glDeleteTextures([self.tex])
+                glDeleteTextures(1, [self.tex])
                 self.tex = None
         except Exception as exc:
             print("[cleanup] tex:", exc, flush=True)
+
+        self.copy_kernel = None
+        self.copy_module = None
 
         try:
             if self.cuda_ctx is not None:
@@ -377,29 +553,32 @@ class ImageMatCudaGlViewer:
         except Exception as exc:
             print("[cleanup] cuda_ctx:", exc, flush=True)
 
-    def init(self):        
-        self.init_gl_window()
-        self.init_gl_resources()
-        self.init_cuda_after_gl_context_exists()
-
-    def run(self,img=None) -> None:
+    def run(self, img=None) -> None:
         if img is not None:
-            self.img = img
-        if self.img is None:
-            raise RuntimeError("ImageMat subscriber has not been created")
-        if self.cuda_pbo is None or self.copy_kernel is None:
-            raise RuntimeError("CUDA/OpenGL resources are not initialized")
+            self.attach_img_and_compile(img)
+        elif self.img is not None:
+            self.compile_specialized_kernel()
+        else:
+            raise RuntimeError("ImageMat subscriber has not been provided")
+
+        glutDisplayFunc(self.display_limited if self.config.max_frames else self.display)
+        glutKeyboardFunc(self.keyboard)
+        glutReshapeFunc(self.reshape)
+
         try:
-            glutDisplayFunc(self.display)
-            glutKeyboardFunc(self.keyboard)
-            try:
-                glutCloseFunc(self.request_close)
-            except Exception:
-                pass
-
-            print("[gl-viewer] running. Press q or Esc to quit.", flush=True)
-            glutMainLoop()
+            glutCloseFunc(self.request_close)
         except Exception:
-            self.cleanup()
-            raise
+            pass
 
+        if self.config.fps > 0:
+            self._timer_interval_ms = max(1, int(round(1000.0 / self.config.fps)))
+            glutTimerFunc(0, self.timer, 0)
+            print(f"[gl-viewer] running at target fps={self.config.fps}", flush=True)
+        else:
+            glutIdleFunc(self.idle)
+            print("[gl-viewer] running as fast as possible", flush=True)
+
+        try:
+            glutMainLoop()
+        finally:
+            self.cleanup()

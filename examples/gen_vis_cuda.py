@@ -22,7 +22,8 @@ from pycuda.compiler import SourceModule
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from resultkit.MatModel import Model4Mat
-from resultkit.cudavis import GlViewerConfig, ImageMatCudaGlViewer
+from resultkit.cudavis import ImageMatCudaGlViewer
+from resultkit.mat import DataType, MatDevice
 
 
 _DRAW_MODULE = None
@@ -92,22 +93,24 @@ def draw(frame):
     return frame
 
 
-def make_image(args_or_config):
+def make_image(args):
     if not hasattr(Model4Mat, "ImageMatCUDAPubSub"):
         raise SystemExit(
             "Model4Mat.ImageMatCUDAPubSub is not available. "
             "Use the PyCUDA patched MatModel.py that defines ImageMatCUDAPubSub."
         )
 
-    width = int(args_or_config.width)
-    height = int(args_or_config.height)
-    num_slots = int(args_or_config.num_slots)
-    topic_id = getattr(args_or_config, "topic_id", "ImageMatCUDAPubSub:test")
+    width = int(args.width)
+    height = int(args.height)
+    num_slots = int(args.num_slots)
+    topic_id = getattr(args, "topic_id", "ImageMatCUDAPubSub:test")
 
     data = gpuarray.empty((height, width, 3), dtype=np.uint8)
     img = Model4Mat.ImageMatCUDAPubSub(
         color_format=Model4Mat.ImageMat.ColorFormat.BGR,
         shape_type=Model4Mat.ImageMat.ShapeType.HWC,
+        dtype=DataType.UINT8,
+        device=MatDevice.CUDA0,
         data=data,
         num_slots=num_slots,
     )
@@ -162,21 +165,17 @@ def main() -> None:
     args = parse_args()
     if not args.sub:
         run_publisher(args)
-        return
-
-    config = GlViewerConfig(
-        width=args.width,
-        height=args.height,
-        fps=args.fps,
-        device=args.device,
-        num_slots=args.num_slots,
-        topic_id=args.topic_id,
-        flip_y=args.flip_y,
-        max_frames=args.max_frames,
-    )
-    vis = ImageMatCudaGlViewer(config)
-    vis.init()
-    vis.run(img=make_image(vis.config))
+    else:
+        vis = ImageMatCudaGlViewer(                    
+            width=int(args.width),
+            height=int(args.height),
+            fps=args.fps,
+            device=args.device,
+            flip_y=args.flip_y,
+            max_frames=args.max_frames,
+        )
+        vis.init()
+        vis.run(img=make_image(args))
 
 
 if __name__ == "__main__":

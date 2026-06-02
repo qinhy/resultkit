@@ -443,7 +443,7 @@ class ImageMatCUDAPubSub(BaseModel):
             self._remote_event = cuda.event_from_ipc_handle(self._as_bytearray(event_handle))
             self._remote_event_handle = event_handle
 
-    def _remote_slot_view(self, signal):
+    def _remote_slot_view(self, signal: Iox2CUDAIPCFrameSignal):
         offset = int(signal.slot_index) * int(signal.frame_bytes)
         ptr = self._OffsetPointer(self._remote_mem, offset)
         return gpuarray.GPUArray(
@@ -488,12 +488,6 @@ class ImageMatCUDAPubSub(BaseModel):
         if isinstance(data, gpuarray.GPUArray):
             return data.get()
         return data
-
-    # def to_numpy(self, tmp=False):
-    #     data = self.get_data_numpy()
-    #     if not tmp:
-    #         return self.safe_update_data(data)
-    #     return self.model_copy(update={"data": data})
 
     def close(self):
         if self._remote_mem is not None:
