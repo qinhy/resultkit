@@ -17,6 +17,16 @@ dependencies = [
 [dependency-groups]
 dev = [
     "ipython>=9.13.0",
+    "pynvvideocodec>=2.1.0",
     "pytest>=9.0.3",
     "ultralytics>=8.4.51",
 ]
+
+[tool.uv.sources]
+torch = { index = "torch-cuda" }
+torchvision = { index = "torch-cuda" }
+
+[[tool.uv.index]]
+name = "torch-cuda"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true

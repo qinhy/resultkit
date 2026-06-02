@@ -12,12 +12,12 @@ from io import BytesIO
 import iceoryx2 as iox2
 
 try:    
-    from cuda import ImageMatCUDAPubSub
+    from cuda import ImageMatCUDAPubSub, EncodedImageMatCUDAPubSub
     from mat import to_ctypes_type, to_np_type
     from BasicModel import Controller4Basic, Model4Basic, BasicStore
     from mat import DataType, MatOps, NumpyMatOps, TorchMatOps, MatLib, MatDevice
 except Exception as e:    
-    from .cuda import ImageMatCUDAPubSub
+    from .cuda import ImageMatCUDAPubSub, EncodedImageMatCUDAPubSub
     from .mat import to_ctypes_type, to_np_type
     from .BasicModel import Controller4Basic, Model4Basic, BasicStore
     from .mat import DataType, MatOps, NumpyMatOps, TorchMatOps, MatLib, MatDevice
@@ -113,6 +113,11 @@ class MatViewMode(str, enum.Enum):
 class MatScaleFormat(str, enum.Enum):
     ZERO_ONE = "01"
     RAW = "raw"
+
+class BboxAxisFormat(str, enum.Enum):
+    XYXY = "xyxy"
+    XYWH = "xywh"
+    CXCYWH = "cxcywh"
 
 class Controller4Mat:
     class AbstractObjController(Controller4Basic.AbstractObjController):pass        
@@ -324,11 +329,11 @@ class Model4Mat:
         
         def _coerce_publish_data(self, data) -> np.ndarray:
             arr = np.asarray(data, dtype=self._np_dtype(), order="C")
-            if arr.shape != self.shape():
-                raise ValueError(
-                    f"published data shape must be {self.shape()}, got {arr.shape}. "
-                    "Create publisher/subscriber with the same shape on both sides."
-                )
+            # if arr.shape != self.shape():
+            #     raise ValueError(
+            #         f"published data shape must be {self.shape()}, got {arr.shape}. "
+            #         "Create publisher/subscriber with the same shape on both sides."
+            #     )
             return arr
 
         def pub(self, data=None, edit_func=None):
@@ -764,7 +769,7 @@ class Model4Mat:
 
         color_format: ColorFormat = ColorFormat.BGR
         shape_type: ImageShapeType = ImageShapeType.UNKNOWN
-        dtype: DataType = DataType.UINT8
+        dtype: DataType = DataType.UINT8 # MUST be UINT8 for raw bytes
         device: MatDevice = MatDevice.CPU
         BCHW: tuple[int, int, int, int] = Field(default=(0, 0, 0, 0))
 
@@ -877,6 +882,65 @@ class Model4Mat:
     class ImageMatPubSub(MatPubSub,ImageMat):
         pass
 
+    class EncodedImageMatPubSub(MatPubSub,EncodedImageMat):
+        @staticmethod
+        def set_first_64bit(arr: np.ndarray, val: int) -> None:
+            arr[:8].view("<u8")[0] = val
+        @staticmethod
+        def get_first_64bit(arr: np.ndarray) -> int:
+            return int(arr[:8].view("<u8")[0])
+        
+        def _slice_to_numpy(self, payload) -> np.ndarray:
+            c_type = self._ctypes_type()
+            n = self._n_elements
+            ptr = ctypes.cast(
+                int(payload.as_ptr()),
+                ctypes.POINTER(c_type),
+            )
+            arr = np.ctypeslib.as_array(ptr, shape=(n,))
+            return arr.ravel()
+        
+        def _out_assign(self,out,data):
+            ind = self._coerce_publish_data(data).ravel()
+            self.valid_nbytes = nb = len(ind)
+            self.set_first_64bit(out, nb)
+            out[8:nb+8] = ind
+
+        def pub(self, data=None, edit_func=None):
+            self.is_pub = True
+            sample = self.get_pub().loan_slice_uninit(self._n_elements)
+            out = self._slice_to_numpy(sample.payload())
+
+            if data is not None:
+                self._out_assign(out, data)
+            elif edit_func is None:
+                # No edit function means "publish the current model data".
+                self._out_assign(out, self.data)
+
+            if edit_func is not None:
+                edited = edit_func(out)
+                if edited is not None and edited is not out:
+                    self._out_assign(out, edited)
+
+            sample.assume_init().send()
+            return self
+
+        def sub(self, copy=False):
+            self.is_pub = False
+            sample = self.get_sub().receive()
+            if sample is None:
+                return self
+
+            # Keep the sample alive while exposing a zero-copy NumPy view.
+            # Without this, the local `sample` can be destroyed before cv2.imshow
+            # consumes `img.sub().get_data()`.
+            self._last_sample = sample
+            view = self._slice_to_numpy(sample.payload())
+            self.valid_nbytes = nb = self.get_first_64bit(view)
+            view = view[8:nb+8]
+            self.unsafe_update_data(view.copy() if copy else view)
+            return self
+        
     try:
         class ImageMatCUDAPubSub(ImageMatCUDAPubSub,ImageMatPubSub):
             dtype: DataType = DataType.FLOAT32
@@ -959,26 +1023,48 @@ class Model4Mat:
                     self.dtype = DataType.which(np.empty((0,), dtype=np.dtype(arr.dtype)))
                 except Exception:
                     pass
+        
+        class EncodedImageMatCUDAPubSub(EncodedImageMatCUDAPubSub,ImageMatCUDAPubSub,EncodedImageMatPubSub):
+            
+            _np_pub:np.ndarray = None
+
+            def np2gpu(self, data):
+                if self._np_pub is None:
+                    self._np_pub = np.zeros(self.shape(), dtype=np.uint8)
+                self._np_pub = self._np_pub.ravel()
+                self.valid_nbytes = nb = len(data)
+                self.set_first_64bit(self._np_pub , nb)
+                self._np_pub [8:nb+8] = data
+                self._np_pub  = self._np_pub.reshape(self.shape())
+                return gpuarray.to_gpu(self._np_pub)
+            
+            def get_data(self):
+                raw:gpuarray.GPUArray = super().get_data()
+                # Flatten GPU buffer; first 8 bytes contain valid payload length.
+                raw = raw.reshape(raw.size)
+
+                # Copy only the 8-byte header back to CPU.
+                nb = int(np.frombuffer(raw[:8].get(), dtype=np.uint64)[0])
+                self.valid_nbytes = nb
+
+                # Return GPUArray view containing only the encoded payload.
+                return raw[8:8 + nb]
+                
+
+
 
     except Exception:
         pass
 
     class BoundingBox(Mat):        
-        class AxisFormat(str, enum.Enum):
-            XYXY = "xyxy"
-            XYWH = "xywh"
-            CXCYWH = "cxcywh"
-        class ScaleFormat(str, enum.Enum):
-            ZERO_ONE = "01"
-            RAW = "raw"
         
         data: Union[np.ndarray,torch.Tensor] = Field(default_factory=lambda:np.random.rand(1,4), exclude=True)        
         labels_id:Optional[Union[np.ndarray,torch.Tensor]] = None
         scores:Optional[Union[np.ndarray,torch.Tensor]] = None
         labels:List[str] = Field(default_factory=list)
 
-        format: AxisFormat = AxisFormat.XYXY
-        scale: ScaleFormat = ScaleFormat.ZERO_ONE
+        format: BboxAxisFormat = BboxAxisFormat.XYXY
+        scale: MatScaleFormat = MatScaleFormat.ZERO_ONE
         image_size: Optional[Tuple[int, int]] = None  # width, height        
         model_config = ConfigDict(arbitrary_types_allowed=True, validate_assignment=True)
 

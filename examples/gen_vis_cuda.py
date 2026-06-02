@@ -34,25 +34,41 @@ extern "C" __global__ void draw_bgr_u8(
     unsigned char *frame,
     int width,
     int height,
-    unsigned int seed)
+    unsigned int frame_index)
 {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int p = blockIdx.x * blockDim.x + threadIdx.x;
     int n = width * height;
-    if (i >= n) return;
+    if (p >= n) return;
 
-    int x = i % width;
-    int y = i / width;
-
-    // Cheap deterministic row hashes. This gives a random-looking
-    // 10% subset per channel without creating GPU RNG state.
-    unsigned int h0 = (unsigned int)y * 1664525u + seed + 1013904223u;
-    unsigned int h1 = (unsigned int)y * 22695477u + seed * 3u + 1u;
-    unsigned int h2 = (unsigned int)y * 1103515245u + seed * 7u + 12345u;
+    int x = p % width;
+    int y = p / width;
 
     int base = (y * width + x) * 3;
-    frame[base + 0] = ((h0 >> 8) % 10u == 0u) ? 125u : 0u;  // B
-    frame[base + 1] = ((h1 >> 8) % 10u == 0u) ? 125u : 0u;  // G
-    frame[base + 2] = ((h2 >> 8) % 10u == 0u) ? 125u : 0u;  // R
+
+    // Same as:
+    // frame[:, :, 0] = np.linspace(0, 255, w, dtype=np.uint8)
+    unsigned char b = 0;
+    if (width > 1) {
+        b = (unsigned char)(((unsigned long long)x * 255ULL) / (unsigned long long)(width - 1));
+    }
+
+    // Same as:
+    // frame[:, :, 1] = int(i * 20) % 255
+    unsigned char g = (unsigned char)(((unsigned long long)frame_index * 20ULL) % 255ULL);
+
+    // Same as:
+    // frame[:, :, 2] = np.linspace(255, 0, h, dtype=np.uint8)[:, None]
+    unsigned char r = 255;
+    if (height > 1) {
+        r = (unsigned char)(
+            ((unsigned long long)(height - 1 - y) * 255ULL) /
+            (unsigned long long)(height - 1)
+        );
+    }
+
+    frame[base + 0] = b;  // B
+    frame[base + 1] = g;  // G
+    frame[base + 2] = r;  // R
 }
 '''
 

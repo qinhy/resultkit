@@ -13,6 +13,173 @@ except ImportError:
     gpuarray = None
     
 
+class Iox2CUDAIPCFrameSignal(ctypes.Structure):
+    """Small fixed-size iceoryx2 payload announcing the latest CUDA frame."""
+
+    payload_type = "CudaIpcFrameSignalV3PyCUDA"
+
+    _fields_ = [
+        ("magic", ctypes.c_char * 8),       # b"CUDAPY3"
+        ("version", ctypes.c_uint32),
+        ("slot_index", ctypes.c_uint32),
+
+        ("num_slots", ctypes.c_uint32),
+        ("ndim", ctypes.c_uint32),
+        ("dtype_str", ctypes.c_char * 16),  # numpy dtype.str, e.g. '|u1', '<f4'
+        ("itemsize", ctypes.c_uint32),
+        ("device_id", ctypes.c_int32),
+        ("producer_pid", ctypes.c_uint32),
+
+        ("sequence", ctypes.c_uint64),
+        ("frame_bytes", ctypes.c_uint64),
+        ("total_bytes", ctypes.c_uint64),
+
+        ("shape", ctypes.c_int64 * 8),
+        ("strides", ctypes.c_int64 * 8),
+
+        ("mem_handle_len", ctypes.c_uint64),
+        ("cuda_ipc_mem_handle", ctypes.c_uint8 * 64),
+
+        ("event_handle_len", ctypes.c_uint64),
+        ("cuda_ipc_event_handle", ctypes.c_uint8 * 64),
+    ]
+
+    @staticmethod
+    def type_name() -> str:
+        return "CudaIpcFrameSignalV3PyCUDA"
+
+    @classmethod
+    def new(
+        cls,
+        *,
+        sequence: int,
+        slot_index: int,
+        num_slots: int,
+        shape: Tuple[int, ...],
+        strides: Tuple[int, ...],
+        dtype_str: str,
+        itemsize: int,
+        frame_bytes: int,
+        total_bytes: int,
+        mem_handle: bytes,
+        event_handle: bytes,
+        device_id: int,
+        producer_pid: int,
+    ) -> "ImageMatCUDAPubSub.Iox2CUDAIPCFrameSignal":
+        if len(shape) > 8:
+            raise ValueError(f"CUDA IPC signal supports at most 8 dimensions, got {shape}")
+        if len(strides) != len(shape):
+            raise ValueError(f"strides length must match shape length: {strides} vs {shape}")
+        if len(mem_handle) > 64:
+            raise ValueError("CUDA IPC memory handle too large")
+        if len(event_handle) > 64:
+            raise ValueError("CUDA IPC event handle too large")
+
+        dtype_bytes = dtype_str.encode("ascii")
+        if len(dtype_bytes) >= 16:
+            raise ValueError(f"dtype string too long for CUDA IPC signal: {dtype_str!r}")
+
+        msg = cls()
+        msg.magic = b"CUDAPY3"
+        msg.version = 3
+        msg.slot_index = int(slot_index)
+        msg.num_slots = int(num_slots)
+        msg.ndim = len(shape)
+        msg.dtype_str = dtype_bytes
+        msg.itemsize = int(itemsize)
+        msg.device_id = int(device_id)
+        msg.producer_pid = int(producer_pid)
+        msg.sequence = int(sequence)
+        msg.frame_bytes = int(frame_bytes)
+        msg.total_bytes = int(total_bytes)
+
+        for i, value in enumerate(shape):
+            msg.shape[i] = int(value)
+        for i, value in enumerate(strides):
+            msg.strides[i] = int(value)
+
+        msg.mem_handle_len = len(mem_handle)
+        msg.cuda_ipc_mem_handle[: len(mem_handle)] = mem_handle
+        msg.event_handle_len = len(event_handle)
+        msg.cuda_ipc_event_handle[: len(event_handle)] = event_handle
+        return msg
+
+    def mem_handle_bytes(self) -> bytes:
+        return bytes(self.cuda_ipc_mem_handle[: self.mem_handle_len])
+
+    def event_handle_bytes(self) -> bytes:
+        return bytes(self.cuda_ipc_event_handle[: self.event_handle_len])
+
+    def dtype(self) -> np.dtype:
+        raw = bytes(self.dtype_str).split(b"\x00", 1)[0]
+        if not raw:
+            raise ValueError("empty dtype in CUDA IPC signal")
+        return np.dtype(raw.decode("ascii"))
+
+    def shape_tuple(self) -> Tuple[int, ...]:
+        return tuple(int(self.shape[i]) for i in range(int(self.ndim)))
+
+    def strides_tuple(self) -> Tuple[int, ...]:
+        return tuple(int(self.strides[i]) for i in range(int(self.ndim)))
+
+    def validate(self) -> None:
+        if bytes(self.magic).rstrip(b"\x00") != b"CUDAPY3":
+            raise ValueError(f"bad magic: {bytes(self.magic)!r}")
+        if self.version != 3:
+            raise ValueError(f"unsupported CUDA IPC signal version: {self.version}")
+        if not (0 <= self.slot_index < self.num_slots):
+            raise ValueError(f"slot_index out of range: {self.slot_index}/{self.num_slots}")
+        if self.ndim == 0 or self.ndim > 8:
+            raise ValueError(f"invalid ndim: {self.ndim}")
+        if self.mem_handle_len != 64:
+            raise ValueError(f"bad CUDA IPC memory handle length: {self.mem_handle_len}")
+        # Some PyCUDA builds, especially on Windows, expose CUDA IPC
+        # memory handles but do not expose event_from_ipc_handle.
+        # In that portable mode the publisher synchronizes before
+        # sending the signal and the event handle is intentionally empty.
+        if self.event_handle_len not in (0, 64):
+            raise ValueError(f"bad CUDA IPC event handle length: {self.event_handle_len}")
+        if self.frame_bytes <= 0 or self.total_bytes <= 0:
+            raise ValueError(
+                f"invalid CUDA IPC byte sizes: frame={self.frame_bytes}, total={self.total_bytes}"
+            )
+        if self.frame_bytes * self.num_slots > self.total_bytes:
+            raise ValueError(
+                f"ring layout exceeds allocation: frame={self.frame_bytes}, "
+                f"slots={self.num_slots}, total={self.total_bytes}"
+            )
+
+class _OffsetPointer(cuda.PointerHolderBase):
+    """PointerHolderBase that keeps the owner allocation alive and adds a byte offset.
+
+    PyCUDA's kernel argument builder accepts GPUArray objects and many
+    built-in pointer holders, but it does not recognize every custom
+    PointerHolderBase subclass when the object itself is passed as a
+    kernel argument.  Expose a ``gpudata`` integer so both of these
+    call styles work::
+
+        kernel(frame, ...)
+        kernel(frame.gpudata, ...)
+
+    The integer value is the final device pointer including offset.
+    """
+
+    def __init__(self, owner, offset: int = 0):
+        super().__init__()
+        self.owner = owner
+        self.offset = int(offset)
+
+    def get_pointer(self):
+        return int(self.owner) + self.offset
+
+    @property
+    def gpudata(self):
+        return int(self)
+
+    @property
+    def ptr(self):
+        return int(self)
+
 class ImageMatCUDAPubSub(BaseModel):
     """CUDA IPC backed ImageMat publisher/subscriber using PyCUDA only.
 
@@ -32,173 +199,6 @@ class ImageMatCUDAPubSub(BaseModel):
     CUDA_IPC_EVENT_HANDLE_BYTES: ClassVar[int] = 64
     DTYPE_STR_BYTES: ClassVar[int] = 16
     MAX_DIMS: ClassVar[int] = 8
-
-    class Iox2CUDAIPCFrameSignal(ctypes.Structure):
-        """Small fixed-size iceoryx2 payload announcing the latest CUDA frame."""
-
-        payload_type = "CudaIpcFrameSignalV3PyCUDA"
-
-        _fields_ = [
-            ("magic", ctypes.c_char * 8),       # b"CUDAPY3"
-            ("version", ctypes.c_uint32),
-            ("slot_index", ctypes.c_uint32),
-
-            ("num_slots", ctypes.c_uint32),
-            ("ndim", ctypes.c_uint32),
-            ("dtype_str", ctypes.c_char * 16),  # numpy dtype.str, e.g. '|u1', '<f4'
-            ("itemsize", ctypes.c_uint32),
-            ("device_id", ctypes.c_int32),
-            ("producer_pid", ctypes.c_uint32),
-
-            ("sequence", ctypes.c_uint64),
-            ("frame_bytes", ctypes.c_uint64),
-            ("total_bytes", ctypes.c_uint64),
-
-            ("shape", ctypes.c_int64 * 8),
-            ("strides", ctypes.c_int64 * 8),
-
-            ("mem_handle_len", ctypes.c_uint64),
-            ("cuda_ipc_mem_handle", ctypes.c_uint8 * 64),
-
-            ("event_handle_len", ctypes.c_uint64),
-            ("cuda_ipc_event_handle", ctypes.c_uint8 * 64),
-        ]
-
-        @staticmethod
-        def type_name() -> str:
-            return "CudaIpcFrameSignalV3PyCUDA"
-
-        @classmethod
-        def new(
-            cls,
-            *,
-            sequence: int,
-            slot_index: int,
-            num_slots: int,
-            shape: Tuple[int, ...],
-            strides: Tuple[int, ...],
-            dtype_str: str,
-            itemsize: int,
-            frame_bytes: int,
-            total_bytes: int,
-            mem_handle: bytes,
-            event_handle: bytes,
-            device_id: int,
-            producer_pid: int,
-        ) -> "ImageMatCUDAPubSub.Iox2CUDAIPCFrameSignal":
-            if len(shape) > 8:
-                raise ValueError(f"CUDA IPC signal supports at most 8 dimensions, got {shape}")
-            if len(strides) != len(shape):
-                raise ValueError(f"strides length must match shape length: {strides} vs {shape}")
-            if len(mem_handle) > 64:
-                raise ValueError("CUDA IPC memory handle too large")
-            if len(event_handle) > 64:
-                raise ValueError("CUDA IPC event handle too large")
-
-            dtype_bytes = dtype_str.encode("ascii")
-            if len(dtype_bytes) >= 16:
-                raise ValueError(f"dtype string too long for CUDA IPC signal: {dtype_str!r}")
-
-            msg = cls()
-            msg.magic = b"CUDAPY3"
-            msg.version = 3
-            msg.slot_index = int(slot_index)
-            msg.num_slots = int(num_slots)
-            msg.ndim = len(shape)
-            msg.dtype_str = dtype_bytes
-            msg.itemsize = int(itemsize)
-            msg.device_id = int(device_id)
-            msg.producer_pid = int(producer_pid)
-            msg.sequence = int(sequence)
-            msg.frame_bytes = int(frame_bytes)
-            msg.total_bytes = int(total_bytes)
-
-            for i, value in enumerate(shape):
-                msg.shape[i] = int(value)
-            for i, value in enumerate(strides):
-                msg.strides[i] = int(value)
-
-            msg.mem_handle_len = len(mem_handle)
-            msg.cuda_ipc_mem_handle[: len(mem_handle)] = mem_handle
-            msg.event_handle_len = len(event_handle)
-            msg.cuda_ipc_event_handle[: len(event_handle)] = event_handle
-            return msg
-
-        def mem_handle_bytes(self) -> bytes:
-            return bytes(self.cuda_ipc_mem_handle[: self.mem_handle_len])
-
-        def event_handle_bytes(self) -> bytes:
-            return bytes(self.cuda_ipc_event_handle[: self.event_handle_len])
-
-        def dtype(self) -> np.dtype:
-            raw = bytes(self.dtype_str).split(b"\x00", 1)[0]
-            if not raw:
-                raise ValueError("empty dtype in CUDA IPC signal")
-            return np.dtype(raw.decode("ascii"))
-
-        def shape_tuple(self) -> Tuple[int, ...]:
-            return tuple(int(self.shape[i]) for i in range(int(self.ndim)))
-
-        def strides_tuple(self) -> Tuple[int, ...]:
-            return tuple(int(self.strides[i]) for i in range(int(self.ndim)))
-
-        def validate(self) -> None:
-            if bytes(self.magic).rstrip(b"\x00") != b"CUDAPY3":
-                raise ValueError(f"bad magic: {bytes(self.magic)!r}")
-            if self.version != 3:
-                raise ValueError(f"unsupported CUDA IPC signal version: {self.version}")
-            if not (0 <= self.slot_index < self.num_slots):
-                raise ValueError(f"slot_index out of range: {self.slot_index}/{self.num_slots}")
-            if self.ndim == 0 or self.ndim > 8:
-                raise ValueError(f"invalid ndim: {self.ndim}")
-            if self.mem_handle_len != 64:
-                raise ValueError(f"bad CUDA IPC memory handle length: {self.mem_handle_len}")
-            # Some PyCUDA builds, especially on Windows, expose CUDA IPC
-            # memory handles but do not expose event_from_ipc_handle.
-            # In that portable mode the publisher synchronizes before
-            # sending the signal and the event handle is intentionally empty.
-            if self.event_handle_len not in (0, 64):
-                raise ValueError(f"bad CUDA IPC event handle length: {self.event_handle_len}")
-            if self.frame_bytes <= 0 or self.total_bytes <= 0:
-                raise ValueError(
-                    f"invalid CUDA IPC byte sizes: frame={self.frame_bytes}, total={self.total_bytes}"
-                )
-            if self.frame_bytes * self.num_slots > self.total_bytes:
-                raise ValueError(
-                    f"ring layout exceeds allocation: frame={self.frame_bytes}, "
-                    f"slots={self.num_slots}, total={self.total_bytes}"
-                )
-
-    class _OffsetPointer(cuda.PointerHolderBase):
-        """PointerHolderBase that keeps the owner allocation alive and adds a byte offset.
-
-        PyCUDA's kernel argument builder accepts GPUArray objects and many
-        built-in pointer holders, but it does not recognize every custom
-        PointerHolderBase subclass when the object itself is passed as a
-        kernel argument.  Expose a ``gpudata`` integer so both of these
-        call styles work::
-
-            kernel(frame, ...)
-            kernel(frame.gpudata, ...)
-
-        The integer value is the final device pointer including offset.
-        """
-
-        def __init__(self, owner, offset: int = 0):
-            super().__init__()
-            self.owner = owner
-            self.offset = int(offset)
-
-        def get_pointer(self):
-            return int(self.owner) + self.offset
-
-        @property
-        def gpudata(self):
-            return int(self)
-
-        @property
-        def ptr(self):
-            return int(self)
 
     lib: str = "pycuda"
     num_slots: int = Field(default=2, ge=1)
@@ -277,7 +277,7 @@ class ImageMatCUDAPubSub(BaseModel):
             self._service = (
                 self._get_node()
                 .service_builder(iox2.ServiceName.new(self.topic_name()))
-                .publish_subscribe(self.Iox2CUDAIPCFrameSignal)
+                .publish_subscribe(Iox2CUDAIPCFrameSignal)
                 .open_or_create()
             )
         return self._service
@@ -336,7 +336,7 @@ class ImageMatCUDAPubSub(BaseModel):
         return self._gpu_ring
 
     def _slot_view(self, slot_index: int):
-        ptr = self._OffsetPointer(self._gpu_ring.gpudata, int(slot_index) * int(self._frame_bytes))
+        ptr = _OffsetPointer(self._gpu_ring.gpudata, int(slot_index) * int(self._frame_bytes))
         return gpuarray.GPUArray(
             shape=self._gpu_ring_shape,
             dtype=self._gpu_ring_dtype,
@@ -348,7 +348,7 @@ class ImageMatCUDAPubSub(BaseModel):
     def _make_signal(self, slot_index: int):
         shape = tuple(int(v) for v in self._gpu_ring_shape)
         strides = tuple(np.ndarray(shape, dtype=self._gpu_ring_dtype).strides)
-        return self.Iox2CUDAIPCFrameSignal.new(
+        return Iox2CUDAIPCFrameSignal.new(
             sequence=int(self.sequence),
             slot_index=int(slot_index),
             num_slots=int(self.num_slots),
@@ -445,7 +445,7 @@ class ImageMatCUDAPubSub(BaseModel):
 
     def _remote_slot_view(self, signal: Iox2CUDAIPCFrameSignal):
         offset = int(signal.slot_index) * int(signal.frame_bytes)
-        ptr = self._OffsetPointer(self._remote_mem, offset)
+        ptr = _OffsetPointer(self._remote_mem, offset)
         return gpuarray.GPUArray(
             shape=signal.shape_tuple(),
             dtype=signal.dtype(),
@@ -502,3 +502,46 @@ class ImageMatCUDAPubSub(BaseModel):
             self.close()
         except Exception:
             pass
+
+class EncodedImageMatCUDAPubSub(ImageMatCUDAPubSub):
+    
+    def _remote_slot_view(self, signal: Iox2CUDAIPCFrameSignal):
+        offset = int(signal.slot_index) * int(signal.frame_bytes)
+        ptr = _OffsetPointer(self._remote_mem, offset)
+        return gpuarray.GPUArray(
+            shape=signal.shape_tuple(),
+            dtype=signal.dtype(),
+            gpudata=ptr,
+            base=self._remote_mem,
+            strides=signal.strides_tuple(),
+        )
+
+    def sub(self, copy=False, sync=True):
+        """Receive one CUDA image frame as a PyCUDA GPUArray.
+
+        ``copy=False`` returns a view into the publisher ring buffer.
+        ``copy=True`` makes a GPU copy so later publisher writes cannot
+        overwrite the subscriber's array.
+        """
+        self.is_pub = False
+        sample = self.get_sub().receive()
+        if sample is None:
+            return self
+
+        signal = sample.payload().contents
+        # signal.validate()
+
+        self._open_remote_memory_if_needed(signal)
+        self._open_remote_event_if_needed(signal)
+
+        if sync and self._remote_event is not None:
+            self._remote_event.synchronize()
+
+        view = self._remote_slot_view(signal)
+        self.data = view.copy() if copy else view
+        self.sequence = int(signal.sequence)
+        self.device_id = int(signal.device_id)
+        self.producer_pid = int(signal.producer_pid)
+        # self._update_image_metadata_from_array(self.data)
+        return self
+
