@@ -21,7 +21,7 @@ from pycuda.compiler import SourceModule
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from resultkit.MatModel import ColorFormat, Model4Mat
+from resultkit.MatModel import ColorFormat, ImageShapeType, Model4Mat
 from resultkit.cudavis import ImageMatCudaGlViewer
 from resultkit.mat import DataType, MatDevice
 
@@ -108,7 +108,7 @@ def make_image(args):
     data = gpuarray.empty((height, width, 3), dtype=np.uint8)
     img = Model4Mat.ImageMatCUDAPubSub(
         color_format=ColorFormat.BGR,
-        shape_type=Model4Mat.ImageMat.ShapeType.HWC,
+        shape_type=ImageShapeType.HWC,
         dtype=DataType.UINT8,
         device=MatDevice.CUDA0,
         data=data,
