@@ -2,6 +2,7 @@
 import ctypes
 import enum
 from typing import Any, ClassVar, Dict, List, Optional, Tuple, Union
+import cv2
 import numpy as np
 from pydantic import ConfigDict, Field, PrivateAttr
 import torch
@@ -28,7 +29,91 @@ except ImportError:
     print("warning: pycuda is not available")
     cuda = None
     gpuarray = None
-    
+
+
+class ColorFormat(str, enum.Enum):
+    RGB = "RGB"
+    BGR = "BGR"
+    GRAY = "GRAY"
+    BAYER = "BAYER"
+    UNKNOWN = "UNKNOWN"
+
+    @classmethod
+    def channels(cls, color_format) -> int:
+        color_format = cls(color_format)
+        channel_counts = {
+            cls.RGB: 3,
+            cls.BGR: 3,
+            cls.GRAY: 1,
+            cls.BAYER: 1,
+        }
+        if color_format not in channel_counts:
+            raise ValueError(f"Unknown color format: {color_format}")
+        return channel_counts[color_format]
+
+class ImageShapeType(str, enum.Enum):
+    BCHW = "BCHW"  # torch, float, [0, 1]
+    HW = "HW"      # numpy, uint8, grayscale
+    BHW = "BHW"    # numpy, uint8, grayscale batch
+    HWC = "HWC"    # numpy, uint8, channels-last, C>1
+    BHWC = "BHWC"  # numpy, uint8, batch + channels-last, C>1
+    UNKNOWN = "UNKNOWN"
+
+    @staticmethod
+    def to_bchw(shape_type, data) -> tuple[int, int, int, int]:
+        shape = tuple(int(v) for v in data.shape)
+        key = shape_type.value if isinstance(shape_type, enum.Enum) else str(shape_type)
+
+        expected_ndim = {
+            "BCHW": 4,
+            "HW": 2,
+            "BHW": 3,
+            "HWC": 3,
+            "BHWC": 4,
+        }
+        if key not in expected_ndim:
+            raise ValueError(f"Cannot convert unknown shape type to BCHW: {shape_type}")
+
+        if len(shape) != expected_ndim[key]:
+            raise ValueError(
+                f"Shape type {shape_type} expects {expected_ndim[key]} dimensions, "
+                f"got shape {shape}"
+            )
+
+        if key == "BCHW":
+            b, c, h, w = shape
+        elif key == "HW":
+            h, w = shape
+            b, c = 1, 1
+        elif key == "BHW":
+            b, h, w = shape
+            c = 1
+        elif key == "HWC":
+            h, w, c = shape
+            b = 1
+        else:  # BHWC
+            b, h, w, c = shape
+
+        return b, c, h, w
+
+class CodecFormat(str, enum.Enum):
+    JPEG = "jpeg"
+    PNG = "png"
+    MJPEG = "mjpeg"
+    H264 = "h264"
+    H265 = "h265"
+    HEVC = "hevc"
+    AV1 = "av1"
+
+class MatViewMode(str, enum.Enum):
+    HWxyxy = "HWxyxy"
+    HWxyhw = "HWxyhw"
+    ALL = "ALL"
+
+class MatScaleFormat(str, enum.Enum):
+    ZERO_ONE = "01"
+    RAW = "raw"
+
 class Controller4Mat:
     class AbstractObjController(Controller4Basic.AbstractObjController):pass        
     class AbstractGroupController(Controller4Basic.AbstractGroupController):pass  
@@ -97,7 +182,6 @@ class Model4Mat:
             if mat_lib == MatLib.TORCH:
                 return TorchMatOps()
             raise ValueError(f"Unsupported matrix library: {lib}")
-
 
     class MatPubSub(Mat):
         lib: str = "iceoryx2"
@@ -298,73 +382,8 @@ class Model4Mat:
             return self
 
     class ImageMat(Mat):
-        class ColorFormat(str, enum.Enum):
-            RGB = "RGB"
-            BGR = "BGR"
-            GRAY = "GRAY"
-            BAYER = "BAYER"
-            UNKNOWN = "UNKNOWN"
-
-            @classmethod
-            def channels(cls, color_format) -> int:
-                color_format = cls(color_format)
-                channel_counts = {
-                    cls.RGB: 3,
-                    cls.BGR: 3,
-                    cls.GRAY: 1,
-                    cls.BAYER: 1,
-                }
-                if color_format not in channel_counts:
-                    raise ValueError(f"Unknown color format: {color_format}")
-                return channel_counts[color_format]
-
-        class ShapeType(str, enum.Enum):
-            BCHW = "BCHW"  # torch, float, [0, 1]
-            HW = "HW"      # numpy, uint8, grayscale
-            BHW = "BHW"    # numpy, uint8, grayscale batch
-            HWC = "HWC"    # numpy, uint8, channels-last, C>1
-            BHWC = "BHWC"  # numpy, uint8, batch + channels-last, C>1
-            UNKNOWN = "UNKNOWN"
-
-            @staticmethod
-            def to_bchw(shape_type, data) -> tuple[int, int, int, int]:
-                shape = tuple(int(v) for v in data.shape)
-                key = shape_type.value if isinstance(shape_type, enum.Enum) else str(shape_type)
-
-                expected_ndim = {
-                    "BCHW": 4,
-                    "HW": 2,
-                    "BHW": 3,
-                    "HWC": 3,
-                    "BHWC": 4,
-                }
-                if key not in expected_ndim:
-                    raise ValueError(f"Cannot convert unknown shape type to BCHW: {shape_type}")
-
-                if len(shape) != expected_ndim[key]:
-                    raise ValueError(
-                        f"Shape type {shape_type} expects {expected_ndim[key]} dimensions, "
-                        f"got shape {shape}"
-                    )
-
-                if key == "BCHW":
-                    b, c, h, w = shape
-                elif key == "HW":
-                    h, w = shape
-                    b, c = 1, 1
-                elif key == "BHW":
-                    b, h, w = shape
-                    c = 1
-                elif key == "HWC":
-                    h, w, c = shape
-                    b = 1
-                else:  # BHWC
-                    b, h, w, c = shape
-
-                return b, c, h, w
-
         color_format: ColorFormat = ColorFormat.GRAY
-        shape_type: ShapeType = ShapeType.UNKNOWN
+        shape_type: ImageShapeType = ImageShapeType.UNKNOWN
         dtype: DataType = DataType.UNKNOWN
         BCHW: tuple[int, int, int, int] = Field(default=(0, 0, 0, 0))
         path: Optional[str] = None
@@ -376,26 +395,25 @@ class Model4Mat:
 
 
         def safe_update_data(self,data:Union[np.ndarray,torch.Tensor]):
-            model = self.__class__(**{'color_format':Model4Mat.ImageMat.ColorFormat.UNKNOWN,'data':data})
+            model = self.__class__(**{'color_format':ColorFormat.UNKNOWN,'data':data})
             return self.controller.update(**{**model.model_dump(),'data':model.data}).model
         
         def init(self):
             super().init()
 
-            cls = type(self)
-            self.color_format = cls.ColorFormat(self.color_format)
-            self.shape_type = cls.ShapeType(self.shape_type)
+            self.color_format = ColorFormat(self.color_format)
+            self.shape_type = ImageShapeType(self.shape_type)
 
-            if self.shape_type == cls.ShapeType.UNKNOWN:
+            if self.shape_type == ImageShapeType.UNKNOWN:
                 self.shape_type = self._infer_shape_type()
 
-            B,C,H,W = self.BCHW = cls.ShapeType.to_bchw(self.shape_type, self.get_data())
+            B,C,H,W = self.BCHW = ImageShapeType.to_bchw(self.shape_type, self.get_data())
 
-            if self.color_format == cls.ColorFormat.UNKNOWN:
+            if self.color_format == ColorFormat.UNKNOWN:
                 if C == 1:
-                    self.color_format = cls.ColorFormat.GRAY # or Bayer
+                    self.color_format = ColorFormat.GRAY # or Bayer
                 elif C == 3:
-                    self.color_format = cls.ColorFormat.RGB # or BGR
+                    self.color_format = ColorFormat.RGB # or BGR
                 else:
                     raise ValueError(f"Unsupported number of channels: {C}")
                 
@@ -407,28 +425,28 @@ class Model4Mat:
             ndim = len(shape)
 
             if ndim == 2:
-                return cls.ShapeType.HW
+                return ImageShapeType.HW
 
             if self.lib == MatLib.TORCH:
                 if ndim == 4:
-                    return cls.ShapeType.BCHW
+                    return ImageShapeType.BCHW
                 raise ValueError(f"Torch image data must be BCHW, got shape {shape}")
 
             if self.lib != MatLib.NUMPY:
                 raise TypeError(f"Unsupported image backend: {self.lib}")
 
             if ndim == 3:
-                if self.color_format == cls.ColorFormat.UNKNOWN:
+                if self.color_format == ColorFormat.UNKNOWN:
                     raise ValueError(
                         "Cannot infer 3-D NumPy image layout. "
                         "Set shape_type to BHW or HWC and set color_format."
                     )
 
-                expected_channels = cls.ColorFormat.channels(self.color_format)
+                expected_channels = ColorFormat.channels(self.color_format)
                 if shape[-1] == expected_channels:
-                    return cls.ShapeType.HWC
+                    return ImageShapeType.HWC
                 if expected_channels == 1:
-                    return cls.ShapeType.BHW
+                    return ImageShapeType.BHW
 
                 raise ValueError(
                     f"Cannot infer 3-D NumPy image layout for shape {shape} "
@@ -436,7 +454,7 @@ class Model4Mat:
                 )
 
             if ndim == 4:
-                return cls.ShapeType.BHWC
+                return ImageShapeType.BHWC
 
             raise ValueError(f"Unsupported image shape: {shape}")
 
@@ -457,10 +475,10 @@ class Model4Mat:
             if min(b, c, h, w) <= 0:
                 raise ValueError(f"Invalid BCHW dimensions: {self.BCHW}")
 
-            if self.color_format == cls.ColorFormat.UNKNOWN:
+            if self.color_format == ColorFormat.UNKNOWN:
                 raise TypeError("color_format must be RGB, BGR, GRAY, or BAYER")
 
-            expected_channels = cls.ColorFormat.channels(self.color_format)
+            expected_channels = ColorFormat.channels(self.color_format)
             if c != expected_channels:
                 raise TypeError(
                     f"Expected {expected_channels} channels for {self.color_format}, "
@@ -468,7 +486,7 @@ class Model4Mat:
                 )
 
             if self.lib == MatLib.TORCH:
-                if self.shape_type != cls.ShapeType.BCHW:
+                if self.shape_type != ImageShapeType.BCHW:
                     raise TypeError(f"Expected BCHW shape for torch data, got {self.shape_type}")
                 if self.dtype not in {DataType.FLOAT32, DataType.FLOAT16, DataType.BFLOAT16}:
                     raise TypeError(f"Expected float dtype for torch data, got {self.dtype}")
@@ -482,7 +500,7 @@ class Model4Mat:
                     raise ValueError(f"Expected torch image values in [0, 1], got {mi}~{ma}")
 
             elif self.lib == MatLib.NUMPY:
-                if self.shape_type == cls.ShapeType.BCHW:
+                if self.shape_type == ImageShapeType.BCHW:
                     raise TypeError(f"Expected HW, BHW, HWC, or BHWC for NumPy data, got {self.shape_type}")
                 if self.dtype != DataType.UINT8:
                     raise TypeError(f"Expected uint8 dtype for NumPy data, got {self.dtype}")
@@ -581,15 +599,6 @@ class Model4Mat:
             return res
 
     class ImageMatView(ImageMat):
-        class Mode(str, enum.Enum):
-            HWxyxy = "HWxyxy"
-            HWxyhw = "HWxyhw"
-            ALL = "ALL"
-
-        class ScaleFormat(str, enum.Enum):
-            ZERO_ONE = "01"
-            RAW = "raw"
-        
         target_img_id: str=None
         view2target3x3: list = Field(default_factory=list)
         target2view3x3: list = Field(default_factory=list)
@@ -598,8 +607,8 @@ class Model4Mat:
             default_factory=lambda: np.zeros((1, 2), dtype=np.int32),
             exclude=True,
         )
-        mode:Mode = Mode.HWxyxy
-        scale:ScaleFormat = ScaleFormat.RAW
+        mode:MatViewMode = MatViewMode.HWxyxy
+        scale:MatScaleFormat = MatScaleFormat.RAW
         _ranges:Dict = None
 
         def model_post_init(self, context):
@@ -610,8 +619,8 @@ class Model4Mat:
         def calc_hw_range(self,data,img_size):
             width, height = img_size
 
-            if self.mode == self.Mode.HWxyxy:
-                if self.scale == self.ScaleFormat.ZERO_ONE:
+            if self.mode == MatViewMode.HWxyxy:
+                if self.scale == MatScaleFormat.ZERO_ONE:
                     (H_from, W_from), (H_to, W_to) = data
                     H_from *= height
                     H_to *= height
@@ -620,8 +629,8 @@ class Model4Mat:
                 else:
                     (H_from, W_from), (H_to, W_to) = data
 
-            elif self.mode == self.Mode.HWxyhw:
-                if self.scale == self.ScaleFormat.ZERO_ONE:
+            elif self.mode == MatViewMode.HWxyhw:
+                if self.scale == MatScaleFormat.ZERO_ONE:
                     (H_from, W_from), (H_len, W_len) = data
                     H_to = H_from + H_len * height
                     W_to = W_from + W_len * width
@@ -648,7 +657,7 @@ class Model4Mat:
             self.dtype = img.dtype
             self.BCHW = img.BCHW
 
-            if self.mode == self.Mode.ALL:
+            if self.mode == MatViewMode.ALL:
                 return self.view_from_ranges(img.get_data(), self.data)
         
             (a,b),(c,d) = self.data
@@ -678,11 +687,11 @@ class Model4Mat:
                 [0, 1, H_from],
                 [0, 0, 1]]
             
-            if img.shape_type == Model4Mat.ImageMat.ShapeType.BCHW:
+            if img.shape_type == ImageShapeType.BCHW:
                 res_func = lambda data,H_from,H_to,W_from,W_to:data[:,:,H_from:H_to,W_from:W_to]
-            elif img.shape_type in [Model4Mat.ImageMat.ShapeType.HWC,Model4Mat.ImageMat.ShapeType.HW]:
+            elif img.shape_type in [ImageShapeType.HWC,ImageShapeType.HW]:
                 res_func = lambda data,H_from,H_to,W_from,W_to:data[H_from:H_to,W_from:W_to]
-            elif img.shape_type in [Model4Mat.ImageMat.ShapeType.BHWC,Model4Mat.ImageMat.ShapeType.BHW]:
+            elif img.shape_type in [ImageShapeType.BHWC,ImageShapeType.BHW]:
                 res_func = lambda data,H_from,H_to,W_from,W_to:data[:,H_from:H_to,W_from:W_to]
             else:
                 raise ValueError(f"Unsupported shape type: {img.shape_type}")
@@ -724,6 +733,147 @@ class Model4Mat:
             img = Image.fromarray(tmp)
             img.show(title=title)
 
+    class EncodedImageMat(ImageMat):
+        """
+        One encoded stream payload.
+
+        This represents one encoded frame/access-unit/message, not a whole video file.
+
+        Good with OpenCV directly:
+        - JPEG
+        - PNG
+        - MJPEG frame, represented as JPEG bytes
+
+        Needs a stateful decoder backend, not cv2.imdecode:
+        - H264
+        - H265 / HEVC
+        - AV1
+        """
+        codec: CodecFormat = CodecFormat.JPEG
+
+        # Metadata for streaming.
+        frame_index: int = -1
+        pts_ns: Optional[int] = None
+        dts_ns: Optional[int] = None
+        is_keyframe: bool = True
+        valid_nbytes: int = 0
+
+        # Optional decoded-frame metadata.
+        width: int = 0
+        height: int = 0
+
+        color_format: ColorFormat = ColorFormat.BGR
+        shape_type: ImageShapeType = ImageShapeType.UNKNOWN
+        dtype: DataType = DataType.UINT8
+        device: MatDevice = MatDevice.CPU
+        BCHW: tuple[int, int, int, int] = Field(default=(0, 0, 0, 0))
+
+        data: Union[np.ndarray, bytes, bytearray, memoryview] = Field(
+            default_factory=lambda: np.empty((0,), dtype=np.uint8),
+            exclude=True,
+        )
+
+        model_config = ConfigDict(arbitrary_types_allowed=True)
+
+        @classmethod
+        def _as_uint8_1d(cls, data) -> np.ndarray:
+            if isinstance(data, np.ndarray):
+                arr = data.reshape(-1)
+                if arr.dtype != np.uint8:
+                    arr = arr.astype(np.uint8, copy=False)
+                return np.ascontiguousarray(arr)
+
+            if isinstance(data, (bytes, bytearray, memoryview)):
+                return np.frombuffer(data, dtype=np.uint8).copy()
+
+            arr = np.asarray(data)
+            if arr.dtype != np.uint8:
+                arr = arr.astype(np.uint8, copy=False)
+            return np.ascontiguousarray(arr.reshape(-1))
+
+        def init(self):
+            # Do not call init(); encoded bytes are not decoded pixels.
+            self.data = type(self)._as_uint8_1d(self.data)
+            self.codec = CodecFormat(self.codec)
+            self.color_format = ColorFormat(self.color_format)
+            self.shape_type = ImageShapeType(self.shape_type)
+
+            self.lib = MatLib.NUMPY
+            self.device = MatDevice.CPU
+            self.dtype = DataType.UINT8
+            self.BCHW = (0, 0, 0, 0)
+
+            if self.valid_nbytes <= 0:
+                self.valid_nbytes = int(self.data.size)
+
+            return self
+
+        def validate(self):
+            if not isinstance(self.data, np.ndarray):
+                raise TypeError(f"EncodedImageMat data must be np.ndarray, got {type(self.data)!r}")
+
+            if self.data.dtype != np.uint8:
+                raise TypeError(f"EncodedImageMat data must be uint8, got {self.data.dtype}")
+
+            if self.data.ndim != 1:
+                raise TypeError(f"EncodedImageMat data must be 1-D bytes, got {self.data.shape}")
+
+            if self.valid_nbytes < 0:
+                raise ValueError(f"valid_nbytes must be >= 0, got {self.valid_nbytes}")
+
+            if self.valid_nbytes > self.data.size:
+                raise ValueError(
+                    f"valid_nbytes={self.valid_nbytes} exceeds buffer size={self.data.size}"
+                )
+
+            return self
+
+        def payload(self) -> np.ndarray:
+            return self.data[: self.valid_nbytes]
+
+        def get_bytes(self) -> bytes:
+            return self.payload().tobytes()
+
+        def nbytes(self) -> int:
+            return int(self.valid_nbytes)
+
+        def unsafe_update_data(
+            self,
+            data: Union[np.ndarray, bytes, bytearray, memoryview],
+            valid_nbytes: Optional[int] = None,
+        ):
+            self.data = type(self)._as_uint8_1d(data)
+            self.valid_nbytes = int(self.data.size if valid_nbytes is None else valid_nbytes)
+            self.lib = MatLib.NUMPY
+            self.device = MatDevice.CPU
+            self.dtype = DataType.UINT8
+            self.validate()
+            return self
+
+        def safe_update_data(
+            self,
+            data: Union[np.ndarray, bytes, bytearray, memoryview],
+            valid_nbytes: Optional[int] = None,
+        ):
+            model = self.__class__(
+                **{
+                    **self.model_dump(exclude=["lib", "device", "dtype"]),
+                    "data": data,
+                    "valid_nbytes": int(
+                        len(data) if valid_nbytes is None and not isinstance(data, np.ndarray)
+                        else np.asarray(data).size if valid_nbytes is None
+                        else valid_nbytes
+                    ),
+                }
+            )
+            model.validate()
+            return self.controller.update(
+                **{
+                    **model.model_dump(),
+                    "data": model.data,
+                }
+            ).model
+
     class ImageMatPubSub(MatPubSub,ImageMat):
         pass
 
@@ -750,7 +900,7 @@ class Model4Mat:
                 if min(b, c, h, w) <= 0:
                     raise ValueError(f"Invalid BCHW dimensions: {self.BCHW}")
 
-                expected_channels = cls.ColorFormat.channels(self.color_format)
+                expected_channels = ColorFormat.channels(self.color_format)
                 if c != expected_channels:
                     raise TypeError(
                         f"Expected {expected_channels} channels for {self.color_format}, "
@@ -758,7 +908,7 @@ class Model4Mat:
                     )
 
                 np_dtype = np.dtype(self.data.dtype)
-                if self.shape_type == cls.ShapeType.BCHW:
+                if self.shape_type == ImageShapeType.BCHW:
                     if np_dtype not in {np.dtype("float16"), np.dtype("float32")}:
                         raise TypeError(f"Expected float dtype for BCHW PyCUDA image data, got {np_dtype}")
                 else:
@@ -767,41 +917,41 @@ class Model4Mat:
 
             def _update_image_metadata_from_array(self, arr):
                 cls = Model4Mat.ImageMat
-                self.color_format = cls.ColorFormat(self.color_format)
-                self.shape_type = cls.ShapeType(self.shape_type)
+                self.color_format = ColorFormat(self.color_format)
+                self.shape_type = ImageShapeType(self.shape_type)
 
-                if self.shape_type == cls.ShapeType.UNKNOWN:
+                if self.shape_type == ImageShapeType.UNKNOWN:
                     ndim = int(len(arr.shape))
                     if ndim == 2:
-                        self.shape_type = cls.ShapeType.HW
+                        self.shape_type = ImageShapeType.HW
                     elif ndim == 3:
-                        if self.color_format == cls.ColorFormat.UNKNOWN:
+                        if self.color_format == ColorFormat.UNKNOWN:
                             raise ValueError(
                                 "Cannot infer 3-D PyCUDA image layout. "
                                 "Set shape_type to BHW or HWC and set color_format."
                             )
-                        expected = cls.ColorFormat.channels(self.color_format)
+                        expected = ColorFormat.channels(self.color_format)
                         if int(arr.shape[-1]) == expected:
-                            self.shape_type = cls.ShapeType.HWC
+                            self.shape_type = ImageShapeType.HWC
                         elif expected == 1:
-                            self.shape_type = cls.ShapeType.BHW
+                            self.shape_type = ImageShapeType.BHW
                         else:
                             raise ValueError(
                                 f"Cannot infer 3-D PyCUDA layout for shape={arr.shape} "
                                 f"and color_format={self.color_format}"
                             )
                     elif ndim == 4:
-                        self.shape_type = cls.ShapeType.BHWC
+                        self.shape_type = ImageShapeType.BHWC
                     else:
                         raise ValueError(f"Unsupported PyCUDA image shape: {arr.shape}")
 
-                b, c, h, w = self.BCHW = cls.ShapeType.to_bchw(self.shape_type, arr)
+                b, c, h, w = self.BCHW = ImageShapeType.to_bchw(self.shape_type, arr)
 
-                if self.color_format == cls.ColorFormat.UNKNOWN:
+                if self.color_format == ColorFormat.UNKNOWN:
                     if c == 1:
-                        self.color_format = cls.ColorFormat.GRAY
+                        self.color_format = ColorFormat.GRAY
                     elif c == 3:
-                        self.color_format = cls.ColorFormat.RGB
+                        self.color_format = ColorFormat.RGB
                     else:
                         raise ValueError(f"Unsupported number of channels: {c}")
 

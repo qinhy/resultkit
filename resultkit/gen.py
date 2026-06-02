@@ -24,7 +24,7 @@ class FrameGenerator(BaseModel):
         return self.img.color_format
     
     def model_post_init(self, context):
-        self.is_mono = (self.color in [Model4Mat.ImageMat.ColorFormat.GRAY, Model4Mat.ImageMat.ColorFormat.BAYER])
+        self.is_mono = (self.color in [ColorFormat.GRAY, ColorFormat.BAYER])
         return super().model_post_init(context)
     
     # def read(self,frame=None):

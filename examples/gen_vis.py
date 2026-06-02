@@ -8,7 +8,7 @@ import numpy as np
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from resultkit.MatModel import Model4Mat
+from resultkit.MatModel import ColorFormat, Model4Mat
 # from resultkit.gen import FrameGenerator
 # from resultkit.vis import FrameGeneratorVisualizer
 
@@ -33,7 +33,7 @@ def main() -> None:
     args = parser.parse_args()
 
     img = Model4Mat.ImageMatPubSub(
-        color_format=Model4Mat.ImageMat.ColorFormat.BGR,
+        color_format=ColorFormat.BGR,
         data=np.zeros((args.height, args.width, 3), dtype=np.uint8),
     )
     img.set_id("ImageMatPubSub:test").init()
