@@ -44,6 +44,19 @@ class Iox2CUDAIPCFrameSignal(ctypes.Structure):
         ("cuda_ipc_event_handle", ctypes.c_uint8 * 64),
     ]
 
+    def __repr__(self):
+        return (f"Iox2CUDAIPCFrameSignal(device_id={self.device_id},"
+                # f"producer_pid={self.producer_pid},"
+                # f"sequence={self.sequence},"
+                # f"frame_bytes={self.frame_bytes},"
+                # f"total_bytes={self.total_bytes},"
+                # f"shape={self.shape_tuple()},"
+                # f"strides={self.strides_tuple()}"
+                f"cuda_ipc_mem_handle={self.cuda_ipc_mem_handle}"
+                f")"
+                )
+    
+
     @staticmethod
     def type_name() -> str:
         return "CudaIpcFrameSignalV3PyCUDA"
@@ -270,7 +283,8 @@ class ImageMatCUDAPubSub(BaseModel):
             # PyCUDA does not consume torch CUDA tensors directly here.
             # Copy through host for correctness without CuPy/DLPack.
             data = data.detach().cpu().numpy()
-        return gpuarray.to_gpu(np.ascontiguousarray(data))
+            return gpuarray.to_gpu(np.ascontiguousarray(data))
+        raise ValueError(f"not supported data type of {data.__class__.__name__}")
 
     def _get_service(self):
         if self._service is None:
@@ -345,7 +359,7 @@ class ImageMatCUDAPubSub(BaseModel):
             strides=tuple(np.ndarray(self._gpu_ring_shape, dtype=self._gpu_ring_dtype).strides),
         )
     
-    def _make_signal(self, slot_index: int):
+    def _make_signal(self, slot_index: int)->Iox2CUDAIPCFrameSignal:
         shape = tuple(int(v) for v in self._gpu_ring_shape)
         strides = tuple(np.ndarray(shape, dtype=self._gpu_ring_dtype).strides)
         return Iox2CUDAIPCFrameSignal.new(
@@ -395,7 +409,8 @@ class ImageMatCUDAPubSub(BaseModel):
             cuda.Context.synchronize()
 
         sample = self.get_pub().loan_uninit()
-        sample = sample.write_payload(self._make_signal(slot_index))
+        signal = self._make_signal(slot_index)
+        sample = sample.write_payload(signal)
         sample.send()
 
         self.data = out
