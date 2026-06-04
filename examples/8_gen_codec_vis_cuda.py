@@ -408,13 +408,18 @@ def mat_device(device: int):
 
 def make_cuda_image_endpoint(cfg: Config, *, is_pub: bool):
     import pycuda.gpuarray as gpuarray
-
+    try:
+        data = gpuarray.empty((int(cfg.height), int(cfg.width), 3), dtype=np.uint8)
+    except Exception as e:
+        print(e)
+        raise ValueError("PyCUDA is trying to allocate GPU memory, but probably no current one. There are maybe muti-context exits.")
+    
     img = Model4Mat.ImageMatCUDAPubSub(
         color_format=ColorFormat.RGB,
         shape_type=ImageShapeType.HWC,
         dtype=DataType.UINT8,
         device=mat_device(cfg.device),
-        data=gpuarray.empty((int(cfg.height), int(cfg.width), 3), dtype=np.uint8),
+        data=data,
         num_slots=int(cfg.num_slots),
     )
     img.set_id(cfg.image_topic).init()

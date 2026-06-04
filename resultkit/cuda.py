@@ -12,6 +12,114 @@ except ImportError:
     cuda = None
     gpuarray = None
     
+TORCH_DTYPE_TO_NUMPY = {
+    torch.uint8: np.uint8,
+    torch.int8: np.int8,
+    torch.int16: np.int16,
+    torch.int32: np.int32,
+    torch.int64: np.int64,
+    torch.float16: np.float16,
+    torch.float32: np.float32,
+    torch.float64: np.float64,
+    torch.bool: np.bool_,
+}
+
+
+class TorchTensorPointer(cuda.PointerHolderBase):
+    def __init__(self, tensor: torch.Tensor):
+        super().__init__()
+        if not tensor.is_cuda:
+            raise TypeError("tensor must be CUDA")
+        self.tensor = tensor  # keep owner alive
+
+    def get_pointer(self):
+        return int(self.tensor.data_ptr())
+
+
+def torch_tensor_to_gpuarray_view(t: torch.Tensor):
+    if not t.is_cuda:
+        raise TypeError("expected CUDA tensor")
+    if t.dtype not in TORCH_DTYPE_TO_NUMPY:
+        raise TypeError(f"unsupported torch dtype: {t.dtype}")
+    if not t.is_contiguous():
+        raise ValueError("expected contiguous tensor")
+
+    holder = TorchTensorPointer(t)
+    strides_bytes = tuple(int(s * t.element_size()) for s in t.stride())
+
+    return gpuarray.GPUArray(
+        shape=tuple(int(x) for x in t.shape),
+        dtype=np.dtype(TORCH_DTYPE_TO_NUMPY[t.dtype]),
+        gpudata=holder,
+        strides=strides_bytes,
+    )
+
+class GPUArrayTorchView:
+    """Expose a PyCUDA GPUArray to PyTorch through CUDA Array Interface.
+
+    Keep this object, or at least the original GPUArray, alive while the
+    torch tensor is used. The torch tensor does not own the CUDA memory.
+    """
+
+    def __init__(self, arr):
+        if not isinstance(arr, gpuarray.GPUArray):
+            raise TypeError(f"expected pycuda.gpuarray.GPUArray, got {type(arr).__name__}")
+
+        self.arr = arr  # keep owner alive
+
+    @property
+    def __cuda_array_interface__(self):
+        iface = {
+            "version": 3,
+            "shape": tuple(int(x) for x in self.arr.shape),
+            "typestr": np.dtype(self.arr.dtype).str,
+            "data": (int(self.arr.gpudata), False),
+        }
+
+        # CUDA Array Interface strides are in bytes.
+        if self.arr.strides is not None:
+            iface["strides"] = tuple(int(x) for x in self.arr.strides)
+
+        return iface
+
+
+def gpuarray_to_torch_tensor_view(
+    arr,
+    *,
+    device: Optional[int] = None,
+    sync: bool = False,
+) -> torch.Tensor:
+    """Create a zero-copy torch CUDA tensor view over a PyCUDA GPUArray.
+
+    No image data is copied. The returned tensor points at arr.gpudata.
+
+    Important:
+      - arr must stay alive while the tensor is used.
+      - if arr is an IPC ring-slot view, the publisher may overwrite it later.
+      - sync=True is useful when PyCUDA wrote the frame before PyTorch reads it.
+    """
+    if not isinstance(arr, gpuarray.GPUArray):
+        raise TypeError(f"expected pycuda.gpuarray.GPUArray, got {type(arr).__name__}")
+
+    if sync:
+        cuda.Context.synchronize()
+
+    if device is None:
+        device = torch.cuda.current_device()
+
+    owner = GPUArrayTorchView(arr)
+
+    with torch.cuda.device(int(device)):
+        tensor = torch.as_tensor(owner, device=f"cuda:{int(device)}")
+
+    # Best-effort: keep the CUDA Array Interface owner alive through the tensor.
+    # If this ever fails in a future PyTorch build, the caller must keep arr alive.
+    try:
+        tensor._pycuda_owner = owner
+    except Exception:
+        pass
+
+    return tensor
 
 class Iox2CUDAIPCFrameSignal(ctypes.Structure):
     """Small fixed-size iceoryx2 payload announcing the latest CUDA frame."""
@@ -213,7 +321,8 @@ class ImageMatCUDAPubSub(BaseModel):
     DTYPE_STR_BYTES: ClassVar[int] = 16
     MAX_DIMS: ClassVar[int] = 8
 
-    lib: str = "pycuda"
+    lib: str = "pycuda"    
+    is_pub: bool = False
     num_slots: int = Field(default=2, ge=1)
     sequence: int = 0
     device_id: int = 0
@@ -247,6 +356,11 @@ class ImageMatCUDAPubSub(BaseModel):
     _remote_dtype: Any = PrivateAttr(default=None)
     _remote_total_bytes: int = PrivateAttr(default=0)
 
+    _node: Any = PrivateAttr(default=None)
+    _service: Any = PrivateAttr(default=None)
+    _pub: Any = PrivateAttr(default=None)
+    _sub: Any = PrivateAttr(default=None)
+
     @staticmethod
     def _current_device_id() -> int:
         try:
@@ -279,13 +393,20 @@ class ImageMatCUDAPubSub(BaseModel):
     def _as_gpuarray(cls, data):
         if isinstance(data, gpuarray.GPUArray):
             return cls._require_contiguous(data)
+
         if isinstance(data, torch.Tensor):
-            # PyCUDA does not consume torch CUDA tensors directly here.
-            # Copy through host for correctness without CuPy/DLPack.
-            data = data.detach().cpu().numpy()
+            return cls._require_contiguous(torch_tensor_to_gpuarray_view(data))
+
+        if isinstance(data, np.ndarray):
             return gpuarray.to_gpu(np.ascontiguousarray(data))
+
         raise ValueError(f"not supported data type of {data.__class__.__name__}")
 
+    def _get_node(self):
+        if self._node is None:
+            self._node = iox2.NodeBuilder.new().create(iox2.ServiceType.Ipc)
+        return self._node
+    
     def _get_service(self):
         if self._service is None:
             self._service = (
@@ -497,12 +618,39 @@ class ImageMatCUDAPubSub(BaseModel):
         self.producer_pid = int(signal.producer_pid)
         # self._update_image_metadata_from_array(self.data)
         return self
+    
+    def get_data_torch(self, *, copy: bool = False, sync: bool = False) -> torch.Tensor:
+        """Return current data as a torch CUDA tensor.
 
+        copy=False:
+            zero-copy torch view over the PyCUDA GPUArray / CUDA IPC slot.
+
+        copy=True:
+            GPU clone. Still no CPU copy, but detached from the IPC ring slot.
+        """
+        data = self.get_data()
+
+        if isinstance(data, torch.Tensor):
+            t = data
+        elif isinstance(data, gpuarray.GPUArray):
+            t = gpuarray_to_torch_tensor_view(
+                data, sync=sync,
+                device=int(self.device_id),
+            )
+        else:
+            raise TypeError(f"cannot convert {type(data).__name__} to torch CUDA tensor")
+
+        return t.clone() if copy else t
+    
     def get_data_numpy(self):
         data = self.get_data()
         if isinstance(data, gpuarray.GPUArray):
             return data.get()
-        return data
+        if isinstance(data, np.ndarray):
+            return data
+        if isinstance(data, torch.Tensor):
+            return data.detach().cpu().numpy()
+        raise TypeError(f"cannot convert {type(data).__name__} to numpy")
 
     def close(self):
         if self._remote_mem is not None:

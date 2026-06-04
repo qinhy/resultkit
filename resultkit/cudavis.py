@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from typing import Optional
 import numpy as np
 
+from .cuda import ImageMatCUDAPubSub
+
 CUDA_ROOT = os.environ.get("CUDA_PATH")
 if CUDA_ROOT and hasattr(os, "add_dll_directory"):
     os.add_dll_directory(os.path.join(CUDA_ROOT, "bin"))
@@ -16,6 +18,7 @@ from OpenGL.GLUT import *
 import pycuda.driver as cuda
 import pycuda.gl as cudagl
 from pycuda.compiler import SourceModule
+import pycuda.gpuarray as gpuarray
 
 
 def make_specialized_gl_copy_src(
@@ -186,14 +189,25 @@ class GlViewerConfig:
 
 
 class ImageMatCudaGlViewer:
-    """Fast PyCUDA/OpenGL PBO viewer for ImageMatCUDAPubSub-like images."""
+    """Fast PyCUDA/OpenGL PBO viewer for ImageMatCUDAPubSub-like images.
 
-    def __init__(self, 
-                width, height,
-                fps: float = 60.0,
-                device: int = 0,
-                flip_y: bool = True,
-                max_frames: Optional[int] = None,
+    Adaptive timer behavior:
+      - frame_idx counts unique producer frames actually copied to the PBO.
+      - img.sequence is used to detect repeated frames and sequence jumps.
+      - if the viewer polls too fast, it increases the timer interval.
+      - if the viewer misses producer frames, it decreases the timer interval.
+
+    The goal is that displayed frame_idx and latest producer sequence stay close.
+    """
+
+    def __init__(
+        self,
+        width,
+        height,
+        fps: float = 60.0,
+        device: int = 0,
+        flip_y: bool = True,
+        max_frames: Optional[int] = None,
     ):
         self.config = GlViewerConfig(
             width=width,
@@ -220,10 +234,29 @@ class ImageMatCudaGlViewer:
             1,
         )
 
+        # Unique frames copied/uploaded to GL, not GLUT redraw calls.
         self.frame_idx = 0
-        self.last_sequence = None
+        self.last_sequence: Optional[int] = None
         self.last_status_time = 0.0
         self.closing = False
+
+        # Adaptive timer state. Initialized again in run(), but defaults are kept
+        # valid so timer() is always safe.
+        self._timer_target_ms = self._fps_to_interval_ms(self.config.fps)
+        self._timer_interval_ms = self._timer_target_ms
+        self._timer_min_ms = 1
+        self._timer_max_ms = max(self._timer_target_ms * 4, 100)
+
+        # Debug/status counters.
+        self.same_sequence_polls = 0
+        self.no_remote_polls = 0
+        self.sequence_jumps = 0
+
+    @staticmethod
+    def _fps_to_interval_ms(fps: float) -> int:
+        if fps <= 0:
+            return 1
+        return max(1, int(round(1000.0 / float(fps))))
 
     @staticmethod
     def _enum_string(value) -> str:
@@ -376,10 +409,10 @@ class ImageMatCudaGlViewer:
         self.init_cuda_after_gl_context_exists()
 
     def attach_img_and_compile(self, img) -> None:
-        self.img = img
+        self.img: ImageMatCUDAPubSub = img
         self.compile_specialized_kernel()
 
-    def copy_frame_to_pbo(self, frame) -> None:
+    def copy_frame_to_pbo(self, frame: gpuarray.GPUArray) -> None:
         mapping = self.cuda_pbo.map()
 
         try:
@@ -438,30 +471,99 @@ class ImageMatCudaGlViewer:
         glEnd()
         glutSwapBuffers()
 
-    def receive_and_render_once(self) -> None:
+    @staticmethod
+    def _safe_int_sequence(value) -> Optional[int]:
+        if value is None:
+            return None
+        try:
+            return int(value)
+        except Exception:
+            return None
+
+    def _current_sequence(self) -> Optional[int]:
+        return self._safe_int_sequence(getattr(self.img, "sequence", None))
+
+    def adapt_timer_after_poll(self, *, rendered: bool, seq_gap: int = 1) -> None:
+        """Adapt GLUT timer using producer sequence feedback.
+
+        rendered=False means we polled but did not receive a new producer frame,
+        so the timer is too fast and should slow down.
+
+        seq_gap>1 means the producer sequence jumped, so the viewer missed one
+        or more producer frames and should temporarily speed up.
+        """
+        if self.config.fps <= 0:
+            return
+
+        if not rendered:
+            self._timer_interval_ms = min(
+                self._timer_max_ms,
+                self._timer_interval_ms + 1,
+            )
+            return
+
+        if seq_gap > 1:
+            self.sequence_jumps += 1
+            self._timer_interval_ms = max(
+                self._timer_min_ms,
+                max(1, self._timer_interval_ms // 2),
+            )
+            return
+
+        # Normal new frame: gently converge back to the target interval.
+        if self._timer_interval_ms < self._timer_target_ms:
+            self._timer_interval_ms += 1
+        elif self._timer_interval_ms > self._timer_target_ms:
+            self._timer_interval_ms -= 1
+
+    def receive_and_render_once(self) -> bool:
         self.img.sub(copy=False, sync=False)
 
-        # # This is the main remaining necessary per-frame check:
-        # # no remote frame yet means keep showing the previous texture.
-        # if getattr(self.img, "_remote_mem", None) is None:
-        #     return
+        # No remote frame yet. Keep drawing the previous texture / black screen,
+        # but slow down polling.
+        if getattr(self.img, "_remote_mem", None) is None:
+            self.no_remote_polls += 1
+            self.adapt_timer_after_poll(rendered=False)
+            return False
 
-        frame = self.img.get_data()
+        seq = self._current_sequence()
 
+        # Same producer frame again. Avoid repeating CUDA PBO copy and texture
+        # upload. This is the main optimization.
+        if seq is not None and seq == self.last_sequence:
+            self.same_sequence_polls += 1
+            self.adapt_timer_after_poll(rendered=False)
+            return False
+
+        prev_seq = self.last_sequence
+
+        frame: gpuarray.GPUArray = self.img.get_data()
         self.copy_frame_to_pbo(frame)
         self.upload_pbo_to_texture()
 
+        # Count only unique producer frames actually rendered to GL texture.
         self.frame_idx += 1
-        self.last_sequence = getattr(self.img, "sequence", self.frame_idx)
 
-    def display(self) -> None:        
-        if self.closing:return
+        if seq is None:
+            self.last_sequence = self.frame_idx
+            seq_gap = 1
+        else:
+            self.last_sequence = seq
+            seq_gap = 1 if prev_seq is None else max(1, seq - prev_seq)
+
+        self.adapt_timer_after_poll(rendered=True, seq_gap=seq_gap)
+        return True
+
+    def display(self) -> None:
+        if self.closing:
+            return
         self.receive_and_render_once()
         self.draw_fullscreen_quad()
         self.print_status_if_due()
 
     def display_limited(self) -> None:
-        if self.closing:return
+        if self.closing:
+            return
         self.receive_and_render_once()
         self.draw_fullscreen_quad()
         self.print_status_if_due()
@@ -470,8 +572,10 @@ class ImageMatCudaGlViewer:
             self.request_close()
 
     def timer(self, value: int = 0) -> None:
+        if self.closing:
+            return
         glutPostRedisplay()
-        glutTimerFunc(self._timer_interval_ms, self.timer, 0)
+        glutTimerFunc(int(self._timer_interval_ms), self.timer, 0)
 
     def idle(self) -> None:
         glutPostRedisplay()
@@ -490,7 +594,11 @@ class ImageMatCudaGlViewer:
             return
 
         print(
-            f"[gl-viewer] displayed={self.frame_idx} latest_seq={self.last_sequence}",
+            f"[gl-viewer] displayed={self.frame_idx} "
+            f"latest_seq={self.last_sequence} "
+            f"timer_ms={self._timer_interval_ms} "
+            f"same_seq_polls={self.same_sequence_polls} "
+            f"seq_jumps={self.sequence_jumps}",
             flush=True,
         )
         self.last_status_time = now
@@ -571,9 +679,19 @@ class ImageMatCudaGlViewer:
             pass
 
         if self.config.fps > 0:
-            self._timer_interval_ms = max(1, int(round(1000.0 / self.config.fps)))
+            self._timer_target_ms = self._fps_to_interval_ms(self.config.fps)
+            self._timer_min_ms = 1
+            self._timer_max_ms = max(self._timer_target_ms * 4, 100)
+            self._timer_interval_ms = self._timer_target_ms
+
             glutTimerFunc(0, self.timer, 0)
-            print(f"[gl-viewer] running at target fps={self.config.fps}", flush=True)
+            print(
+                f"[gl-viewer] adaptive timer target_fps={self.config.fps} "
+                f"target_ms={self._timer_target_ms} "
+                f"min_ms={self._timer_min_ms} "
+                f"max_ms={self._timer_max_ms}",
+                flush=True,
+            )
         else:
             glutIdleFunc(self.idle)
             print("[gl-viewer] running as fast as possible", flush=True)
