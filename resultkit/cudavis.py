@@ -621,7 +621,12 @@ class ImageMatCudaGlViewer:
         except Exception:
             pass
 
+    def stop(self) -> None:
+        """Public API to stop the viewer and release resources."""
+        self.request_close()
+
     def cleanup(self) -> None:
+        print("[ImageMatCUDAPubSub] cleanup")
         try:
             if self.cuda_pbo is not None:
                 self.cuda_pbo.unregister()
