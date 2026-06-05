@@ -16,6 +16,8 @@ dependencies = [
 
 [dependency-groups]
 dev = [
+    "fastapi>=0.115.0",
+    "uvicorn>=0.30.0",
     "ipython>=9.13.0",
     "pynvvideocodec>=2.1.0",
     "pytest>=9.0.3",
