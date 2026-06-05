@@ -640,7 +640,7 @@ class ImageMatCUDAPubSub(BaseModel):
         else:
             raise TypeError(f"cannot convert {type(data).__name__} to torch CUDA tensor")
 
-        return t.clone() if copy else t
+        return t.clone(memory_format=torch.contiguous_format) if copy else t
     
     def get_data_numpy(self):
         data = self.get_data()

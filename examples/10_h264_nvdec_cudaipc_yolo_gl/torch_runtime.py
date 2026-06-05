@@ -13,7 +13,7 @@ import torch
 
 # Keep this if the demo lives in an examples/tests folder next to resultkit.
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from utils import draw_boxes_gpu_with_bitmap_labels
+from utils import *
 from cuda_ipc_runtime import Config, FpsMeter, FramePacer, make_cuda_image_endpoint, mat_device
 
 
@@ -174,160 +174,6 @@ def _encode_detections_into_pixels(
 
     return out_img
 
-def _draw_boxes_gpu_simple(
-    img_uint8: torch.Tensor,
-    *,
-    boxes_xyxy: torch.Tensor | None,
-    conf: torch.Tensor | None = None,
-    cls: torch.Tensor | None = None,
-    names=None,
-    color_rgb=(0, 255, 0),
-    thickness: int = 2,
-    chunk_size: int = 32,
-) -> torch.Tensor:
-    """
-    Draw YOLO boxes on GPU using PyTorch only.
-
-    Input/output:
-        CUDA HWC RGB uint8 tensor.
-
-    Notes:
-        - No OpenCV
-        - No .cpu()
-        - No .numpy()
-        - No text labels yet
-        - Python loop is only for chunking boxes; drawing ops run on GPU
-    """
-    if img_uint8.ndim != 3 or img_uint8.shape[-1] != 3:
-        raise ValueError("img_uint8 must be HWC RGB with shape [H, W, 3].")
-
-    if img_uint8.dtype != torch.uint8:
-        raise ValueError("img_uint8 must be torch.uint8.")
-
-    if not img_uint8.is_cuda:
-        raise ValueError("img_uint8 must be a CUDA tensor.")
-
-    out = img_uint8.clone()
-
-    if boxes_xyxy is None or boxes_xyxy.numel() == 0:
-        return out.contiguous()
-
-    device = img_uint8.device
-    h, w = img_uint8.shape[:2]
-
-    boxes = boxes_xyxy.to(device=device)
-    boxes = boxes.round().to(torch.long)
-
-    x1 = boxes[:, 0].clamp(0, w - 1)
-    y1 = boxes[:, 1].clamp(0, h - 1)
-    x2 = boxes[:, 2].clamp(0, w - 1)
-    y2 = boxes[:, 3].clamp(0, h - 1)
-
-    valid = (x2 > x1) & (y2 > y1)
-
-    # Pixel coordinate grids, kept on GPU.
-    yy = torch.arange(h, device=device).view(1, h, 1)
-    xx = torch.arange(w, device=device).view(1, 1, w)
-
-    final_mask = torch.zeros((h, w), dtype=torch.bool, device=device)
-
-    n = boxes.shape[0]
-
-    for start in range(0, n, chunk_size):
-        end = min(start + chunk_size, n)
-
-        x1c = x1[start:end].view(-1, 1, 1)
-        y1c = y1[start:end].view(-1, 1, 1)
-        x2c = x2[start:end].view(-1, 1, 1)
-        y2c = y2[start:end].view(-1, 1, 1)
-        vc = valid[start:end].view(-1, 1, 1)
-
-        inside = (
-            vc
-            & (xx >= x1c)
-            & (xx <= x2c)
-            & (yy >= y1c)
-            & (yy <= y2c)
-        )
-
-        border = inside & (
-            ((xx - x1c) < thickness)
-            | ((x2c - xx) < thickness)
-            | ((yy - y1c) < thickness)
-            | ((y2c - yy) < thickness)
-        )
-
-        final_mask |= border.any(dim=0)
-
-    color = torch.tensor(color_rgb, dtype=torch.uint8, device=device)
-    out[final_mask] = color
-
-    return out.contiguous()
-
-def _draw_boxes_cpu(
-    img_uint8: torch.Tensor,
-    *,
-    boxes_xyxy: torch.Tensor | None,
-    conf: torch.Tensor | None,
-    cls: torch.Tensor | None,
-    names,
-) -> torch.Tensor:
-    """
-    Draw YOLO boxes using OpenCV on CPU.
-
-    Input/output:
-        CUDA HWC RGB uint8 tensor.
-    """
-    import cv2
-
-    out_cpu = _draw_boxes_gpu_simple(img_uint8,boxes_xyxy=boxes_xyxy).detach().cpu().numpy().copy()
-    bgr = cv2.cvtColor(out_cpu, cv2.COLOR_RGB2BGR)
-
-    if boxes_xyxy is not None and conf is not None and cls is not None and boxes_xyxy.numel() > 0:
-        boxes_np = boxes_xyxy.detach().round().to(torch.int32).cpu().numpy()
-        conf_np = conf.detach().cpu().numpy()
-        cls_np = cls.detach().round().to(torch.int32).cpu().numpy()
-
-        h, w = bgr.shape[:2]
-
-        for xyxy, score, class_id in zip(boxes_np, conf_np, cls_np):
-            x1, y1, x2, y2 = [int(v) for v in xyxy]
-
-            x1 = max(0, min(w - 1, x1))
-            y1 = max(0, min(h - 1, y1))
-            x2 = max(0, min(w - 1, x2))
-            y2 = max(0, min(h - 1, y2))
-
-            if x2 <= x1 or y2 <= y1:
-                continue
-
-            if isinstance(names, dict):
-                label = names.get(int(class_id), str(int(class_id)))
-            else:
-                label = str(int(class_id))
-
-            text = f"{label} {float(score):.2f}"
-
-            # cv2.rectangle(bgr, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            cv2.putText(
-                bgr,
-                text,
-                (x1, max(0, y1 - 5)),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.5,
-                (0, 255, 0),
-                1,
-                cv2.LINE_AA,
-            )
-
-    out_rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-
-    return torch.from_numpy(out_rgb).to(
-        device=img_uint8.device,
-        dtype=torch.uint8,
-        non_blocking=True,
-    ).contiguous()
-
 def yolo_step(img_uint8: torch.Tensor) -> torch.Tensor:
     """
     Input:
@@ -414,21 +260,22 @@ def yolo_step(img_uint8: torch.Tensor) -> torch.Tensor:
     if names is None:
         names = getattr(model, "names", {})
 
-    # out = draw_boxes_gpu_with_bitmap_labels(
+    out = draw_boxes_gpu_with_bitmap_labels(
+            img_uint8,
+            boxes_xyxy=boxes_xyxy,
+            conf=conf,
+            cls=cls,
+            names=names,
+            font_scale=2,
+            color_rgb=DEFAULT_COLOR_PALETTE_RGB,
+    )
+    # out = draw_boxes_cpu(
     #     img_uint8,
     #     boxes_xyxy=boxes_xyxy,
     #     conf=conf,
     #     cls=cls,
     #     names=names,
-    #     font_scale=2,
     # )
-    out = _draw_boxes_cpu(
-        img_uint8,
-        boxes_xyxy=boxes_xyxy,
-        conf=conf,
-        cls=cls,
-        names=names,
-    )
 
     out = _encode_detections_into_pixels(
         out,
@@ -482,18 +329,18 @@ def torch_loop(cfg: Config) -> None:
                 if getattr(image_sub, "_remote_mem", None) is None:
                     frame = None
                     sequence = None
-                    remote_ptr = 0
+                    # remote_ptr = 0
                 else:
                     sequence = int(getattr(image_sub, "sequence", -1))
 
                     if sequence == last_sequence:
                         frame = None
-                        remote_ptr = 0
+                        # remote_ptr = 0
                     else:
                         last_sequence = sequence
 
                         remote_t = image_sub.get_data_torch(copy=False, sync=False)
-                        remote_ptr = int(remote_t.data_ptr())
+                        # remote_ptr = int(remote_t.data_ptr())
 
                         # This clone breaks the lifetime dependency on the IPC memory
                         # handle. YOLO/torchvision will only see normal PyTorch CUDA
