@@ -14,7 +14,7 @@ import torch
 # Keep this if the demo lives in an examples/tests folder next to resultkit.
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from utils import *
-from cuda_ipc_runtime import Config, FpsMeter, FramePacer, make_cuda_image_endpoint, mat_device
+from cuda_ipc_runtime import Config, FpsMeter, FramePacer, StoppableLoop, make_cuda_image_endpoint, mat_device
 
 
 YOLO_TOPIC = "ImageMatCUDAPubSub:yolo"
@@ -46,7 +46,7 @@ def pushed_cuda_context(ctx):
         ctx.pop()
 
 
-def make_cuda_yolo_endpoint(cfg: Config, *, is_pub: bool):
+def make_cuda_yolo_endpoint(cfg: Config, *, is_pub: bool, output_topic: str = YOLO_TOPIC):
     import pycuda.gpuarray as gpuarray
     from resultkit.MatModel import ColorFormat, ImageShapeType, Model4Mat
     from resultkit.mat import DataType
@@ -65,7 +65,7 @@ def make_cuda_yolo_endpoint(cfg: Config, *, is_pub: bool):
         num_slots=int(cfg.num_slots),
     )
 
-    img.set_id(YOLO_TOPIC).init()
+    img.set_id(output_topic).init()
 
     img.init()
 
@@ -287,7 +287,18 @@ def yolo_step(img_uint8: torch.Tensor) -> torch.Tensor:
     return out.contiguous()
 
 
-def torch_loop(cfg: Config) -> None:
+class YoloLoop(StoppableLoop):
+    """CUDA IPC image subscriber -> YOLO CUDA image publisher loop."""
+
+    def __init__(self, cfg: Config, *, output_topic: str = YOLO_TOPIC):
+        super().__init__(cfg)
+        self.output_topic = output_topic
+
+    def _run(self) -> None:
+        torch_loop(self.cfg, output_topic=self.output_topic, stop_event=self._stop_event)
+
+
+def torch_loop(cfg: Config, output_topic: str = YOLO_TOPIC, stop_event=None) -> None:
     import pycuda.driver as cuda
 
     cuda.init()
@@ -309,16 +320,17 @@ def torch_loop(cfg: Config) -> None:
         # Create resultkit endpoints while PyCUDA primary context is current.
         with pushed_cuda_context(ctx):
             image_sub = make_cuda_image_endpoint(cfg, is_pub=False)
-            yolo_pub = make_cuda_yolo_endpoint(cfg, is_pub=True)
+            yolo_pub = make_cuda_yolo_endpoint(cfg, is_pub=True, output_topic=output_topic)
 
         last_sequence = -1
 
         print(
-            f"torch-yolo: subscribing {cfg.image_topic!r}, publishing {YOLO_TOPIC!r}",
+            f"torch-yolo: subscribing {cfg.image_topic!r}, publishing {output_topic!r}",
             flush=True,
         )
 
-        while True:
+        published = 0
+        while stop_event is None or not stop_event.is_set():
             # Resultkit/PyCUDA IPC receive must happen with the PyCUDA context current.
             # CRITICAL: do not let YOLO run directly on the remote IPC tensor.
             # Copy it into local PyTorch CUDA memory immediately, then release the
@@ -376,10 +388,14 @@ def torch_loop(cfg: Config) -> None:
 
             # Drop references aggressively so Python does not hold old IPC-backed
             # tensors across resultkit slot switches.            
+            published += 1
             meter.tick()
             pacer.sleep()
             del frame
             del yolo_res
+
+            if cfg.max_frames is not None and published >= cfg.max_frames:
+                return
 
     finally:
         # Close resultkit endpoints with PyCUDA context current.

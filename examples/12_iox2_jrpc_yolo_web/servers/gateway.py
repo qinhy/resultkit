@@ -12,6 +12,7 @@ from iox2_jsonrpc.services import JsonRpcServiceRegistry
 
 from server_decodepub import DecodePubController
 from server_glshow import GlShowController
+from server_yolo import YoloController
 
 JsonRpcHttpBody = Annotated[
     JsonRpcHttpRequest | list[JsonRpcHttpRequest],
@@ -19,6 +20,7 @@ JsonRpcHttpBody = Annotated[
         openapi_examples={
             **(DecodePubController.openapi_examples()),
             **(GlShowController.openapi_examples()),
+            **(YoloController.openapi_examples()),
         }
         
     ),
@@ -33,6 +35,7 @@ def main() -> None:
 
     registry = JsonRpcServiceRegistry.from_list([
         DecodePubController.JsonRpcServiceDescriptor(),
+        YoloController.JsonRpcServiceDescriptor(),
         GlShowController.JsonRpcServiceDescriptor(),
     ])
     gw = FastApiJsonRpcGateway(registry)
