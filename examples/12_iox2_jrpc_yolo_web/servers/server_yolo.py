@@ -3,17 +3,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
-from pydantic import BaseModel, Field
-
-from common import EmptyParams, build_processor
-from iox2_jsonrpc.iox2_transport import Iceoryx2JsonRpcServer
-from iox2_jsonrpc.services import JsonRpcServiceDescriptor
+from common import EmptyParams, RpcModel
 
 from cuda_ipc_runtime import Config
 from torch_runtime import YOLO_TOPIC, YoloLoop
 
 
-class YoloBaseModel(BaseModel):
+class YoloBaseModel(RpcModel):
     service: Literal["yolo"] = "yolo"
 
     def model_post_init(self, context):
@@ -42,13 +38,10 @@ class YoloResult(YoloBaseModel):
 
 @dataclass
 class YoloController:
-    class JsonRpcServiceDescriptor(JsonRpcServiceDescriptor):
-        name: str = "yolo"
-        iceoryx2_service: str = "jsonrpc/yolo"
-        timeout_seconds: float = Field(default=5.0, gt=0)
-
     running: bool = False
     yolo_loop: YoloLoop = None
+    service_name: str = "yolo"
+    controller_name: str = "yolo"
 
     @staticmethod
     def openapi_examples():
@@ -131,10 +124,10 @@ class YoloController:
 
 
 def main() -> None:
-    iox_service_name = YoloController.JsonRpcServiceDescriptor().iceoryx2_service
-    processor = build_processor(YoloController(), prefix="yolo")
-    server = Iceoryx2JsonRpcServer(service_name=iox_service_name, processor=processor)
-    server.serve_forever()
+    from iox2_jsonrpc.iceoryx import Iox2JsonRpcServer
+
+    server = Iox2JsonRpcServer(YoloController())
+    server.run_forever()
 
 
 if __name__ == "__main__":

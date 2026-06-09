@@ -1,18 +1,15 @@
 from __future__ import annotations
 
-import argparse
 from dataclasses import dataclass
-from typing import Dict, Literal
-from pydantic import BaseModel, Field
+from typing import Literal
 
 
-from common import EmptyParams, build_processor
-from iox2_jsonrpc.services import JsonRpcServiceDescriptor
-from iox2_jsonrpc.iox2_transport import Iceoryx2JsonRpcServer
+from common import EmptyParams, RpcModel
 
 from cuda_ipc_runtime import Config, GlShowLoop
 
-class GlShowBaseModel(BaseModel):
+
+class GlShowBaseModel(RpcModel):
     service: Literal["glshow"] = "glshow"
 
     def model_post_init(self, context):
@@ -20,7 +17,6 @@ class GlShowBaseModel(BaseModel):
         return super().model_post_init(context)
     
 class StartGlShowParams(GlShowBaseModel):
-    input_path: str | None = None
     width: int = 1280
     height: int = 720
     fps: int = 30
@@ -29,7 +25,7 @@ class StartGlShowParams(GlShowBaseModel):
     num_slots: int = 3
     max_frames: int | None = None
     stats_every: int = 100
-    loop: bool = False
+    loop: bool = True
     flip_y: bool = True
     require_aud: bool = False
 
@@ -41,13 +37,10 @@ class GlShowResult(GlShowBaseModel):
 
 @dataclass
 class GlShowController:
-    class JsonRpcServiceDescriptor(JsonRpcServiceDescriptor):
-        name: str="glshow"
-        iceoryx2_service: str="jsonrpc/glshow"
-        timeout_seconds: float = Field(default=5.0, gt=0)    
-    
     running: bool = False
     glshow_sub: GlShowLoop = None
+    service_name: str = "glshow"
+    controller_name: str = "glshow"
 
     @staticmethod
     def openapi_examples():
@@ -130,10 +123,10 @@ class GlShowController:
 
 
 def main() -> None:
-    iox_service_name = GlShowController.JsonRpcServiceDescriptor().iceoryx2_service
-    processor=build_processor(GlShowController(),prefix="glshow")
-    server = Iceoryx2JsonRpcServer(service_name=iox_service_name, processor=processor)
-    server.serve_forever()
+    from iox2_jsonrpc.iceoryx import Iox2JsonRpcServer
+
+    server = Iox2JsonRpcServer(GlShowController())
+    server.run_forever()
 
 
 if __name__ == "__main__":

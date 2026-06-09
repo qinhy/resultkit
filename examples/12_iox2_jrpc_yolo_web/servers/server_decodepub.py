@@ -1,18 +1,15 @@
 from __future__ import annotations
 
-import argparse
 from dataclasses import dataclass
-from typing import Dict, Literal
-from pydantic import BaseModel, Field
+from typing import Literal
 
 
-from common import EmptyParams, build_processor
-from iox2_jsonrpc.services import JsonRpcServiceDescriptor
-from iox2_jsonrpc.iox2_transport import Iceoryx2JsonRpcServer
+from common import EmptyParams, RpcModel
 
 from cuda_ipc_runtime import Config, DecodePubLoop
 
-class DecodePubBaseModel(BaseModel):
+
+class DecodePubBaseModel(RpcModel):
     service: Literal["decodepub"] = "decodepub"
 
     def model_post_init(self, context):
@@ -20,7 +17,7 @@ class DecodePubBaseModel(BaseModel):
         return super().model_post_init(context)
     
 class StartDecodePubParams(DecodePubBaseModel):
-    input_path: str | None = None
+    input_path: str | None = "./examples/demo.h264"
     width: int = 1280
     height: int = 720
     fps: int = 30
@@ -29,7 +26,7 @@ class StartDecodePubParams(DecodePubBaseModel):
     num_slots: int = 3
     max_frames: int | None = None
     stats_every: int = 100
-    loop: bool = False
+    loop: bool = True
     flip_y: bool = True
     require_aud: bool = False
 
@@ -41,13 +38,10 @@ class DecodePubResult(DecodePubBaseModel):
 
 @dataclass
 class DecodePubController:
-    class JsonRpcServiceDescriptor(JsonRpcServiceDescriptor):
-        name: str="decodepub"
-        iceoryx2_service: str="jsonrpc/decodepub"
-        timeout_seconds: float = Field(default=5.0, gt=0)    
-    
     running: bool = False
     dec_pub: DecodePubLoop = None
+    service_name: str = "decodepub"
+    controller_name: str = "decodepub"
 
     @staticmethod
     def openapi_examples():
@@ -130,10 +124,10 @@ class DecodePubController:
 
 
 def main() -> None:
-    iox_service_name = DecodePubController.JsonRpcServiceDescriptor().iceoryx2_service
-    processor=build_processor(DecodePubController(),prefix="decodepub")
-    server = Iceoryx2JsonRpcServer(service_name=iox_service_name, processor=processor)
-    server.serve_forever()
+    from iox2_jsonrpc.iceoryx import Iox2JsonRpcServer
+
+    server = Iox2JsonRpcServer(DecodePubController())
+    server.run_forever()
 
 
 if __name__ == "__main__":

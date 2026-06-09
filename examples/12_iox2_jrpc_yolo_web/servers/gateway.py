@@ -1,53 +1,33 @@
 from __future__ import annotations
 
 import argparse
-from typing import Annotated
 
-from fastapi import Body, Response
 import uvicorn
 
-from common import *
-from iox2_jsonrpc.gateway import FastApiJsonRpcGateway, JsonRpcHttpRequest
-from iox2_jsonrpc.services import JsonRpcServiceRegistry
-
-from server_decodepub import DecodePubController
-from server_glshow import GlShowController
-from server_yolo import YoloController
-
-JsonRpcHttpBody = Annotated[
-    JsonRpcHttpRequest | list[JsonRpcHttpRequest],
-    Body(
-        openapi_examples={
-            **(DecodePubController.openapi_examples()),
-            **(GlShowController.openapi_examples()),
-            **(YoloController.openapi_examples()),
-        }
-        
-    ),
-]
+import common  # noqa: F401
+from webapi import create_auto_discover_fastapi_app
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="FastAPI gateway for JSON-RPC over iceoryx2 services")
+    parser = argparse.ArgumentParser(description="FastAPI gateway for auto-discovered iceoryx2 JSON-RPC services")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument(
+        "--refresh-interval-s",
+        type=float,
+        default=0.0,
+        help="Periodic refresh interval. Use 0 to refresh only on startup and manual GET /refresh.",
+    )
     args = parser.parse_args()
+    refresh_interval_s = args.refresh_interval_s if args.refresh_interval_s > 0 else None
 
-    registry = JsonRpcServiceRegistry.from_list([
-        DecodePubController.JsonRpcServiceDescriptor(),
-        YoloController.JsonRpcServiceDescriptor(),
-        GlShowController.JsonRpcServiceDescriptor(),
-    ])
-    gw = FastApiJsonRpcGateway(registry)
-    app = gw.create_app()
-    
-    @app.post("/{service_name}/rpc", summary="Forward JSON-RPC to one iceoryx2 service")
-    async def rpc_by_prefix(service_name: str, body: JsonRpcHttpBody) -> Response:
-        return await gw._forward_body(service_name, body)
-
-    @app.post("/rpc/{service_name}", summary="Forward JSON-RPC to one iceoryx2 service")
-    async def rpc_by_namespace(service_name: str, body: JsonRpcHttpBody) -> Response:
-        return await gw._forward_body(service_name, body)
+    app = create_auto_discover_fastapi_app(
+        title="Auto-discovered YOLO RPC API",
+        description="Discovers iox2 JSON-RPC services and exposes them through /controllers/** routes.",
+        refresh_on_startup=True,
+        refresh_interval_s=refresh_interval_s,
+        install_dynamic_openapi=True,
+    )
 
     uvicorn.run(app, host=args.host, port=args.port)
 
