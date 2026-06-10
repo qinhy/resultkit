@@ -102,6 +102,7 @@ class Iox2JsonRpcServer:
             pass
 
         self.node = iox2.NodeBuilder.new().create(iox2.ServiceType.Ipc)
+        state = self.node.try_cleanup_dead_nodes(iox2.ServiceType.Ipc,self.node.config)
 
         rpc_attrs = make_attributes(
             {
@@ -132,6 +133,7 @@ class Iox2JsonRpcServer:
             .max_active_requests_per_client(8)
             .create_with_attributes(rpc_attrs)
         )
+        state = self.rpc_service.try_cleanup_dead_nodes()
 
         self.schema_service = (
             self.node.service_builder(iox2.ServiceName.new(self.schema_endpoint))
@@ -142,6 +144,7 @@ class Iox2JsonRpcServer:
             .max_active_requests_per_client(8)
             .create_with_attributes(schema_attrs)
         )
+        state = self.schema_service.try_cleanup_dead_nodes()
 
         self.rpc_server = (
             self.rpc_service.server_builder()
@@ -236,6 +239,7 @@ class Iox2RpcRegistry:
         iox2.set_log_level_from_env_or(iox2.LogLevel.Info)
 
         node = iox2.NodeBuilder.new().create(iox2.ServiceType.Ipc)
+        state = node.try_cleanup_dead_nodes(iox2.ServiceType.Ipc,node.config)
         deadline = time.monotonic() + timeout_s
         discovered: dict[str, DiscoveredRpcService] = {}
 
@@ -301,7 +305,8 @@ class Iox2RpcRegistry:
                     self.node.service_builder(iox2.ServiceName.new(discovered.schema_endpoint))
                     .request_response(U8Slice, U8Slice)
                     .open()
-                )
+                )                
+                state = schema_service.try_cleanup_dead_nodes()
 
                 schema_client = (
                     schema_service.client_builder()
@@ -322,7 +327,8 @@ class Iox2RpcRegistry:
                     self.node.service_builder(iox2.ServiceName.new(descriptor.rpc_endpoint))
                     .request_response(U8Slice, U8Slice)
                     .open()
-                )
+                )                
+                state = rpc_service.try_cleanup_dead_nodes()
 
                 rpc_client = (
                     rpc_service.client_builder()

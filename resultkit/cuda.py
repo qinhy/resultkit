@@ -405,6 +405,8 @@ class ImageMatCUDAPubSub(BaseModel):
     def _get_node(self):
         if self._node is None:
             self._node = iox2.NodeBuilder.new().create(iox2.ServiceType.Ipc)
+            state = self._node.try_cleanup_dead_nodes(iox2.ServiceType.Ipc,self._node.config)
+            
         return self._node
     
     def _get_service(self):
@@ -415,6 +417,7 @@ class ImageMatCUDAPubSub(BaseModel):
                 .publish_subscribe(Iox2CUDAIPCFrameSignal)
                 .open_or_create()
             )
+            state = self._service.try_cleanup_dead_nodes()
         return self._service
 
     def get_pub(self):

@@ -40,7 +40,7 @@ class YoloResult(YoloBaseModel):
 class YoloController:
     running: bool = False
     yolo_loop: YoloLoop = None
-    service_name: str = "yolo"
+    service_name: str = "jsonrpc"
     controller_name: str = "yolo"
 
     @staticmethod

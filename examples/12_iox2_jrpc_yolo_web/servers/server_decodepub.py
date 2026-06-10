@@ -40,7 +40,7 @@ class DecodePubResult(DecodePubBaseModel):
 class DecodePubController:
     running: bool = False
     dec_pub: DecodePubLoop = None
-    service_name: str = "decodepub"
+    service_name: str = "jsonrpc"
     controller_name: str = "decodepub"
 
     @staticmethod

@@ -39,7 +39,7 @@ class GlShowResult(GlShowBaseModel):
 class GlShowController:
     running: bool = False
     glshow_sub: GlShowLoop = None
-    service_name: str = "glshow"
+    service_name: str = "jsonrpc"
     controller_name: str = "glshow"
 
     @staticmethod
