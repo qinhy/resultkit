@@ -125,6 +125,8 @@ class YoloController:
 
 def main() -> None:
     from iox2_jsonrpc.iceoryx import Iox2JsonRpcServer
+    from utils import set_default_font_hex_path
+    set_default_font_hex_path("./font/unifont_all.hex")
 
     server = Iox2JsonRpcServer(YoloController())
     server.run_forever()

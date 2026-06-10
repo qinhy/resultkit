@@ -256,9 +256,21 @@ def yolo_step(img_uint8: torch.Tensor) -> torch.Tensor:
         boxes_xyxy[:, [0, 2]] += left
         boxes_xyxy[:, [1, 3]] += top
 
-    names = getattr(result, "names", None)
-    if names is None:
-        names = getattr(model, "names", {})
+    # names = getattr(result, "names", None)
+    # if names is None:
+    #     names = getattr(model, "names", {})
+    names = {
+        0: "person",
+        1: "自行车",      # bicycle - CN
+        2: "車",          # car - JP
+        3: "오토바이",    # motorcycle - KR
+        4: "飞机",        # airplane - CN
+        5: "バス",        # bus - JP
+        6: "기차",        # train - KR
+        7: "卡车",        # truck - CN
+        8: "船",          # boat - CN/JP
+        9: "신호등",      # traffic light - KR
+    }
 
     out = draw_boxes_gpu_with_bitmap_labels(
             img_uint8,
@@ -269,13 +281,6 @@ def yolo_step(img_uint8: torch.Tensor) -> torch.Tensor:
             font_scale=2,
             color_rgb=DEFAULT_COLOR_PALETTE_RGB,
     )
-    # out = draw_boxes_cpu(
-    #     img_uint8,
-    #     boxes_xyxy=boxes_xyxy,
-    #     conf=conf,
-    #     cls=cls,
-    #     names=names,
-    # )
 
     out = _encode_detections_into_pixels(
         out,

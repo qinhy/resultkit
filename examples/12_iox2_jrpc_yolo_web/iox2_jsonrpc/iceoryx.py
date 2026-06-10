@@ -93,13 +93,6 @@ class Iox2JsonRpcServer:
         self.schema_endpoint = schema_endpoint_name(controller)
         self.descriptor = describe_controller(controller)
 
-        try:
-            iox2.Node.try_cleanup_dead_nodes(
-                iox2.ServiceType.Ipc,
-                iox2.config.global_config(),
-            )
-        except Exception:
-            pass
 
         self.node = iox2.NodeBuilder.new().create(iox2.ServiceType.Ipc)
         state = self.node.try_cleanup_dead_nodes(iox2.ServiceType.Ipc,self.node.config)
