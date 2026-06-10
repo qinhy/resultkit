@@ -152,6 +152,7 @@ async def imgstream(
                 with _CUDA_LOCK:
                     img.sub()
 
+                    # rgb
                     tensor = img.get_data_torch(copy=False)
 
                     # Downsample on GPU before moving to CPU.
@@ -162,7 +163,7 @@ async def imgstream(
                         tensor = tensor.contiguous()
 
                     # Move data fully to CPU while CUDA context and img are still alive.
-                    arr = tensor.detach().cpu().numpy().copy()[:,:,::-1]
+                    arr = tensor.detach().cpu().numpy().copy()[:,:,::-1] # to bgr
 
                 # Encode outside the lock.
                 ok, encoded = cv2.imencode(".jpg", arr)
