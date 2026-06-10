@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ctypes
 import json
+import os
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -9,7 +10,7 @@ from typing import Any
 from .controller import describe_controller, rpc_endpoint_name, schema_endpoint_name
 from .endpoint import ControllerRpcEndpoint
 from .models import JsonRpcRequest, JsonRpcResponse, RpcServiceDescriptor
-
+os.environ.setdefault("IOX2_JSONRPC_FORCE_REMOVE_SERVICES","1")
 try:
     import iceoryx2 as iox2
 except ImportError as exc:  # pragma: no cover - depends on optional package
@@ -53,12 +54,152 @@ def make_attributes(values: dict[str, str]) -> Any:
     spec = iox2.AttributeSpecifier.new()
 
     for key, value in values.items():
-        spec = spec.define(
+        updated = spec.define(
             iox2.AttributeKey.new(key),
             iox2.AttributeValue.new(value),
         )
+        if updated is not None:
+            spec = updated
 
     return spec
+
+
+def make_attribute_verifier(values: dict[str, str]) -> Any:
+    verifier = iox2.AttributeVerifier.new()
+
+    for key, value in values.items():
+        updated = verifier.require(
+            iox2.AttributeKey.new(key),
+            iox2.AttributeValue.new(value),
+        )
+        if updated is not None:
+            verifier = updated
+
+    return verifier
+
+
+def _is_exceeds_max_supported_servers(exc: Exception) -> bool:
+    return "ExceedsMaxSupportedServers" in f"{type(exc).__name__}: {exc}"
+
+
+def _best_effort_cleanup_dead_nodes(
+    *,
+    node: Any | None = None,
+    service: Any | None = None,
+    timeout_ms: int = 100,
+) -> None:
+    timeout = iox2.Duration.from_millis(timeout_ms)
+
+    for target in (service, node):
+        if target is None:
+            continue
+
+        blocking_cleanup = getattr(target, "blocking_cleanup_dead_nodes", None)
+        if callable(blocking_cleanup):
+            try:
+                blocking_cleanup(timeout)
+                continue
+            except Exception:
+                pass
+
+        try_cleanup = getattr(target, "try_cleanup_dead_nodes", None)
+        if callable(try_cleanup):
+            try:
+                try_cleanup()
+            except TypeError:
+                # Older/alternate Python bindings expose Node.try_cleanup_dead_nodes
+                # with service_type and config arguments.
+                if node is not None:
+                    try:
+                        try_cleanup(iox2.ServiceType.Ipc, node.config)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+
+def _describe_service_nodes(service: Any) -> str:
+    try:
+        nodes = call_or_value(getattr(service, "nodes"))
+        return repr(nodes)
+    except Exception as exc:
+        return f"<could not inspect service nodes: {exc}>"
+
+
+def create_server_with_dead_node_cleanup(
+    service: Any,
+    *,
+    initial_max_slice_len: int,
+    service_name: str,
+    node: Any | None = None,
+    max_attempts: int = 20,
+    cleanup_timeout_ms: int = 100,
+) -> Any:
+    last_exc: Exception | None = None
+
+    for attempt in range(max_attempts):
+        try:
+            return (
+                service.server_builder()
+                .initial_max_slice_len(initial_max_slice_len)
+                .allocation_strategy(iox2.AllocationStrategy.PowerOfTwo)
+                .create()
+            )
+        except Exception as exc:
+            last_exc = exc
+
+            if not _is_exceeds_max_supported_servers(exc):
+                raise
+
+            _best_effort_cleanup_dead_nodes(
+                node=node,
+                service=service,
+                timeout_ms=cleanup_timeout_ms,
+            )
+
+            if attempt + 1 >= max_attempts:
+                break
+
+            time.sleep(min(0.05 * (attempt + 1), 0.5))
+
+    assert last_exc is not None
+    nodes = _describe_service_nodes(service)
+    raise RuntimeError(
+        "Could not create iceoryx2 server port for "
+        f"{service_name!r}: {last_exc}.\n"
+        "iceoryx2 still counts an existing Server port against max_servers(1). "
+        "This usually means another server process is still alive, or a crashed process "
+        "is still visible to the OS and cannot be cleaned by iceoryx2 yet.\n"
+        f"Known nodes for this service: {nodes}\n"
+        "Stop all processes using this endpoint and retry. During local development only, "
+        "you can also set IOX2_JSONRPC_FORCE_REMOVE_SERVICES=1 before starting the server "
+        "to force-remove the RPC/schema services and recreate them."
+    ) from last_exc
+
+
+def force_remove_request_response_service_if_requested(node: Any, service_name: str) -> None:
+    if os.environ.get("IOX2_JSONRPC_FORCE_REMOVE_SERVICES") != "1":
+        return
+
+    try:
+        node.force_remove_service(
+            iox2.ServiceName.new(service_name),
+            iox2.MessagingPattern.RequestResponse,
+        )
+        print(f"Force-removed stale iceoryx2 service: {service_name}")
+    except Exception as exc:
+        # It is fine if the service does not exist. If it does exist but cannot be
+        # removed, opening/creating it below will surface a more specific error.
+        print(f"Could not force-remove iceoryx2 service {service_name!r}: {exc}")
+
+
+def delete_iox2_object(obj: Any) -> None:
+    delete = getattr(obj, "delete", None)
+    if callable(delete):
+        try:
+            delete()
+        except Exception:
+            pass
 
 
 def attribute_set_to_dict(attribute_set: Any) -> dict[str, str]:
@@ -93,29 +234,30 @@ class Iox2JsonRpcServer:
         self.schema_endpoint = schema_endpoint_name(controller)
         self.descriptor = describe_controller(controller)
 
-
         self.node = iox2.NodeBuilder.new().create(iox2.ServiceType.Ipc)
-        state = self.node.try_cleanup_dead_nodes(iox2.ServiceType.Ipc,self.node.config)
+        _best_effort_cleanup_dead_nodes(node=self.node)
 
-        rpc_attrs = make_attributes(
-            {
-                "rpc.protocol": "jsonrpc-2.0",
-                "rpc.service": controller.service_name,
-                "rpc.controller": controller.controller_name,
-                "rpc.kind": "rpc",
-                "rpc.schema": self.schema_endpoint,
-                "rpc.methods": ",".join(m.jsonrpc_method for m in self.descriptor.methods),
-            }
-        )
+        force_remove_request_response_service_if_requested(self.node, self.rpc_endpoint)
+        force_remove_request_response_service_if_requested(self.node, self.schema_endpoint)
 
-        schema_attrs = make_attributes(
-            {
-                "rpc.protocol": "jsonrpc-2.0",
-                "rpc.service": controller.service_name,
-                "rpc.controller": controller.controller_name,
-                "rpc.kind": "schema",
-            }
-        )
+        rpc_attr_values = {
+            "rpc.protocol": "jsonrpc-2.0",
+            "rpc.service": controller.service_name,
+            "rpc.controller": controller.controller_name,
+            "rpc.kind": "rpc",
+            "rpc.schema": self.schema_endpoint,
+            "rpc.methods": ",".join(m.jsonrpc_method for m in self.descriptor.methods),
+        }
+
+        schema_attr_values = {
+            "rpc.protocol": "jsonrpc-2.0",
+            "rpc.service": controller.service_name,
+            "rpc.controller": controller.controller_name,
+            "rpc.kind": "schema",
+        }
+
+        rpc_attr_verifier = make_attribute_verifier(rpc_attr_values)
+        schema_attr_verifier = make_attribute_verifier(schema_attr_values)
 
         self.rpc_service = (
             self.node.service_builder(iox2.ServiceName.new(self.rpc_endpoint))
@@ -124,9 +266,9 @@ class Iox2JsonRpcServer:
             .max_clients(32)
             .max_response_buffer_size(4)
             .max_active_requests_per_client(8)
-            .create_with_attributes(rpc_attrs)
+            .open_or_create_with_attributes(rpc_attr_verifier)
         )
-        state = self.rpc_service.try_cleanup_dead_nodes()
+        _best_effort_cleanup_dead_nodes(node=self.node, service=self.rpc_service)
 
         self.schema_service = (
             self.node.service_builder(iox2.ServiceName.new(self.schema_endpoint))
@@ -135,23 +277,27 @@ class Iox2JsonRpcServer:
             .max_clients(32)
             .max_response_buffer_size(4)
             .max_active_requests_per_client(8)
-            .create_with_attributes(schema_attrs)
+            .open_or_create_with_attributes(schema_attr_verifier)
         )
-        state = self.schema_service.try_cleanup_dead_nodes()
+        _best_effort_cleanup_dead_nodes(node=self.node, service=self.schema_service)
 
-        self.rpc_server = (
-            self.rpc_service.server_builder()
-            .initial_max_slice_len(initial_max_slice_len)
-            .allocation_strategy(iox2.AllocationStrategy.PowerOfTwo)
-            .create()
-        )
+        try:
+            self.rpc_server = create_server_with_dead_node_cleanup(
+                self.rpc_service,
+                initial_max_slice_len=initial_max_slice_len,
+                service_name=self.rpc_endpoint,
+                node=self.node,
+            )
 
-        self.schema_server = (
-            self.schema_service.server_builder()
-            .initial_max_slice_len(initial_max_slice_len)
-            .allocation_strategy(iox2.AllocationStrategy.PowerOfTwo)
-            .create()
-        )
+            self.schema_server = create_server_with_dead_node_cleanup(
+                self.schema_service,
+                initial_max_slice_len=initial_max_slice_len,
+                service_name=self.schema_endpoint,
+                node=self.node,
+            )
+        except Exception:
+            self.close()
+            raise
 
     def _send_response(self, active_request: Any, payload: bytes) -> None:
         response = active_request.loan_slice_uninit(len(payload))
@@ -185,6 +331,25 @@ class Iox2JsonRpcServer:
             finally:
                 active_request.delete()
 
+    def close(self) -> None:
+        # Explicitly releasing the Server ports on normal shutdown prevents many
+        # development-time ExceedsMaxSupportedServers restarts.
+        for name in ("schema_server", "rpc_server", "schema_service", "rpc_service"):
+            obj = getattr(self, name, None)
+            if obj is not None:
+                delete_iox2_object(obj)
+                setattr(self, name, None)
+
+        node = getattr(self, "node", None)
+        if node is not None:
+            _best_effort_cleanup_dead_nodes(node=node)
+
+    def __enter__(self) -> Iox2JsonRpcServer:
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        self.close()
+
     def run_forever(self) -> None:
         print("\n=== iceoryx2 JSON-RPC server started ===")
         print(f"RPC endpoint:    {self.rpc_endpoint}")
@@ -198,8 +363,10 @@ class Iox2JsonRpcServer:
                 self.node.wait(self.poll_time)
                 self._drain_schema_requests()
                 self._drain_rpc_requests()
-        except iox2.NodeWaitFailure:
+        except (KeyboardInterrupt, iox2.NodeWaitFailure):
             print("Server stopped.")
+        finally:
+            self.close()
 
 
 @dataclass
