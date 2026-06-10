@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 from contextlib import contextmanager
 import io
 import json
@@ -11,6 +12,7 @@ from typing import Any
 from PIL import Image
 import cv2
 from fastapi import APIRouter, HTTPException, Query, Response
+from fastapi.responses import StreamingResponse
 import numpy as np
 from pydantic import BaseModel
 
@@ -130,63 +132,81 @@ def numpy_image_to_png_bytes(arr) -> bytes:
     image.save(buffer, format="PNG")
     return buffer.getvalue()
 
-def imgstream(
+
+
+async def imgstream(
     stream_type: str,
     stream_name: str,
     width: int = Query(default=1280, gt=0),
     height: int = Query(default=720, gt=0),
+    step: int = Query(default=10, gt=0),
 ):
     img = None
     topic = f"{stream_type}:{stream_name}"
 
     try:
-        with _CUDA_LOCK:
-            with pycuda_context(0):
-                img = make_cuda_image_endpoint(
-                    topic,
-                    height,
-                    width,
-                )
+        with pycuda_context(0):
+            img = make_cuda_image_endpoint(topic, height, width)
 
-                while True:
+            while True:
+                with _CUDA_LOCK:
                     img.sub()
 
-                    tensor = img.get_data_torch(copy=True)
+                    tensor = img.get_data_torch(copy=False)
 
-                    # Important:
+                    # Downsample on GPU before moving to CPU.
+                    # Assumes image layout is H x W x C or H x W.
+                    if step > 1:
+                        tensor = tensor[::step, ::step, ...].contiguous()
+                    else:
+                        tensor = tensor.contiguous()
+
                     # Move data fully to CPU while CUDA context and img are still alive.
-                    arr = tensor.detach().cpu().numpy().copy()
-                    if arr.sum()>0:
-                        break
-                    # cv2.imshow(topic, arr)
-                    # if cv2.waitKey(1) & 0xFF == ord('q'):
-                    #     cv2.destroyWindow(topic)
-                    #     break
+                    arr = tensor.detach().cpu().numpy().copy()[:,:,::-1]
 
-                # Now GPU tensor is no longer needed.
-                del tensor
+                # Encode outside the lock.
+                ok, encoded = cv2.imencode(".jpg", arr)
+                if not ok:
+                    continue
 
-                img.close()
-                img = None
+                frame = encoded.tobytes()
 
-        # return (arr.shape,int(arr.sum()))
-    
-        # Convert CPU numpy array to PNG outside CUDA section.
-        png_bytes = numpy_image_to_png_bytes(arr)
+                yield (
+                    b"--frame\r\n"
+                    b"Content-Type: image/jpeg\r\n"
+                    b"Content-Length: " + str(len(frame)).encode() + b"\r\n"
+                    b"\r\n" + frame + b"\r\n"
+                )
 
-        return Response(
-            content=png_bytes,
-            media_type="image/png",
-        )
+                await asyncio.sleep(0.001)
 
-    except Exception as e:
+    except asyncio.CancelledError:
+        # Client disconnected. Let FastAPI/Starlette handle cancellation.
+        raise
+
+    finally:
         if img is not None:
             try:
                 img.close()
             except Exception:
                 pass
 
-        raise HTTPException(status_code=500, detail=str(e))
+async def stream_res(
+    stream_type: str,
+    stream_name: str,
+    width: int = Query(default=1280, gt=0),
+    height: int = Query(default=720, gt=0),
+    step: int = Query(default=10, gt=0),
+):
+    return StreamingResponse(
+        imgstream(stream_type, stream_name, width, height, step),
+        media_type="multipart/x-mixed-replace; boundary=frame",
+        headers={
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
+            "Connection": "close",
+        },
+    )
 
 
 def run_api(host: str, port: int, reload: bool = False) -> None:
@@ -195,10 +215,9 @@ def run_api(host: str, port: int, reload: bool = False) -> None:
     # Import here so existing non-HTTP modes work without uvicorn installed.
     import uvicorn
     app = create_fastapi_app()
-
     app.add_api_route(
         "/imgstream/{stream_type}/{stream_name}",
-        imgstream,
+        stream_res,
         methods=["GET"],
         name="imgstream",
         tags=["image"],
