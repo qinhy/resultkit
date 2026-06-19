@@ -6,7 +6,7 @@ from typing import Literal
 from common import EmptyParams, RpcModel, openapi_doc
 
 from cuda_ipc_runtime import Config
-from torch_runtime import YOLO_TOPIC, YoloLoop, YoloSettings as YoloSettingsRuntime
+from torch_runtime import YoloLoop, YoloSettings as YoloSettingsRuntime
 
 
 class YoloBaseModel(RpcModel):
@@ -45,8 +45,6 @@ class YoloSettings(YoloBaseModel):
 class YoloResult(StartYoloParams):
     model_config = {"extra": "ignore"}
     running: bool
-    input_topic: str = "ImageMatCUDAPubSub:h264FileDemo"
-    output_topic: str = YOLO_TOPIC
     model: YoloSettings = None
     error: str | None = None
 

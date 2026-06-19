@@ -8,7 +8,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 
 import numpy as np
-
+from common import StoppableLoop
 from h264_access_units import h264_is_keyframe, load_h264_access_units
 
 # Keep this if the demo lives in an examples/tests folder next to resultkit.
@@ -284,76 +284,6 @@ def close_quietly(obj) -> None:
         pass
 
 
-class StoppableLoop:
-    """Small base class for loops that can run blocking or in a worker thread."""
-
-    def __init__(self, cfg: Config):
-        self.cfg = cfg
-        self._stop_event = threading.Event()
-        self._thread: threading.Thread | None = None
-        self._running = False
-        self._exception: BaseException | None = None
-
-    @property
-    def is_running(self) -> bool:
-        return self._running
-
-    @property
-    def exception(self) -> BaseException | None:
-        return self._exception
-
-    def start(self, *, blocking: bool = True) -> "StoppableLoop":
-        """Start the loop.
-
-        Args:
-            blocking: When True, run on the current thread. When False, run in a
-                daemon worker thread and return immediately.
-        """
-        if self._running:
-            return self
-
-        self._stop_event.clear()
-        self._exception = None
-
-        if blocking:
-            self._run_guarded()
-        else:
-            self._thread = threading.Thread(target=self._run_guarded, daemon=True)
-            self._thread.start()
-
-        return self
-
-    def stop(self, *, join: bool = True, timeout: float | None = None) -> None:
-        """Request the loop to stop and optionally wait for the worker thread."""
-        self._stop_event.set()
-
-        thread = self._thread
-        if join and thread is not None and thread.is_alive() and thread is not threading.current_thread():
-            thread.join(timeout=timeout)
-
-    def join(self, timeout: float | None = None) -> None:
-        """Wait for a non-blocking start() worker thread to finish."""
-        thread = self._thread
-        if thread is not None and thread.is_alive():
-            thread.join(timeout=timeout)
-
-        if self._exception is not None:
-            raise self._exception
-
-    def _run_guarded(self) -> None:
-        self._running = True
-        try:
-            self._run()
-        except BaseException as exc:
-            self._exception = exc
-            raise
-        finally:
-            self._running = False
-
-    def _run(self) -> None:
-        raise NotImplementedError
-
-
 class DecodePubLoop(StoppableLoop):
     """NVDEC H264 -> CUDA image publisher loop."""
 
@@ -399,77 +329,8 @@ class DecodePubLoop(StoppableLoop):
                     if not cfg.loop:
                         return
             finally:
-                close_quietly(image_pub)
-
-
-class GlShowLoop(StoppableLoop):
-    """CUDA IPC image subscriber -> OpenGL viewer loop."""
-
-    def __init__(self, cfg: Config):
-        super().__init__(cfg)
-        self.viewer = None
-        self.image_sub = None
-
-    def stop(self, *, join: bool = True, timeout: float | None = None) -> None:
-        super().stop(join=False)
-
-        # ImageMatCudaGlViewer is expected to own the GL run loop. Different
-        # resultkit builds expose different shutdown method names, so try the
-        # common ones if the viewer is already initialized.
-        viewer = self.viewer
-        if viewer is not None:
-            for method_name in ("stop", "close", "shutdown", "destroy", "quit"):
-                method = getattr(viewer, method_name, None)
-                if callable(method):
-                    try:
-                        method()
-                        break
-                    except Exception:
-                        pass
-
-        thread = self._thread
-        if join and thread is not None and thread.is_alive() and thread is not threading.current_thread():
-            thread.join(timeout=timeout)
-
-    def _run(self) -> None:
-        from resultkit.cudavis import ImageMatCudaGlViewer
-
-        cfg = self.cfg
-
-        # Follow resultkit's GL path: initialize the viewer first, then create
-        # the CUDA IPC image endpoint in the CUDA/GL context owned by viewer.
-        self.viewer = ImageMatCudaGlViewer(
-            width=int(cfg.width),
-            height=int(cfg.height),
-            fps=float(cfg.fps),
-            device=int(cfg.device),
-            flip_y=bool(cfg.flip_y),
-            max_frames=cfg.max_frames,
-        )
-        self.viewer.init()
-
-        self.image_sub = make_cuda_image_endpoint(cfg, is_pub=False)
-
-        print(
-            f"show: GL viewer subscribing {cfg.image_topic!r} "
-            f"({cfg.width}x{cfg.height} @ {cfg.fps} fps)",
-            flush=True,
-        )
-
-        try:
-            self.viewer.run(img=self.image_sub)
-        finally:
-            close_quietly(self.image_sub)
-            self.image_sub = None
-            self.viewer = None
-
-
-def decode_pub_loop(cfg: Config) -> None:
-    """Backward-compatible function wrapper for the class-based loop."""
-    DecodePubLoop(cfg).start(blocking=True)
-
-
-def gl_show_loop(cfg: Config) -> None:
-    """Backward-compatible function wrapper for the class-based loop."""
-    GlShowLoop(cfg).start(blocking=True)
+                try:
+                    image_pub.close()
+                except Exception:
+                    pass
 

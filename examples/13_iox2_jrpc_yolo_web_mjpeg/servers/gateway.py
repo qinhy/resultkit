@@ -4,7 +4,6 @@ import argparse
 
 import uvicorn
 
-import common  # noqa: F401
 from webapi import create_auto_discover_fastapi_app
 
 

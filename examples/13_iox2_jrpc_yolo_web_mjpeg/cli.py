@@ -11,7 +11,7 @@ from typing import Any
 
 from PIL import Image
 import cv2
-from fastapi import APIRouter, HTTPException, Query, Response
+from fastapi import Query
 from fastapi.responses import StreamingResponse
 import numpy as np
 from pydantic import BaseModel
@@ -24,6 +24,7 @@ from pathlib import Path
 sys.path.append(os.path.dirname(os.path.dirname(Path(__file__).absolute().parent)))
 from resultkit.MatModel import ColorFormat, ImageShapeType, Model4Mat
 from resultkit.mat import DataType
+
 
 def print_json(value: Any) -> str:
     if isinstance(value, BaseModel):
@@ -107,6 +108,7 @@ def pycuda_context(device: int):
     finally:
         cuda.Context.pop()
 
+
 def numpy_image_to_png_bytes(arr) -> bytes:
     # Remove batch dimension if present
     if arr.ndim == 4:
@@ -131,7 +133,6 @@ def numpy_image_to_png_bytes(arr) -> bytes:
     buffer = io.BytesIO()
     image.save(buffer, format="PNG")
     return buffer.getvalue()
-
 
 
 async def imgstream(
@@ -191,6 +192,7 @@ async def imgstream(
                 img.close()
             except Exception:
                 pass
+
 
 async def stream_res(
     stream_type: str,
