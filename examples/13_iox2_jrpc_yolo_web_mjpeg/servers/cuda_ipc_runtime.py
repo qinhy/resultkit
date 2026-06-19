@@ -44,13 +44,15 @@ class FpsMeter:
         self.count = 0
         self.t0 = time.perf_counter()
 
-    def tick(self) -> None:
+    def tick(self) -> float:
         self.count += 1
         if self.count % self.every:
             return
         dt = time.perf_counter() - self.t0
+        fps = self.count / dt
         if dt > 0:
-            print(f"{self.name}: {self.count / dt:.2f} fps", flush=True)
+            print(f"{self.name}: {fps:.2f} fps", flush=True)
+        return fps
 
 
 class FramePacer:
@@ -388,7 +390,7 @@ class DecodePubLoop(StoppableLoop):
 
                             image_pub.pub(data=as_hwc_rgb8(tensor, cfg))
                             published += 1
-                            meter.tick()
+                            fps = meter.tick()
                             pacer.sleep()
 
                             if cfg.max_frames is not None and published >= cfg.max_frames:

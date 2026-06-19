@@ -1,0 +1,84 @@
+import logging
+import time
+import requests
+
+API_URL = "http://127.0.0.1:8000"
+
+def call_method(controller: str, method: str, params: dict = None) -> dict | None:
+    if params is None:
+        params = {}
+    url = f"{API_URL}/controllers/{controller}/{method}"
+    try:
+        response = requests.post(url, json=params)
+        response.raise_for_status()
+        return response.json()
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Request failed: {e}")
+        if hasattr(e, 'response') and e.response is not None:
+            logging.error(f"Response body: {e.response.text}")
+        return None
+
+def main() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(levelname)s - %(message)s"
+    )
+
+    time.sleep(5)
+
+    # Force a refresh on the API gateway to ensure it discovers the latest services
+    logging.info("Refreshing API gateway controllers...")
+    try:
+        requests.get(f"{API_URL}/refresh")
+    except requests.exceptions.RequestException as e:
+        logging.warning(f"Could not reach API gateway at {API_URL}. Is it running? Error: {e}")
+        return
+
+    # start decodepub
+    logging.info("\n=== decodepub.start ===")
+    res_decode_start = call_method("decodepub", "start", {})
+    logging.info(res_decode_start)
+
+    time.sleep(5)
+
+    # get decodepub status
+    logging.info("\n=== decodepub.status ===")
+    res_decode_status = call_method("decodepub", "status")
+    logging.info(res_decode_status)
+
+    # start yolo
+    logging.info("\n=== yolo.start ===")
+    res_yolo_start = call_method("yolo", "start", {})
+    logging.info(res_yolo_start)
+
+    time.sleep(5)
+
+    # get yolo status
+    logging.info("\n=== yolo.status ===")
+    res_yolo_status = call_method("yolo", "status")
+    logging.info(res_yolo_status)
+
+    # change yolo model
+    logging.info("\n=== yolo.set_model ===")
+    res_yolo_model = call_method("yolo", "set_model", {
+        "model_name": "yolov8s.pt",  # changing to a different model as an example
+        "confidence": 0.9,
+        "iou": 0.45,
+        "max_detections": 100,
+        "stride": 32,
+    })
+    logging.info(res_yolo_model)
+
+    time.sleep(5)
+
+    # get yolo status
+    logging.info("\n=== yolo.status ===")
+    res_yolo_status2 = call_method("yolo", "status")
+    logging.info(res_yolo_status2)
+
+    # wait for quit
+    input("Press Enter to quit...")
+    
+
+if __name__ == "__main__":
+    main()

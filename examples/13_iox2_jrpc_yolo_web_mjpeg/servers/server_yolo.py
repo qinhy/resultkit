@@ -3,10 +3,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
-from common import EmptyParams, RpcModel
+from common import EmptyParams, RpcModel, openapi_doc
 
 from cuda_ipc_runtime import Config
-from torch_runtime import YOLO_TOPIC, YoloLoop
+from torch_runtime import YOLO_TOPIC, YoloLoop, YoloSettings as YoloSettingsRuntime
 
 
 class YoloBaseModel(RpcModel):
@@ -23,21 +23,36 @@ class StartYoloParams(YoloBaseModel):
     fps: int = 30
     device: int = 0
     input_topic: str = "ImageMatCUDAPubSub:h264FileDemo"
-    output_topic: str = YOLO_TOPIC
+    output_topic: str = "ImageMatCUDAPubSub:yolo"
     num_slots: int = 3
     max_frames: int | None = None
     stats_every: int = 100
 
 
-class YoloResult(YoloBaseModel):
+class YoloSettings(YoloBaseModel):
+    """Runtime settings for model inference and detection serialization."""
+
+    model_name: str = "yolov8n.pt"
+    confidence: float = 0.25
+    iou: float = 0.45
+    max_detections: int = 100
+    stride: int = 32
+
+    def as_runtime(self) -> YoloSettingsRuntime:
+        return YoloSettingsRuntime(**self.model_dump(exclude={"service"}))
+
+
+class YoloResult(StartYoloParams):
+    model_config = {"extra": "ignore"}
     running: bool
     input_topic: str = "ImageMatCUDAPubSub:h264FileDemo"
     output_topic: str = YOLO_TOPIC
+    model: YoloSettings = None
     error: str | None = None
 
 
 @dataclass
-class YoloController:
+class YoloController:# (JsonRpcController)
     running: bool = False
     yolo_loop: YoloLoop = None
     service_name: str = "jsonrpc"
@@ -46,61 +61,30 @@ class YoloController:
     @staticmethod
     def openapi_examples():
         return {
-            "yolo_status": {
-                "summary": "yolo: yolo.status",
-                "description": "Use service_name = yolo with /{service_name}/rpc.",
-                "value": {
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "method": "yolo.status",
-                    "params": {},
-                },
-            },
-            "yolo_start": {
-                "summary": "yolo: yolo.start",
-                "description": "Use service_name = yolo with /{service_name}/rpc.",
-                "value": {
-                    "jsonrpc": "2.0",
-                    "id": 2,
-                    "method": "yolo.start",
-                    "params": {
-                        "input_topic": "ImageMatCUDAPubSub:h264FileDemo",
-                        "output_topic": "ImageMatCUDAPubSub:yolo",
-                        "width": 1280,
-                        "height": 720,
-                        "fps": 30,
-                        "device": 0,
-                    },
-                },
-            },
-            "yolo_stop": {
-                "summary": "yolo: yolo.stop",
-                "description": "Use service_name = yolo with /{service_name}/rpc.",
-                "value": {
-                    "jsonrpc": "2.0",
-                    "id": 3,
-                    "method": "yolo.stop",
-                    "params": {},
-                },
-            },
+            **openapi_doc("yolo_status", id=1, params={}),
+            **openapi_doc("yolo_start",  id=2, params=StartYoloParams().model_dump()),
+            **openapi_doc("yolo_stop",   id=3, params={}),
+            **openapi_doc("yolo_set_model", id=4, params=YoloSettings().model_dump()),
         }
 
-    def _result(self) -> YoloResult:
-        err = None
-        running = False
-        input_topic = "ImageMatCUDAPubSub:h264FileDemo"
-        output_topic = YOLO_TOPIC
+    def _result(self, err = None) -> YoloResult:
+        res = YoloResult(
+            running = False,
+            input_topic = "",
+            output_topic = "",
+            error = None,
+        )
 
         if self.yolo_loop is not None:
-            running = self.yolo_loop.is_running
-            input_topic = self.yolo_loop.cfg.image_topic
-            output_topic = self.yolo_loop.output_topic
+            res.running = self.yolo_loop.is_running
+            res.input_topic = self.yolo_loop.cfg.image_topic
+            res.output_topic = self.yolo_loop.output_topic
+            res.model = YoloSettings(**self.yolo_loop.detector.settings.__dict__)
             if self.yolo_loop.exception is not None:
-                err = f"{self.yolo_loop.exception.__class__.__name__}: {self.yolo_loop.exception}"
+                res.error = f"{self.yolo_loop.exception.__class__.__name__}: {self.yolo_loop.exception}"
 
-        self.running = running
-        return YoloResult(running=running, input_topic=input_topic, output_topic=output_topic, error=err)
-
+        return res
+    
     def start(self, params: StartYoloParams) -> YoloResult:
         if self.yolo_loop is not None:
             self.yolo_loop.stop()
@@ -120,6 +104,14 @@ class YoloController:
         return self._result()
 
     def status(self, params: EmptyParams) -> YoloResult:
+        return self._result()
+    
+    def set_model(self, params: YoloSettings) -> YoloResult:
+        if self.yolo_loop is None:return self._result()
+        try:
+            self.yolo_loop.change_detector(settings=params.as_runtime())
+        except Exception as e:
+            return self._result(str(e))
         return self._result()
 
 
