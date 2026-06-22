@@ -1,6 +1,7 @@
 import logging
 import time
 import requests
+from iox2redis import redis_for
 
 API_URL = "http://127.0.0.1:8000"
 
@@ -60,13 +61,23 @@ def main() -> None:
 
     # change yolo model
     logging.info("\n=== yolo.set_model ===")
-    res_yolo_model = call_method("yolo", "set_model", {
+    r = redis_for(host="/iox2redis/", decode_responses=True)
+    while not r.ping():
+        time.sleep(1)
+        logging.info("Waiting for iox2redis...")
+
+    default_yolo_settings = {
         "model_name": "yolov8s.pt",  # changing to a different model as an example
         "confidence": 0.9,
         "iou": 0.45,
         "max_detections": 100,
         "stride": 32,
-    })
+    }
+    last_yolo_settings = r.get_json("yolo_settings")
+    if last_yolo_settings is None:
+        last_yolo_settings = default_yolo_settings
+        
+    res_yolo_model = call_method("yolo", "set_model", last_yolo_settings)
     logging.info(res_yolo_model)
 
     time.sleep(5)

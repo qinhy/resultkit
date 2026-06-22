@@ -182,3 +182,4 @@ cython_debug/
 *.pt
 /pycuda
 /bin
+iox2redis-store.json

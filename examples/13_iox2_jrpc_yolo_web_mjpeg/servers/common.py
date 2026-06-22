@@ -14,6 +14,8 @@ if EXAMPLE_DIR not in sys.path:
     sys.path.append(EXAMPLE_DIR)
 
 from iox2_jsonrpc import EmptyParams, RpcModel
+from iox2redis import redis_for
+from iox2redis.server import main as server_main
 
 class StoppableLoop:
     """Small base class for loops that can run blocking or in a worker thread."""

@@ -31,19 +31,6 @@ from utils import (  # noqa: E402
 )
 
 
-YOLO_TOPIC = "ImageMatCUDAPubSub:yolo"
-
-# Environment overrides:
-#   set YOLO_MODEL=yolov8n.pt
-#   set YOLO_CONF=0.25
-#   set YOLO_IOU=0.45
-#   set YOLO_MAX_DET=100
-YOLO_MODEL = os.environ.get("YOLO_MODEL", "yolov8n.pt")
-YOLO_CONF = float(os.environ.get("YOLO_CONF", "0.25"))
-YOLO_IOU = float(os.environ.get("YOLO_IOU", "0.45"))
-YOLO_MAX_DET = int(os.environ.get("YOLO_MAX_DET", "100"))
-
-
 @contextmanager
 def pushed_cuda_context(ctx: Any):
     """
@@ -64,53 +51,11 @@ def pushed_cuda_context(ctx: Any):
 class YoloSettings:
     """Runtime settings for model inference and detection serialization."""
 
-    model_name: str = YOLO_MODEL
-    confidence: float = YOLO_CONF
-    iou: float = YOLO_IOU
-    max_detections: int = YOLO_MAX_DET
+    model_name: str = os.environ.get("YOLO_MODEL", "yolov8n.pt")
+    confidence: float = float(os.environ.get("YOLO_CONF", "0.25"))
+    iou: float = float(os.environ.get("YOLO_IOU", "0.45"))
+    max_detections: int = int(os.environ.get("YOLO_MAX_DET", "100"))
     stride: int = 32
-
-    @classmethod
-    def from_env(cls) -> "YoloSettings":
-        return cls(
-            model_name=os.environ.get("YOLO_MODEL", YOLO_MODEL),
-            confidence=float(os.environ.get("YOLO_CONF", str(YOLO_CONF))),
-            iou=float(os.environ.get("YOLO_IOU", str(YOLO_IOU))),
-            max_detections=int(os.environ.get("YOLO_MAX_DET", str(YOLO_MAX_DET))),
-        )
-
-
-@dataclass(frozen=True)
-class CropRegion:
-    """A centered crop whose height and width are YOLO-stride aligned."""
-
-    top: int
-    left: int
-    bottom: int
-    right: int
-
-    @property
-    def height(self) -> int:
-        return self.bottom - self.top
-
-    @property
-    def width(self) -> int:
-        return self.right - self.left
-
-    @classmethod
-    def centered_stride_crop(cls, height: int, width: int, stride: int) -> "CropRegion":
-        crop_h = height - (height % stride)
-        crop_w = width - (width % stride)
-
-        if crop_h <= 0 or crop_w <= 0:
-            raise RuntimeError(
-                "image too small after stride crop: "
-                f"original shape=({height}, {width}, 3), stride={stride}"
-            )
-
-        top = (height - crop_h) // 2
-        left = (width - crop_w) // 2
-        return cls(top=top, left=left, bottom=top + crop_h, right=left + crop_w)
 
 
 @dataclass
@@ -120,10 +65,11 @@ class DetectionResult:
     boxes_xyxy: torch.Tensor | None = None
     conf: torch.Tensor | None = None
     cls: torch.Tensor | None = None
+    count: int = 0
 
     @property
     def is_empty(self) -> bool:
-        return self.boxes_xyxy is None or self.conf is None or self.cls is None
+        return self.count == 0 or self.boxes_xyxy is None or self.conf is None or self.cls is None
 
 
 class DetectionPixelEncoder:
@@ -145,34 +91,127 @@ class DetectionPixelEncoder:
     """
 
     MAGIC = b"YOLORES1"
-    HEADER_RESERVED_BYTES = 6
+    HEADER_BYTES = 16
+    BYTES_PER_DETECTION = 12
 
     def __init__(self, max_detections: int) -> None:
         self.max_detections = int(max_detections)
 
+        if self.max_detections < 0:
+            raise ValueError("max_detections must be >= 0")
+
+        if self.max_detections > 65535:
+            raise ValueError("max_detections must be <= 65535 because count is uint16")
+
+        self._magic_cache = {}
+
     def encode(self, out_img: torch.Tensor, detections: DetectionResult) -> torch.Tensor:
         self._validate_image(out_img)
 
+        # Fastest option: require contiguous output.
+        # Copying a whole image just to encode a few bytes can be expensive.
         if not out_img.is_contiguous():
-            out_img = out_img.contiguous()
+            raise ValueError("out_img must be contiguous for fast encoding")
 
-        payload = self._build_payload(detections)
-        flat = out_img.reshape(-1)
+        flat = out_img.view(-1)
 
-        if len(payload) > flat.numel():
+        count = self._detection_count(detections)
+        needed = self.HEADER_BYTES + count * self.BYTES_PER_DETECTION
+
+        if needed > flat.numel():
             raise RuntimeError(
-                f"YOLO encoded payload needs {len(payload)} bytes, "
+                f"YOLO encoded payload needs {needed} bytes, "
                 f"but output image only has {flat.numel()} bytes"
             )
 
-        payload_np = np.frombuffer(payload, dtype=np.uint8).copy()
-        encoded = torch.from_numpy(payload_np).to(device=out_img.device, dtype=torch.uint8)
-        flat[: encoded.numel()] = encoded
+        payload = torch.empty(
+            needed,
+            device=out_img.device,
+            dtype=torch.uint8,
+        )
+
+        # Header
+        payload[:8] = self._magic_tensor(out_img.device)
+        payload[8] = count & 0xFF
+        payload[9] = (count >> 8) & 0xFF
+        payload[10:16].zero_()
+
+        if count > 0:
+            values = self._detections_as_uint16_values(detections, count, out_img.device)
+
+            # Convert uint16-ish int32 values to little-endian bytes:
+            # [x1_lo, x1_hi, y1_lo, y1_hi, ...]
+            bytes_le = torch.empty(
+                (count, 6, 2),
+                device=out_img.device,
+                dtype=torch.uint8,
+            )
+
+            bytes_le[:, :, 0] = torch.bitwise_and(values, 0xFF).to(torch.uint8)
+            bytes_le[:, :, 1] = torch.bitwise_right_shift(values, 8).to(torch.uint8)
+
+            payload[16:] = bytes_le.reshape(-1)
+
+        flat[:needed] = payload
         return out_img
 
+    def _magic_tensor(self, device: torch.device) -> torch.Tensor:
+        key = str(device)
+
+        cached = self._magic_cache.get(key)
+        if cached is None:
+            cached = torch.tensor(
+                list(self.MAGIC),
+                device=device,
+                dtype=torch.uint8,
+            )
+            self._magic_cache[key] = cached
+
+        return cached
+
+    def _detection_count(self, detections: DetectionResult) -> int:
+        if detections.is_empty or detections.boxes_xyxy.numel() == 0:
+            return 0
+
+        return min(
+            int(detections.boxes_xyxy.shape[0]),
+            int(detections.conf.shape[0]),
+            int(detections.cls.shape[0]),
+            self.max_detections,
+            65535,
+        )
+
     @staticmethod
-    def uint16_le(value: int) -> bytes:
-        return struct.pack("<H", max(0, min(65535, int(value))))
+    def _detections_as_uint16_values(
+        detections: DetectionResult,
+        count: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        boxes = (
+            detections.boxes_xyxy[:count]
+            .detach()
+            .round()
+            .to(device=device, dtype=torch.int32)
+            .clamp_(0, 65535)
+        )
+
+        conf = detections.conf[:count].detach().to(device=device)
+        conf = torch.nan_to_num(conf, nan=0.0, posinf=1.0, neginf=0.0)
+        conf = conf.clamp_(0.0, 1.0)
+        conf_u16 = (conf * 10000.0).round().to(torch.int32).unsqueeze(1)
+
+        cls = (
+            detections.cls[:count]
+            .detach()
+            .round()
+            .to(device=device, dtype=torch.int32)
+            .clamp_(0, 65535)
+            .unsqueeze(1)
+        )
+
+        # Shape: [N, 6]
+        # Columns: x1, y1, x2, y2, conf, cls
+        return torch.cat([boxes, conf_u16, cls], dim=1)
 
     @staticmethod
     def _validate_image(out_img: torch.Tensor) -> None:
@@ -181,41 +220,132 @@ class DetectionPixelEncoder:
 
         if out_img.ndim != 3 or int(out_img.shape[-1]) != 3:
             raise ValueError(f"out_img must be HWC RGB, got {tuple(out_img.shape)}")
+        
 
-    def _build_payload(self, detections: DetectionResult) -> bytes:
-        if detections.is_empty or detections.boxes_xyxy.numel() == 0:
-            return self.MAGIC + self.uint16_le(0) + bytes(self.HEADER_RESERVED_BYTES)
+class DetectionPixelDecoder:
+    """
+    Decodes YOLO detections from the first bytes of an RGB image.
 
-        boxes_cpu = (
-            detections.boxes_xyxy[: self.max_detections]
-            .detach()
-            .round()
-            .to(torch.int32)
-            .cpu()
+    Layout:
+        bytes 0..7    magic: b"YOLORES1"
+        bytes 8..9    detection count uint16 little-endian
+        bytes 10..15   reserved
+
+    Per detection, 12 bytes:
+        x1 uint16
+        y1 uint16
+        x2 uint16
+        y2 uint16
+        conf uint16, confidence * 10000
+        cls uint16
+    """
+
+    MAGIC = b"YOLORES1"
+    HEADER_BYTES = 16
+    BYTES_PER_DETECTION = 12
+
+    def __init__(self) -> None:
+        self._magic_cache = {}
+
+    def decode(self, encoded_img: torch.Tensor) -> DetectionResult:
+        self._validate_image(encoded_img)
+
+        # For maximum speed, require contiguous memory.
+        # This matches the fast encoder behavior.
+        if not encoded_img.is_contiguous():
+            raise ValueError("encoded_img must be contiguous for fast decoding")
+
+        flat = encoded_img.view(-1)
+
+        if flat.numel() < self.HEADER_BYTES:
+            raise ValueError(
+                f"encoded_img is too small: needs at least {self.HEADER_BYTES} bytes"
+            )
+
+        self._validate_magic(flat)
+
+        count = self._read_uint16_le(flat, offset=8)
+
+        payload_bytes = self.HEADER_BYTES + count * self.BYTES_PER_DETECTION
+
+        if payload_bytes > flat.numel():
+            raise ValueError(
+                f"Encoded payload says it needs {payload_bytes} bytes, "
+                f"but image only has {flat.numel()} bytes"
+            )
+
+        if count == 0:
+            return self._empty_result(encoded_img.device)
+
+        body = flat[
+            self.HEADER_BYTES : self.HEADER_BYTES + count * self.BYTES_PER_DETECTION
+        ]
+
+        # Shape: [N, 6, 2]
+        # 6 uint16 fields per detection, 2 little-endian bytes per field.
+        byte_pairs = body.view(count, 6, 2).to(torch.int32)
+
+        # uint16 little-endian decode:
+        # value = low_byte + high_byte * 256
+        values = byte_pairs[:, :, 0] + byte_pairs[:, :, 1] * 256
+
+        boxes_xyxy = values[:, 0:4].to(torch.float32)
+        conf = values[:, 4].to(torch.float32) / 10000.0
+        cls = values[:, 5].to(torch.int64)
+
+        return DetectionResult(
+            boxes_xyxy=boxes_xyxy,
+            conf=conf,
+            cls=cls,
+            count=count,
         )
-        conf_cpu = detections.conf[: self.max_detections].detach().cpu()
-        cls_cpu = detections.cls[: self.max_detections].detach().round().to(torch.int32).cpu()
-        count = min(int(boxes_cpu.shape[0]), self.max_detections)
 
-        payload = bytearray()
-        payload += self.MAGIC
-        payload += self.uint16_le(count)
-        payload += bytes(self.HEADER_RESERVED_BYTES)
+    def _validate_magic(self, flat: torch.Tensor) -> None:
+        expected = self._magic_tensor(flat.device)
 
-        for i in range(count):
-            x1, y1, x2, y2 = [int(v) for v in boxes_cpu[i].tolist()]
-            score = int(float(conf_cpu[i]) * 10000.0)
-            class_id = int(cls_cpu[i])
+        if not torch.equal(flat[:8], expected):
+            found = bytes(flat[:8].detach().cpu().tolist())
+            raise ValueError(
+                f"Invalid YOLO result magic header: expected {self.MAGIC!r}, got {found!r}"
+            )
 
-            payload += self.uint16_le(x1)
-            payload += self.uint16_le(y1)
-            payload += self.uint16_le(x2)
-            payload += self.uint16_le(y2)
-            payload += self.uint16_le(score)
-            payload += self.uint16_le(class_id)
+    def _magic_tensor(self, device: torch.device) -> torch.Tensor:
+        key = str(device)
 
-        return bytes(payload)
+        cached = self._magic_cache.get(key)
+        if cached is None:
+            cached = torch.tensor(
+                list(self.MAGIC),
+                device=device,
+                dtype=torch.uint8,
+            )
+            self._magic_cache[key] = cached
 
+        return cached
+
+    @staticmethod
+    def _read_uint16_le(flat: torch.Tensor, offset: int) -> int:
+        low = int(flat[offset].item())
+        high = int(flat[offset + 1].item())
+        return low | (high << 8)
+
+    @staticmethod
+    def _empty_result(device: torch.device) -> DetectionResult:
+        return DetectionResult(
+            boxes_xyxy=torch.empty((0, 4), device=device, dtype=torch.float32),
+            conf=torch.empty((0,), device=device, dtype=torch.float32),
+            cls=torch.empty((0,), device=device, dtype=torch.int64),
+            count=0,
+        )
+
+    @staticmethod
+    def _validate_image(encoded_img: torch.Tensor) -> None:
+        if encoded_img.dtype != torch.uint8:
+            raise ValueError("encoded_img must be torch.uint8")
+
+        if encoded_img.ndim != 3 or int(encoded_img.shape[-1]) != 3:
+            raise ValueError(f"encoded_img must be HWC RGB, got {tuple(encoded_img.shape)}")
+        
 
 class YoloDetector:
     """Runs YOLO on CUDA HWC RGB images and draws encoded results."""
@@ -234,8 +364,9 @@ class YoloDetector:
     }
 
     def __init__(self, settings: YoloSettings | None = None) -> None:
-        self.settings = settings or YoloSettings.from_env()
+        self.settings = settings or YoloSettings()
         self.encoder = DetectionPixelEncoder(self.settings.max_detections)
+        self._validated_inputs = {}
 
     def process(self, img_uint8: torch.Tensor) -> torch.Tensor:
         """
@@ -246,29 +377,37 @@ class YoloDetector:
             CUDA HWC RGB uint8 tensor, same original shape.
 
         Behavior:
-            - Crops edges so H and W are divisible by the configured stride.
+            - Crops only the bottom/right edges so H and W are divisible by stride.
             - For 720x1280 input, YOLO sees 704x1280 when stride is 32.
-            - Boxes are shifted back to full-frame coordinates.
+            - No box offset is needed because crop starts at top-left corner.
             - Output image keeps the original shape.
         """
-        self._validate_input(img_uint8)
+        crop_h, crop_w = self._validate_input(img_uint8)
         img_uint8 = img_uint8.contiguous()
 
         device_index = int(img_uint8.device.index or 0)
         model = self._get_model(self.settings.model_name, device_index)
 
-        crop = CropRegion.centered_stride_crop(
-            height=int(img_uint8.shape[0]),
-            width=int(img_uint8.shape[1]),
-            stride=self.settings.stride,
-        )
-        img_crop = img_uint8[crop.top : crop.bottom, crop.left : crop.right, :].contiguous()
+        img_crop = img_uint8[:crop_h, :crop_w, :].contiguous()
         model_input = self._to_model_input(img_crop)
 
         result = self._predict(model, model_input, device_index)
-        detections = self._extract_detections(result, crop)
+
+        boxes = getattr(result, "boxes", None)
+
+        if boxes is None or len(boxes) == 0:
+            detections = DetectionResult()
+        else:
+            detections = DetectionResult(
+                boxes_xyxy=boxes.xyxy,
+                conf=boxes.conf,
+                cls=boxes.cls,
+                count=len(boxes.conf),
+            )
+
         output = self._draw_detections(img_uint8, detections)
         output = self.encoder.encode(output, detections)
+
         return output.contiguous()
 
     @staticmethod
@@ -286,8 +425,13 @@ class YoloDetector:
         model.to(f"cuda:{int(device_index)}")
         return model
 
-    @staticmethod
-    def _validate_input(img_uint8: torch.Tensor) -> None:
+    def _validate_input(self, img_uint8: torch.Tensor) -> tuple[int, int]:
+        key = (tuple(img_uint8.shape), img_uint8.dtype, img_uint8.is_cuda, int(self.settings.stride))
+
+        if key in self._validated_inputs:
+            crop_h, crop_w = self._validated_inputs[key]
+            return crop_h, crop_w
+
         if not img_uint8.is_cuda:
             raise RuntimeError("yolo_step expects a CUDA tensor")
 
@@ -299,10 +443,22 @@ class YoloDetector:
                 f"yolo_step expects HWC RGB image, got shape {tuple(img_uint8.shape)}"
             )
 
+        h = int(img_uint8.shape[0])
+        w = int(img_uint8.shape[1])
+        stride = int(self.settings.stride)
+
+        crop_h = h - (h % stride)
+        crop_w = w - (w % stride)
+
+        self._validated_inputs[key] = (crop_h, crop_w)
+        return crop_h, crop_w
+
+
     @staticmethod
     def _to_model_input(img_crop: torch.Tensor) -> torch.Tensor:
         # Ultralytics tensor input must be BCHW and H/W divisible by stride 32.
         # Input is RGB float in range 0..1.
+        # For YOLO object detection, you normally should not apply ImageNet mean/std
         return (
             img_crop.permute(2, 0, 1)
             .unsqueeze(0)
@@ -322,21 +478,6 @@ class YoloDetector:
                 verbose=False,
             )
         return results[0]
-
-    @staticmethod
-    def _extract_detections(result: Any, crop: CropRegion) -> DetectionResult:
-        boxes = getattr(result, "boxes", None)
-        if boxes is None or len(boxes) == 0:
-            return DetectionResult()
-
-        boxes_xyxy = boxes.xyxy.clone()
-        boxes_xyxy[:, [0, 2]] += crop.left
-        boxes_xyxy[:, [1, 3]] += crop.top
-        return DetectionResult(
-            boxes_xyxy=boxes_xyxy,
-            conf=boxes.conf,
-            cls=boxes.cls,
-        )
 
     def _draw_detections(
         self,
@@ -358,7 +499,7 @@ class CudaYoloEndpointFactory:
     """Creates resultkit CUDA image endpoints."""
 
     @staticmethod
-    def make_yolo_endpoint(cfg: Config, *, is_pub: bool, output_topic: str = YOLO_TOPIC):
+    def make_yolo_endpoint(cfg: Config, *, is_pub: bool, output_topic: str = "ImageMatCUDAPubSub:yolo"):
         import pycuda.gpuarray as gpuarray
         from resultkit.MatModel import ColorFormat, ImageShapeType, Model4Mat
         from resultkit.mat import DataType
@@ -425,7 +566,6 @@ class CudaPrimaryContext:
             yield
 
 
-
 class YoloLoop(StoppableLoop):
     """CUDA IPC image subscriber -> YOLO CUDA image publisher loop."""
 
@@ -433,7 +573,7 @@ class YoloLoop(StoppableLoop):
         self,
         cfg: Config,
         *,
-        output_topic: str = YOLO_TOPIC,
+        output_topic: str,
         detector: YoloDetector | None = None,
         pause_sleep_seconds: float = 0.01,
     ) -> None:
@@ -625,3 +765,4 @@ class YoloLoop(StoppableLoop):
             endpoint.close()
         except Exception:
             pass
+
