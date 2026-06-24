@@ -188,13 +188,12 @@ class Iox2JsonRpcServer:
         self.close()
 
     def run_forever(self) -> None:
+        print("\n=== Descriptor ===")
+        print(self.descriptor.model_dump_json(indent=2))
         print("\n=== iceoryx2 JSON-RPC server started ===")
         print(f"RPC endpoint:    {self.rpc_endpoint}")
         print(f"Schema endpoint: {self.schema_endpoint}")
-        print("\n=== Descriptor ===")
-        print(self.descriptor.model_dump_json(indent=2))
         print("\nWaiting for requests...")
-
         try:
             while True:
                 self.node.wait(self.poll_time)
