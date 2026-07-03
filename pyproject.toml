@@ -27,12 +27,14 @@ dev = [
     "glfw>=2.10.0",
     "redis>=8.0.0",
     "depthai>=3.7.1",
+    "pyopengl>=3.1.10",
+    "pyopengl-accelerate>=3.1.10",
 ]
 
 [tool.uv.sources]
 torch = { index = "torch-cuda" }
 torchvision = { index = "torch-cuda" }
-pycuda = { path = "./pycuda", editable = true }
+pycuda = { path = "./pycuda" }
 
 [[tool.uv.index]]
 name = "torch-cuda"
