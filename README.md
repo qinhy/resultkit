@@ -158,3 +158,31 @@ Available classes:
 - `MatOps`
 - `NumpyMatOps`
 - `TorchMatOps`
+
+There is no `pycuda[gl]` extra. You enable PyCUDA OpenGL support **at build time** with:
+
+```bash
+--cuda-enable-gl
+```
+
+or by setting this in `siteconf.py`:
+
+```python
+CUDA_ENABLE_GL = True
+```
+
+PyCUDA’s build config has `CUDA_ENABLE_GL` disabled by default, and when enabled it adds the CUDA/OpenGL wrapper source and defines `HAVE_GL`. The current PyCUDA docs also show `pycuda.gl` APIs such as `make_context`, `RegisteredBuffer`, and `RegisteredImage`. ([GitHub][1])
+
+
+## Build PyCUDA with `uv`
+
+Then rebuild PyCUDA from source:
+
+```bash
+git clone https://github.com/inducer/pycuda.git
+cd pycuda
+
+uv pip install -U setuptools wheel numpy mako pytools platformdirs
+uv run python configure.py --cuda-root="$CUDA_HOME" --cuda-enable-gl
+uv pip install -v --no-build-isolation .
+```
