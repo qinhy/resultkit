@@ -3,21 +3,22 @@ from __future__ import annotations
 import argparse
 import base64
 import multiprocessing as mp
-import os
 import queue as py_queue
-import sys
 import threading
 import time
 import traceback
-from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any, Literal
 
+import torch
 from pydantic import Field
+import cv2
 
-from common import EmptyParams, RpcModel, openapi_doc
+from common import (EmptyParams, RpcModel, openapi_doc,
+                    PreviewProcess, CaptureRequestProcess, 
+                    WorkerFrame, WorkerContext, WorkerPipelineProcess)
 
+from resultkit.dai.rgb_stereo_generator import DepthAIPoeRGBStereoTorchGenerator
 
 StreamName = Literal["rgb", "stereo", "left", "right"]
 STREAMS: tuple[StreamName, ...] = ("rgb", "stereo", "left", "right")
@@ -38,7 +39,7 @@ parser.add_argument(
 parser.add_argument(
     "--device",
     default="169.254.1.222",
-    help="Name of the camera controller.",
+    help="IP address or device identifier of the camera controller.",
 )
 args = parser.parse_args()
 
@@ -50,8 +51,8 @@ class CameraBaseModel(RpcModel):
 class CameraConfig(CameraBaseModel):
     """Runtime settings for the DepthAI PoE RGB+stereo RPC camera server.
 
-    Keep all DepthAI/Torch/CUDA/OpenCV frame work in the child process. The RPC
-    parent only owns queues, metadata, and JPEG base64 strings, so native decoder
+    Keep DepthAI/Torch/OpenCV frame work in the child process. The RPC parent
+    only owns queues, metadata, and JPEG base64 strings, so native decoder
     failures cannot directly crash the RPC server process.
     """
 
@@ -82,17 +83,6 @@ class CameraConfig(CameraBaseModel):
 
     normalize_rgb: bool = True
     normalize_stereo: bool = True
-
-    # CUDA image publisher settings. The publisher is created inside the
-    # camera worker process so the JSON-RPC parent never touches CUDA state.
-    pub_enabled: bool = True
-    pub_stream: StreamName = "rgb"
-    pub_device: int = 0
-    image_topic: str = "ImageMatCUDAPubSub:daiRgb"
-    num_slots: int = 3
-    pub_width: int | None = None
-    pub_height: int | None = None
-    pub_required: bool = False
 
     preview: bool = False
     preview_rgb_downsample: int = 10
@@ -140,11 +130,6 @@ class CameraStatusResult(CameraBaseModel):
     restart_count: int = 0
     process_restart_count: int = 0
     worker_exitcode: int | None = None
-    publishing: bool = False
-    image_topic: str | None = None
-    pub_stream: StreamName | None = None
-    last_published_frame_id: int | None = None
-    last_publish_error: str | None = None
 
 
 class CaptureResult(CameraStatusResult):
@@ -214,263 +199,47 @@ def _float_or_keep(current: float | None, value: Any) -> float | None:
         return current
 
 
-
-def _to_cv_array(mat: Any, *, downsample: int = 1, rgb_to_bgr: bool = True) -> Any:
-    """Convert a Torch tensor image to a CPU OpenCV array inside the worker."""
-
-    import torch
-
-    x = mat.detach()
-    if x.ndim == 4 and x.shape[0] == 1:
-        x = x[0]
-    if x.ndim == 3 and x.shape[0] in (1, 3, 4) and x.shape[-1] not in (1, 3, 4):
-        x = x.permute(1, 2, 0)
-
-    step = max(1, int(downsample))
-    if step > 1:
-        x = x[::step, ::step]
-
-    if x.dtype.is_floating_point:
-        max_value = float(x.max()) if x.numel() else 1.0
-        x = x * 255.0 if max_value <= 1.5 else x
-        x = x.clamp(0, 255)
-    x = x.to(dtype=torch.uint8)
-
-    arr = x.cpu().numpy()
-    if arr.ndim == 3 and arr.shape[-1] == 4:
-        arr = arr[:, :, :3]
-    if rgb_to_bgr and arr.ndim == 3 and arr.shape[-1] == 3:
-        arr = arr[:, :, ::-1].copy()
-    if arr.ndim == 3 and arr.shape[-1] == 1:
-        arr = arr[:, :, 0]
-    return arr
-
-
-def _tensor_to_jpeg_base64_in_worker(tensor: Any, jpeg_quality: int, *, rgb_to_bgr: bool) -> str:
-    import cv2
-
-    ok, encoded = cv2.imencode(
-        ".jpg",
-        _to_cv_array(tensor, downsample=1, rgb_to_bgr=rgb_to_bgr),
-        [int(cv2.IMWRITE_JPEG_QUALITY), int(jpeg_quality)],
-    )
-    if not ok:
-        raise RuntimeError("cv2.imencode failed while encoding camera frame")
-    return base64.b64encode(encoded.tobytes()).decode("ascii")
-
-
-def _drain_capture_requests(capture_request_queue: Any) -> list[dict[str, Any]]:
-    requests: list[dict[str, Any]] = []
-    while True:
-        try:
-            req = capture_request_queue.get_nowait()
-        except (py_queue.Empty, Exception):
-            return requests
-        if isinstance(req, dict):
-            requests.append(req)
-
+# ---------------------------------------------------------------------------
+# Worker-only helpers. Keep Torch/OpenCV/DepthAI imports inside functions.
+# ---------------------------------------------------------------------------
 
 def _sleep_until_stopped(stop_event: Any, seconds: float) -> None:
     end_s = time.monotonic() + max(0.0, seconds)
     while not stop_event.is_set() and time.monotonic() < end_s:
         time.sleep(min(0.1, end_s - time.monotonic()))
 
-# ---------------------------------------------------------------------------
-# Worker-only helpers. Keep Torch/OpenCV/DepthAI/CUDA imports inside functions.
-# ---------------------------------------------------------------------------
 
 def _build_dai_gen_from_config(config: dict[str, Any]) -> Any:
-    from resultkit.dai.rgb_stereo_generator import DepthAIPoeRGBStereoTorchGenerator
-    config:CameraConfig = CameraConfig(**config)
+
+    camera_config = CameraConfig(**config)
     return DepthAIPoeRGBStereoTorchGenerator(
-        uuid=config.uuid,
-        sources=config.sources,
-        rgb_width=config.rgb_width,
-        rgb_height=config.rgb_height,
-        stereo_width=config.stereo_width,
-        stereo_height=config.stereo_height,
-        capture_fps=config.capture_fps,
-        rgb_codec=config.rgb_codec,
-        stereo_codec=config.stereo_codec,
-        rgb_bitrate_kbps=config.rgb_bitrate_kbps,
-        stereo_bitrate_kbps=config.stereo_bitrate_kbps,
-        decoder_backend=config.decoder_backend,
-        gst_nvivafilter_so=config.gst_nvivafilter_so,
-        gst_nvivafilter_dtype=config.gst_nvivafilter_dtype,
-        gst_nvivafilter_channel_order=config.gst_nvivafilter_channel_order,
-        decoder_output_color=config.decoder_output_color,
-        stereo_decoder_output_color=config.stereo_decoder_output_color,
-        rgb_camera_socket=config.rgb_camera_socket,
-        left_camera_socket=config.left_camera_socket,
-        right_camera_socket=config.right_camera_socket,
-        normalize_rgb=config.normalize_rgb,
-        normalize_stereo=config.normalize_stereo,
+        uuid=camera_config.uuid,
+        sources=camera_config.sources,
+        rgb_width=camera_config.rgb_width,
+        rgb_height=camera_config.rgb_height,
+        stereo_width=camera_config.stereo_width,
+        stereo_height=camera_config.stereo_height,
+        capture_fps=camera_config.capture_fps,
+        rgb_codec=camera_config.rgb_codec,
+        stereo_codec=camera_config.stereo_codec,
+        rgb_bitrate_kbps=camera_config.rgb_bitrate_kbps,
+        stereo_bitrate_kbps=camera_config.stereo_bitrate_kbps,
+        decoder_backend=camera_config.decoder_backend,
+        gst_nvivafilter_so=camera_config.gst_nvivafilter_so,
+        gst_nvivafilter_dtype=camera_config.gst_nvivafilter_dtype,
+        gst_nvivafilter_channel_order=camera_config.gst_nvivafilter_channel_order,
+        decoder_output_color=camera_config.decoder_output_color,
+        stereo_decoder_output_color=camera_config.stereo_decoder_output_color,
+        rgb_camera_socket=camera_config.rgb_camera_socket,
+        left_camera_socket=camera_config.left_camera_socket,
+        right_camera_socket=camera_config.right_camera_socket,
+        normalize_rgb=camera_config.normalize_rgb,
+        normalize_stereo=camera_config.normalize_stereo,
         color_types=[],
         show_rgb_preview=False,
         show_stereo_preview=False,
         fps=0,
     )
-
-
-@contextmanager
-def _pycuda_context(device: int):
-    """Use the CUDA primary context so PyCUDA, Torch, and CUDA IPC agree."""
-
-    import pycuda.driver as cuda
-
-    cuda.init()
-    ctx = cuda.Device(int(device)).retain_primary_context()
-    ctx.push()
-    try:
-        yield
-    finally:
-        ctx.pop()
-        ctx.detach()
-
-
-def _publisher_context(config: dict[str, Any]):
-    if not bool(config.get("pub_enabled", True)):
-        return nullcontext()
-    return _pycuda_context(int(config.get("pub_device", 0)))
-
-
-def _mat_device(device: int) -> Any:
-    from resultkit.mat import MatDevice
-
-    return getattr(MatDevice, f"CUDA{int(device)}", MatDevice.CUDA0)
-
-
-def _stream_size_from_config(config: dict[str, Any], stream: str) -> tuple[int, int]:
-    if config.get("pub_width") is not None and config.get("pub_height") is not None:
-        return int(config["pub_width"]), int(config["pub_height"])
-    if stream == "rgb":
-        return int(config["rgb_width"]), int(config["rgb_height"])
-    return int(config["stereo_width"]), int(config["stereo_height"])
-
-
-def _stream_is_normalized(config: dict[str, Any], stream: str) -> bool:
-    if stream == "rgb":
-        return bool(config.get("normalize_rgb", True))
-    return bool(config.get("normalize_stereo", True))
-
-
-def _make_cuda_image_endpoint(config: dict[str, Any], *, stream: str, is_pub: bool = True) -> Any:
-    import numpy as np
-    import pycuda.gpuarray as gpuarray
-    from resultkit.MatModel import ColorFormat, ImageShapeType, Model4Mat
-    from resultkit.mat import DataType
-
-    if not hasattr(Model4Mat, "ImageMatCUDAPubSub"):
-        raise RuntimeError("Model4Mat.ImageMatCUDAPubSub is not available in this resultkit build")
-
-    width, height = _stream_size_from_config(config, stream)
-    try:
-        data = gpuarray.empty((height, width, 3), dtype=np.uint8)
-    except Exception as exc:
-        raise RuntimeError(
-            "PyCUDA could not allocate the publisher image buffer. "
-            "A CUDA primary context must be current in the camera worker."
-        ) from exc
-
-    img = Model4Mat.ImageMatCUDAPubSub(
-        color_format=ColorFormat.RGB,
-        shape_type=ImageShapeType.HWC,
-        dtype=DataType.UINT8,
-        device=_mat_device(int(config.get("pub_device", 0))),
-        data=data,
-        num_slots=int(config.get("num_slots", 3)),
-    )
-    img.set_id(str(config.get("image_topic", "ImageMatCUDAPubSub:daiRgb"))).init()
-
-    try:
-        img.is_pub = bool(is_pub)
-    except Exception:
-        pass
-
-    return img
-
-
-def _as_cuda_hwc_rgb8(tensor: Any, *, width: int, height: int, normalized: bool) -> Any:
-    """Normalize a DepthAI Torch image tensor to CUDA HWC/RGB/uint8."""
-
-    import torch
-
-    t = tensor.detach()
-    if not getattr(t, "is_cuda", False):
-        raise RuntimeError("publisher expected a CUDA tensor from DepthAI")
-
-    # Drop a leading batch dimension. The generator commonly returns NCHW/NHWC.
-    if t.ndim == 4:
-        if int(t.shape[0]) < 1:
-            raise RuntimeError(f"empty batch tensor cannot be published: {tuple(t.shape)}")
-        t = t[0]
-
-    if t.ndim == 2:
-        # Mono/depth-like stream -> RGB by replication.
-        t = t[:height, :width].unsqueeze(-1).expand(-1, -1, 3)
-    elif t.ndim == 3 and int(t.shape[0]) in (1, 3, 4) and int(t.shape[-1]) not in (1, 3, 4):
-        # CHW/RGBP/RGBA planar -> HWC/RGB.
-        t = t[:, :height, :width]
-        if int(t.shape[0]) == 1:
-            t = t.expand(3, -1, -1)
-        t = t[:3].permute(1, 2, 0)
-    elif t.ndim == 3 and int(t.shape[-1]) in (1, 3, 4):
-        # HWC/RGB/RGBA -> HWC/RGB.
-        t = t[:height, :width, :]
-        if int(t.shape[-1]) == 1:
-            t = t.expand(-1, -1, 3)
-        t = t[:, :, :3]
-    else:
-        raise RuntimeError(f"unsupported publisher tensor shape: {tuple(t.shape)}")
-
-    if tuple(int(v) for v in t.shape) != (height, width, 3):
-        raise RuntimeError(
-            f"publisher tensor shape {tuple(t.shape)} does not match endpoint "
-            f"shape {(height, width, 3)}. Check rgb/stereo dimensions or pub_width/pub_height."
-        )
-
-    if t.dtype != torch.uint8:
-        if getattr(t.dtype, "is_floating_point", False) or t.dtype.is_floating_point:
-            if normalized:
-                t = t.clamp(0.0, 1.0) * 255.0
-            else:
-                t = t.clamp(0.0, 255.0)
-        else:
-            t = t.clamp(0, 255)
-        t = t.to(dtype=torch.uint8)
-
-    return t.contiguous()
-
-
-def _publish_latest_frame(
-    image_pub: Any,
-    config: dict[str, Any],
-    tensors: dict[StreamName, Any],
-    *,
-    frame_id: int,
-) -> int:
-    stream = str(config.get("pub_stream", "rgb"))
-    if stream not in tensors:
-        raise RuntimeError(f"Unsupported pub_stream: {stream!r}")
-
-    width, height = _stream_size_from_config(config, stream)
-    image_pub.pub(
-        data=_as_cuda_hwc_rgb8(
-            tensors[stream],  # type: ignore[index]
-            width=width,
-            height=height,
-            normalized=_stream_is_normalized(config, stream),
-        )
-    )
-    return frame_id
-
-
-def _close_quietly(obj: Any) -> None:
-    try:
-        if obj is not None:
-            obj.close()
-    except Exception:
-        pass
 
 
 def _emit_worker_status(status_queue: Any, state: str, **fields: Any) -> None:
@@ -491,9 +260,6 @@ def _emit_frame_status(
     frame_id: int,
     frame_timestamp_s: float,
     restart_count: int,
-    publishing: bool = False,
-    last_published_frame_id: int | None = None,
-    last_publish_error: str | None = None,
 ) -> None:
     shapes = {f"{stream}_shape": _shape(tensor) for stream, tensor in tensors.items()}
     _emit_worker_status(
@@ -502,88 +268,202 @@ def _emit_frame_status(
         restart_count=restart_count,
         last_frame_id=frame_id,
         last_frame_timestamp_s=frame_timestamp_s,
-        publishing=publishing,
-        last_published_frame_id=last_published_frame_id,
-        last_publish_error=last_publish_error,
         **shapes,
     )
 
 
-def _handle_capture_requests(
-    capture_request_queue: Any,
-    capture_result_queue: Any,
-    latest_tensors: dict[StreamName, Any] | None,
-    *,
-    frame_id: int,
-    frame_timestamp_s: float,
-) -> None:
-    for req in _drain_capture_requests(capture_request_queue):
-        request_id = int(req.get("request_id", -1))
-        stream = str(req.get("stream", "rgb"))
-        quality = int(req.get("jpeg_quality", 85))
-
-        try:
-            if latest_tensors is None:
-                raise RuntimeError("No latest frame is available yet")
-            if stream not in latest_tensors:
-                raise RuntimeError(f"Unsupported stream: {stream!r}")
-
-            tensor = latest_tensors[stream]  # type: ignore[index]
-            _put_drop_oldest(
-                capture_result_queue,
-                {
-                    "ok": True,
-                    "request_id": request_id,
-                    "frame_id": frame_id,
-                    "frame_timestamp_s": frame_timestamp_s,
-                    "stream": stream,
-                    "tensor_shape": _shape(tensor),
-                    "jpeg_base64": _tensor_to_jpeg_base64_in_worker(
-                        tensor,
-                        quality,
-                        rgb_to_bgr=(stream == "rgb"),
-                    ),
-                },
-            )
-        except Exception:
-            _put_drop_oldest(
-                capture_result_queue,
-                {"ok": False, "request_id": request_id, "error": traceback.format_exc()},
-            )
-
-
-def _show_preview(config: dict[str, Any], tensors: dict[StreamName, Any], stop_event: Any) -> None:
-    import cv2
-
-    rgb_step = int(config["preview_rgb_downsample"])
-    stereo_step = int(config["preview_stereo_downsample"])
-    cv2.imshow("rpc_camera_rgb", _to_cv_array(tensors["rgb"][0], downsample=rgb_step, rgb_to_bgr=True))
-    cv2.imshow("rpc_camera_left", _to_cv_array(tensors["left"][0], downsample=stereo_step, rgb_to_bgr=False))
-    cv2.imshow("rpc_camera_right", _to_cv_array(tensors["right"][0], downsample=stereo_step, rgb_to_bgr=False))
-
-    if cv2.waitKey(1) & 0xFF in (ord("q"), 27):
-        stop_event.set()
-
-
-def _release_worker_resources(gen: Any, image_pub: Any = None) -> str | None:
+def _release_worker_resources(gen: Any) -> str | None:
     error = None
-    try:
-        _close_quietly(image_pub)
-    except Exception:
-        error = traceback.format_exc()
     try:
         if gen is not None:
             gen.release()
     except Exception:
         error = traceback.format_exc()
-    try:
-        import cv2
-        cv2.destroyWindow("rpc_camera_rgb")
-        cv2.destroyWindow("rpc_camera_left")
-        cv2.destroyWindow("rpc_camera_right")
-    except Exception:
-        pass
     return error
+
+
+
+@dataclass
+class FrameStatusProcess(WorkerPipelineProcess):
+    """Periodically report the latest frame metadata to the parent process."""
+
+    emit_interval_s: float = 1.0
+    _last_emit_monotonic_s: float = field(default=0.0, init=False, repr=False)
+
+    def on_start(self, context: WorkerContext) -> None:
+        self._last_emit_monotonic_s = 0.0
+
+    def on_frame(self, context: WorkerContext, frame: WorkerFrame) -> None:
+        now = time.monotonic()
+        if now - self._last_emit_monotonic_s < self.emit_interval_s:
+            return
+
+        self._last_emit_monotonic_s = now
+        _emit_frame_status(
+            context.status_queue,
+            frame.tensors,
+            frame_id=frame.frame_id,
+            frame_timestamp_s=frame.timestamp_s,
+            restart_count=context.restart_count,
+        )
+
+
+class CaptureRequestProcess(CaptureRequestProcess):
+    pass
+
+class PreviewProcess(PreviewProcess):
+    pass
+
+
+def build_worker_pipeline(config: dict[str, Any]) -> list[WorkerPipelineProcess]:
+    """Create the ordered worker-side processing pipeline.
+
+    The order matters: status is cheap, capture requests should see the newest
+    tensors, and preview is last because GUI calls are optional side effects.
+    """
+
+    processes: list[WorkerPipelineProcess] = [
+        FrameStatusProcess(),
+        CaptureRequestProcess(),
+    ]
+
+    if bool(config.get("preview", False)):        
+        processes: list[WorkerPipelineProcess] = [
+            FrameStatusProcess(),
+            CaptureRequestProcess(),
+            PreviewProcess(),
+        ]
+
+    return processes
+
+
+@dataclass
+class CameraWorker:
+    """Child process owner for DepthAI and all frame pipeline processing."""
+
+    config: dict[str, Any]
+    status_queue: Any
+    capture_request_queue: Any
+    capture_result_queue: Any
+    stop_event: Any
+    frame_id: int = 0
+    restart_count: int = 0
+
+    def run(self) -> None:
+        print("DepthAI RPC camera worker starting.", flush=True)
+        retry_forever = bool(self.config.get("retry_forever", True))
+        retry_delay_s = float(self.config.get("retry_delay_s", 1.0))
+
+        while not self.stop_event.is_set():
+            self.restart_count += 1
+            latest_timestamp_s = 0.0
+            context = WorkerContext(
+                config=self.config,
+                status_queue=self.status_queue,
+                capture_request_queue=self.capture_request_queue,
+                capture_result_queue=self.capture_result_queue,
+                stop_event=self.stop_event,
+                restart_count=self.restart_count,
+            )
+
+            _emit_worker_status(
+                self.status_queue,
+                "starting",
+                restart_count=self.restart_count,
+                last_frame_id=self.frame_id or None,
+            )
+
+            try:
+                latest_timestamp_s = self._run_session(context)
+            except KeyboardInterrupt:
+                self.stop_event.set()
+            except Exception:
+                err = traceback.format_exc()
+                print(err, flush=True)
+                _emit_worker_status(
+                    self.status_queue,
+                    "error",
+                    error=err,
+                    restart_count=self.restart_count,
+                    last_frame_id=self.frame_id or None,
+                )
+
+            if self.stop_event.is_set() or not retry_forever:
+                break
+
+            _emit_worker_status(
+                self.status_queue,
+                "retry_wait",
+                restart_count=self.restart_count,
+                last_frame_id=self.frame_id or None,
+                last_frame_timestamp_s=latest_timestamp_s or None,
+            )
+            _sleep_until_stopped(self.stop_event, retry_delay_s)
+
+        _emit_worker_status(
+            self.status_queue,
+            "stopped",
+            restart_count=self.restart_count,
+            last_frame_id=self.frame_id or None,
+        )
+        print("DepthAI RPC camera worker stopped.", flush=True)
+
+    def _run_session(self, context: WorkerContext) -> float:
+        gen = None
+        latest_timestamp_s = 0.0
+        pipeline = build_worker_pipeline(self.config)
+
+        try:
+            for process in pipeline:
+                process.on_start(context)
+
+            gen = _build_dai_gen_from_config(self.config)
+            _emit_worker_status(
+                self.status_queue,
+                "running",
+                restart_count=self.restart_count,
+                last_frame_id=self.frame_id or None,
+            )
+
+            for mats in gen:
+                if self.stop_event.is_set():
+                    break
+
+                self.frame_id += 1
+                latest_timestamp_s = time.time()
+                frame = WorkerFrame(
+                    frame_id=self.frame_id,
+                    timestamp_s=latest_timestamp_s,
+                    tensors=_unpack_frame(gen, mats),
+                )
+
+                for process in pipeline:
+                    process.on_frame(context, frame)
+
+            if not self.stop_event.is_set():
+                _emit_worker_status(
+                    self.status_queue,
+                    "ended",
+                    error="DepthAI generator ended; restarting camera session.",
+                    restart_count=self.restart_count,
+                    last_frame_id=self.frame_id or None,
+                    last_frame_timestamp_s=latest_timestamp_s or None,
+                )
+        finally:
+            for process in reversed(pipeline):
+                process.on_stop(context)
+            err = _release_worker_resources(gen)
+            if err:
+                print(err, flush=True)
+                _emit_worker_status(
+                    self.status_queue,
+                    "release_error",
+                    error=err,
+                    restart_count=self.restart_count,
+                    last_frame_id=self.frame_id or None,
+                )
+
+        return latest_timestamp_s
 
 
 def _camera_worker(
@@ -593,173 +473,15 @@ def _camera_worker(
     capture_result_queue: Any,
     stop_event: Any,
 ) -> None:
-    """Child process that owns DepthAI/Torch/CUDA and returns JSON-safe data."""
+    """Child process entry point. Must stay top-level for multiprocessing spawn."""
 
-    print("DepthAI RPC camera worker starting.", flush=True)
-    frame_id = restart_count = 0
-    last_status_emit_s = 0.0
-    retry_forever = bool(config.get("retry_forever", True))
-    retry_delay_s = float(config.get("retry_delay_s", 1.0))
-
-    while not stop_event.is_set():
-        gen = latest_tensors = image_pub = None
-        latest_timestamp_s = 0.0
-        last_published_frame_id = None
-        last_publish_error = None
-        publish_disabled_after_error = False
-        restart_count += 1
-        _emit_worker_status(
-            status_queue,
-            "starting",
-            restart_count=restart_count,
-            last_frame_id=frame_id or None,
-            publishing=False,
-        )
-
-        try:
-            with _publisher_context(config):
-                try:
-                    gen = _build_dai_gen_from_config(config)
-                    pub_stream = str(config.get("pub_stream", "rgb"))
-                    if bool(config.get("pub_enabled", True)):
-                        image_pub = _make_cuda_image_endpoint(config, stream=pub_stream, is_pub=True)
-                        width, height = _stream_size_from_config(config, pub_stream)
-                        print(
-                            f"server_dai: DepthAI {pub_stream!r} -> CUDA pub "
-                            f"{config.get('image_topic')!r} ({width}x{height})",
-                            flush=True,
-                        )
-
-                    _emit_worker_status(
-                        status_queue,
-                        "running",
-                        restart_count=restart_count,
-                        last_frame_id=frame_id or None,
-                        publishing=image_pub is not None,
-                        last_published_frame_id=last_published_frame_id,
-                    )
-
-                    for mats in gen:
-                        if stop_event.is_set():
-                            break
-
-                        frame_id += 1
-                        latest_timestamp_s = time.time()
-                        latest_tensors = _unpack_frame(gen, mats)
-
-                        if image_pub is not None:
-                            try:
-                                last_published_frame_id = _publish_latest_frame(
-                                    image_pub,
-                                    config,
-                                    latest_tensors,
-                                    frame_id=frame_id,
-                                )
-                                last_publish_error = None
-                            except Exception:
-                                last_publish_error = traceback.format_exc()
-                                print(last_publish_error, flush=True)
-                                _emit_worker_status(
-                                    status_queue,
-                                    "publish_error",
-                                    error=last_publish_error,
-                                    restart_count=restart_count,
-                                    last_frame_id=frame_id or None,
-                                    last_frame_timestamp_s=latest_timestamp_s or None,
-                                    publishing=False,
-                                    last_published_frame_id=last_published_frame_id,
-                                    last_publish_error=last_publish_error,
-                                )
-                                if bool(config.get("pub_required", False)):
-                                    raise
-                                _close_quietly(image_pub)
-                                image_pub = None
-                                publish_disabled_after_error = True
-
-                        now = time.monotonic()
-                        if now - last_status_emit_s >= 1.0:
-                            last_status_emit_s = now
-                            _emit_frame_status(
-                                status_queue,
-                                latest_tensors,
-                                frame_id=frame_id,
-                                frame_timestamp_s=latest_timestamp_s,
-                                restart_count=restart_count,
-                                publishing=image_pub is not None and not publish_disabled_after_error,
-                                last_published_frame_id=last_published_frame_id,
-                                last_publish_error=last_publish_error,
-                            )
-
-                        _handle_capture_requests(
-                            capture_request_queue,
-                            capture_result_queue,
-                            latest_tensors,
-                            frame_id=frame_id,
-                            frame_timestamp_s=latest_timestamp_s,
-                        )
-
-                        if config.get("preview", False):
-                            _show_preview(config, latest_tensors, stop_event)
-
-                    if not stop_event.is_set():
-                        _emit_worker_status(
-                            status_queue,
-                            "ended",
-                            error="DepthAI generator ended; restarting camera session.",
-                            restart_count=restart_count,
-                            last_frame_id=frame_id or None,
-                            last_frame_timestamp_s=latest_timestamp_s or None,
-                            publishing=False,
-                            last_published_frame_id=last_published_frame_id,
-                            last_publish_error=last_publish_error,
-                        )
-                finally:
-                    err = _release_worker_resources(gen, image_pub)
-                    if err:
-                        print(err, flush=True)
-                        _emit_worker_status(
-                            status_queue,
-                            "release_error",
-                            error=err,
-                            restart_count=restart_count,
-                            last_frame_id=frame_id or None,
-                            publishing=False,
-                        )
-
-        except KeyboardInterrupt:
-            stop_event.set()
-        except Exception:
-            err = traceback.format_exc()
-            print(err, flush=True)
-            _emit_worker_status(
-                status_queue,
-                "error",
-                error=err,
-                restart_count=restart_count,
-                last_frame_id=frame_id or None,
-                publishing=False,
-                last_published_frame_id=last_published_frame_id,
-                last_publish_error=last_publish_error,
-            )
-
-        if stop_event.is_set() or not retry_forever:
-            break
-
-        _emit_worker_status(
-            status_queue,
-            "retry_wait",
-            restart_count=restart_count,
-            last_frame_id=frame_id or None,
-        )
-        _sleep_until_stopped(stop_event, retry_delay_s)
-
-    _emit_worker_status(
-        status_queue,
-        "stopped",
-        restart_count=restart_count,
-        last_frame_id=frame_id or None,
-    )
-    print("DepthAI RPC camera worker stopped.", flush=True)
+    CameraWorker(
+        config=config,
+        status_queue=status_queue,
+        capture_request_queue=capture_request_queue,
+        capture_result_queue=capture_result_queue,
+        stop_event=stop_event,
+    ).run()
 
 
 # ---------------------------------------------------------------------------
@@ -791,9 +513,6 @@ class CameraController:
     _process_restart_count: int = field(default=0, init=False, repr=False)
     _last_frame_id: int | None = field(default=None, init=False, repr=False)
     _last_frame_timestamp_s: float | None = field(default=None, init=False, repr=False)
-    _publishing: bool = field(default=False, init=False, repr=False)
-    _last_published_frame_id: int | None = field(default=None, init=False, repr=False)
-    _last_publish_error: str | None = field(default=None, init=False, repr=False)
     _request_id: int = field(default=0, init=False, repr=False)
 
     _watchdog_thread: threading.Thread | None = field(default=None, init=False, repr=False)
@@ -803,11 +522,11 @@ class CameraController:
     def openapi_examples():
         return {
             **openapi_doc("camera_status", id=1, params={}),
-            **openapi_doc("camera_start",  id=2, params=CameraConfig().model_dump()),
-            **openapi_doc("camera_stop",   id=3, params={}),
-            **openapi_doc("camera_capture",id=4, params=CaptureParams().model_dump()),
+            **openapi_doc("camera_start", id=2, params=CameraConfig().model_dump()),
+            **openapi_doc("camera_stop", id=3, params={}),
+            **openapi_doc("camera_capture", id=4, params=CaptureParams().model_dump()),
         }
-    
+
     def _is_worker_alive(self) -> bool:
         return bool(self._process is not None and self._process.is_alive())
 
@@ -822,9 +541,6 @@ class CameraController:
         self._last_worker_state = None
         self._last_frame_id = None
         self._last_frame_timestamp_s = None
-        self._publishing = False
-        self._last_published_frame_id = None
-        self._last_publish_error = None
         self._restart_count = 0
         self._process_restart_count = 0
         self._request_id = 0
@@ -839,14 +555,6 @@ class CameraController:
             self._last_frame_timestamp_s,
             msg.get("last_frame_timestamp_s"),
         )
-        if "publishing" in msg:
-            self._publishing = bool(msg.get("publishing"))
-        self._last_published_frame_id = _int_or_keep(
-            self._last_published_frame_id,
-            msg.get("last_published_frame_id"),
-        )
-        if msg.get("last_publish_error"):
-            self._last_publish_error = str(msg["last_publish_error"])
         if msg.get("error"):
             self._last_error = str(msg["error"])
 
@@ -1009,11 +717,6 @@ class CameraController:
             "restart_count": self._restart_count,
             "process_restart_count": self._process_restart_count,
             "worker_exitcode": self._worker_exitcode(),
-            "publishing": bool(self._publishing),
-            "image_topic": self.config.image_topic,
-            "pub_stream": self.config.pub_stream,
-            "last_published_frame_id": self._last_published_frame_id,
-            "last_publish_error": self._last_publish_error,
         })
 
     def open(self, params: CameraConfig) -> CameraStatusResult:
@@ -1168,9 +871,9 @@ def run_server(service_name: str = "serverCam", controller_name: str = "camera")
     from iox2_jsonrpc.iceoryx import Iox2JsonRpcServer
 
     mp.freeze_support()
-    Iox2JsonRpcServer(CameraController(service_name=service_name,
-                                       controller_name=controller_name)).run_forever()
-
+    Iox2JsonRpcServer(
+        CameraController(service_name=service_name, controller_name=controller_name)
+    ).run_forever()
 
 
 if __name__ == "__main__":
