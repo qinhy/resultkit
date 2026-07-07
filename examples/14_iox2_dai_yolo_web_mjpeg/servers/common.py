@@ -14,7 +14,11 @@ if EXAMPLE_DIR not in sys.path:
     sys.path.append(EXAMPLE_DIR)
 
 from iox2_jsonrpc import EmptyParams, RpcModel
-from pipeline import PreviewProcess, CaptureRequestProcess, AsyncWorkerPipelineProcess, WorkerFrame, WorkerContext, WorkerPipelineProcess
+from pipeline import (PreviewProcess, YoloPreviewProcess, AsyncPreviewProcess,
+                      AsyncYoloPreviewProcess, CaptureRequestProcess,
+                      UltralyticsYoloProcess, AsyncYoloProcess,
+                      AsyncWorkerPipelineProcess, WorkerFrame, WorkerContext,
+                      WorkerPipelineProcess)
 class StoppableLoop:
     """Small base class for loops that can run blocking or in a worker thread."""
 
@@ -130,6 +134,7 @@ def openapi_doc(key="yolo_status", id=1, params={}):
             }}
 
 
-__all__ = ["EmptyParams", "RpcModel", "PreviewProcess",
-           "CaptureRequestProcess", "AsyncWorkerPipelineProcess",
+__all__ = ["EmptyParams", "RpcModel", "PreviewProcess", "YoloPreviewProcess",
+           "AsyncPreviewProcess", "AsyncYoloPreviewProcess", "CaptureRequestProcess",
+           "UltralyticsYoloProcess", "AsyncYoloProcess", "AsyncWorkerPipelineProcess",
            "WorkerFrame", "WorkerContext", "WorkerPipelineProcess"]

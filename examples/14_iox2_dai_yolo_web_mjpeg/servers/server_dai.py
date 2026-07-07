@@ -15,7 +15,8 @@ from pydantic import Field
 import cv2
 
 from common import (EmptyParams, RpcModel, openapi_doc,
-                    PreviewProcess, CaptureRequestProcess, AsyncWorkerPipelineProcess,
+                    AsyncPreviewProcess, AsyncYoloPreviewProcess,
+                    AsyncYoloProcess, CaptureRequestProcess,
                     WorkerFrame, WorkerContext, WorkerPipelineProcess)
 
 from resultkit.dai.rgb_stereo_generator import DepthAIPoeRGBStereoTorchGenerator
@@ -88,6 +89,51 @@ class CameraConfig(CameraBaseModel):
     preview_rgb_downsample: int = 10
     preview_stereo_downsample: int = 4
 
+    # Async zero-copy CUDA Ultralytics YOLO inference. The model is created
+    # inside the CameraWorker child process and inside the async YOLO thread.
+    # Frames stay as CUDA tensors; only post-NMS detection summaries are copied
+    # back to CPU for JSON status output.
+    yolo_enabled: bool = False
+    yolo_model_path: str = "yolov8n.pt"
+    yolo_stream: StreamName = "rgb"
+    yolo_imgsz: int = 640
+    yolo_conf: float = 0.25
+    yolo_iou: float = 0.45
+    yolo_max_det: int = 100
+    yolo_max_results: int = 20
+    yolo_device: str = "0"
+    yolo_half: bool = True
+    yolo_verbose: bool = False  # kept for config compatibility; raw-model path does not use it
+    # None means: follow normalize_rgb for rgb, normalize_stereo otherwise.
+    # Set False only when your frame tensors are float 0..255 or uint8-like.
+    yolo_input_normalized: bool | None = None
+    yolo_letterbox: bool = True
+    yolo_pad_value: float = 114.0 / 255.0
+    # GPU slicing before resize/letterbox. Keeps CUDA-only path, useful for quick load tests.
+    yolo_downsample: int = 1
+    yolo_frame_interval: int = 1
+    yolo_queue_max_size: int = 1
+    yolo_join_timeout_s: float = 2.0
+    yolo_empty_cache_on_stop: bool = False
+
+    # v4 normal preview overlay: preview thread draws latest YOLO metadata.
+    # preview_yolo: bool = True
+    # preview_yolo_max_age_s: float = 1.0
+    # preview_yolo_max_frame_lag: int = 30
+    # preview_yolo_thickness: int = 2
+    # preview_yolo_font_scale: float = 0.5
+
+    # v5 debug-only paired overlay: UltralyticsYoloProcess draws directly from
+    # the exact frame/result pair that produced detections. This is useful for
+    # checking preprocessing/box scaling, but it adds a CPU frame copy and GUI
+    # call in the YOLO async thread.
+    yolo_debug_preview: bool = False
+    yolo_debug_window_name: str = "yolo_debug_rgb"
+    yolo_debug_downsample: int = 1
+    yolo_debug_wait_key_ms: int = 1
+    yolo_debug_font_scale: float = 0.6
+    yolo_debug_text_thickness: int = 2
+
     queue_max_size: int = 8
     capture_wait_s: float = 2.0
     close_join_timeout_s: float = 5.0
@@ -130,6 +176,16 @@ class CameraStatusResult(CameraBaseModel):
     restart_count: int = 0
     process_restart_count: int = 0
     worker_exitcode: int | None = None
+
+    yolo_enabled: bool = False
+    yolo_model_path: str | None = None
+    yolo_stream: str | None = None
+    yolo_frame_id: int | None = None
+    yolo_frame_age_s: float | None = None
+    yolo_latency_ms: float | None = None
+    yolo_num_detections: int = 0
+    yolo_detections: list[dict[str, Any]] = []
+    yolo_zero_copy_cuda: bool = True
 
 
 class CaptureResult(CameraStatusResult):
@@ -308,18 +364,12 @@ class FrameStatusProcess(WorkerPipelineProcess):
         )
 
 
-class CaptureRequestProcess(CaptureRequestProcess):
-    pass
-
-class PreviewProcess(PreviewProcess):
-    pass
-
-
 def build_worker_pipeline(config: dict[str, Any]) -> list[WorkerPipelineProcess]:
     """Create the ordered worker-side processing pipeline.
 
-    The order matters: status is cheap, capture requests should see the newest
-    tensors, and preview is last because GUI calls are optional side effects.
+    Status and capture request handling stay inline. Preview and YOLO are async
+    latest-frame stages so OpenCV display or model inference cannot block the
+    camera acquisition loop.
     """
 
     processes: list[WorkerPipelineProcess] = [
@@ -327,11 +377,18 @@ def build_worker_pipeline(config: dict[str, Any]) -> list[WorkerPipelineProcess]
         CaptureRequestProcess(),
     ]
 
-    if bool(config.get("preview", False)):
+    if bool(config.get("yolo_enabled", False)):
         processes.append(
-            AsyncWorkerPipelineProcess(
-                PreviewProcess(),
-                name="preview",
+            AsyncYoloProcess(
+                queue_max_size=int(config.get("yolo_queue_max_size", 1)),
+                join_timeout_s=float(config.get("yolo_join_timeout_s", 2.0)),
+            )
+        )
+
+    if bool(config.get("preview", False)):
+        preview_cls = AsyncYoloPreviewProcess if bool(config.get("preview_yolo", True)) else AsyncPreviewProcess
+        processes.append(
+            preview_cls(
                 queue_max_size=1,
                 join_timeout_s=2.0,
             )
@@ -518,6 +575,14 @@ class CameraController:
     _last_frame_timestamp_s: float | None = field(default=None, init=False, repr=False)
     _request_id: int = field(default=0, init=False, repr=False)
 
+    _last_yolo_model_path: str | None = field(default=None, init=False, repr=False)
+    _last_yolo_stream: str | None = field(default=None, init=False, repr=False)
+    _last_yolo_frame_id: int | None = field(default=None, init=False, repr=False)
+    _last_yolo_frame_timestamp_s: float | None = field(default=None, init=False, repr=False)
+    _last_yolo_latency_ms: float | None = field(default=None, init=False, repr=False)
+    _last_yolo_num_detections: int = field(default=0, init=False, repr=False)
+    _last_yolo_detections: list[dict[str, Any]] = field(default_factory=list, init=False, repr=False)
+
     _watchdog_thread: threading.Thread | None = field(default=None, init=False, repr=False)
     _watchdog_stop: threading.Event = field(default_factory=threading.Event, init=False, repr=False)
 
@@ -547,6 +612,13 @@ class CameraController:
         self._restart_count = 0
         self._process_restart_count = 0
         self._request_id = 0
+        self._last_yolo_model_path = None
+        self._last_yolo_stream = None
+        self._last_yolo_frame_id = None
+        self._last_yolo_frame_timestamp_s = None
+        self._last_yolo_latency_ms = None
+        self._last_yolo_num_detections = 0
+        self._last_yolo_detections = []
 
     def _apply_worker_status_unlocked(self, msg: dict[str, Any]) -> None:
         state = msg.get("state")
@@ -560,6 +632,29 @@ class CameraController:
         )
         if msg.get("error"):
             self._last_error = str(msg["error"])
+
+        if any(str(key).startswith("yolo_") for key in msg):
+            self._last_yolo_model_path = msg.get("yolo_model_path", self._last_yolo_model_path)
+            self._last_yolo_stream = msg.get("yolo_stream", self._last_yolo_stream)
+            self._last_yolo_frame_id = _int_or_keep(
+                self._last_yolo_frame_id,
+                msg.get("yolo_frame_id"),
+            )
+            self._last_yolo_frame_timestamp_s = _float_or_keep(
+                self._last_yolo_frame_timestamp_s,
+                msg.get("yolo_frame_timestamp_s"),
+            )
+            self._last_yolo_latency_ms = _float_or_keep(
+                self._last_yolo_latency_ms,
+                msg.get("yolo_latency_ms"),
+            )
+            self._last_yolo_num_detections = _int_or_keep(
+                self._last_yolo_num_detections,
+                msg.get("yolo_num_detections"),
+            ) or 0
+            detections = msg.get("yolo_detections")
+            if isinstance(detections, list):
+                self._last_yolo_detections = [d for d in detections if isinstance(d, dict)]
 
     def _drain_status_queue(self) -> None:
         if self._status_queue is None:
@@ -701,6 +796,10 @@ class CameraController:
         if self._last_frame_timestamp_s is not None:
             age_s = max(0.0, time.time() - self._last_frame_timestamp_s)
 
+        yolo_age_s = None
+        if self._last_yolo_frame_timestamp_s is not None:
+            yolo_age_s = max(0.0, time.time() - self._last_yolo_frame_timestamp_s)
+
         return CameraStatusResult(**{
             "opened": bool(self.opened),
             "captures": self.captures,
@@ -720,6 +819,15 @@ class CameraController:
             "restart_count": self._restart_count,
             "process_restart_count": self._process_restart_count,
             "worker_exitcode": self._worker_exitcode(),
+            "yolo_enabled": bool(self.config.yolo_enabled),
+            "yolo_model_path": self._last_yolo_model_path or self.config.yolo_model_path,
+            "yolo_stream": self._last_yolo_stream or self.config.yolo_stream,
+            "yolo_frame_id": self._last_yolo_frame_id,
+            "yolo_frame_age_s": yolo_age_s,
+            "yolo_latency_ms": self._last_yolo_latency_ms,
+            "yolo_num_detections": self._last_yolo_num_detections,
+            "yolo_detections": self._last_yolo_detections,
+            "yolo_zero_copy_cuda": True,
         })
 
     def open(self, params: CameraConfig) -> CameraStatusResult:
