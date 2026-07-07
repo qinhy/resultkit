@@ -15,7 +15,7 @@ from pydantic import Field
 import cv2
 
 from common import (EmptyParams, RpcModel, openapi_doc,
-                    PreviewProcess, CaptureRequestProcess, 
+                    PreviewProcess, CaptureRequestProcess, AsyncWorkerPipelineProcess,
                     WorkerFrame, WorkerContext, WorkerPipelineProcess)
 
 from resultkit.dai.rgb_stereo_generator import DepthAIPoeRGBStereoTorchGenerator
@@ -327,12 +327,15 @@ def build_worker_pipeline(config: dict[str, Any]) -> list[WorkerPipelineProcess]
         CaptureRequestProcess(),
     ]
 
-    if bool(config.get("preview", False)):        
-        processes: list[WorkerPipelineProcess] = [
-            FrameStatusProcess(),
-            CaptureRequestProcess(),
-            PreviewProcess(),
-        ]
+    if bool(config.get("preview", False)):
+        processes.append(
+            AsyncWorkerPipelineProcess(
+                PreviewProcess(),
+                name="preview",
+                queue_max_size=1,
+                join_timeout_s=2.0,
+            )
+        )
 
     return processes
 
@@ -352,7 +355,8 @@ class CameraWorker:
     def run(self) -> None:
         print("DepthAI RPC camera worker starting.", flush=True)
         retry_forever = bool(self.config.get("retry_forever", True))
-        retry_delay_s = float(self.config.get("retry_delay_s", 1.0))
+        retry_delay_s = float(self.config.get("retry_delay_s", 1.0))        
+        pipeline = build_worker_pipeline(self.config)
 
         while not self.stop_event.is_set():
             self.restart_count += 1
@@ -374,7 +378,7 @@ class CameraWorker:
             )
 
             try:
-                latest_timestamp_s = self._run_session(context)
+                latest_timestamp_s = self._run_session(context, pipeline)
             except KeyboardInterrupt:
                 self.stop_event.set()
             except Exception:
@@ -408,10 +412,9 @@ class CameraWorker:
         )
         print("DepthAI RPC camera worker stopped.", flush=True)
 
-    def _run_session(self, context: WorkerContext) -> float:
+    def _run_session(self, context: WorkerContext, pipeline: list[WorkerPipelineProcess]) -> float:
         gen = None
         latest_timestamp_s = 0.0
-        pipeline = build_worker_pipeline(self.config)
 
         try:
             for process in pipeline:

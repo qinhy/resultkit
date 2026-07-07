@@ -149,6 +149,143 @@ class WorkerPipelineProcess:
         pass
 
 
+class AsyncWorkerPipelineProcess(WorkerPipelineProcess):
+    """Run another WorkerPipelineProcess in a thread inside the worker process.
+
+    This keeps CUDA/Torch tensors in the same process, avoiding CUDA
+    multiprocessing/IPC issues on Jetson, while preventing slow stages such as
+    preview or inference from blocking the camera acquisition loop.
+
+    The default queue size of 1 implements latest-frame behavior: if the inner
+    process is still busy, the stale queued frame is dropped and replaced by the
+    newest frame.
+    """
+
+    def __init__(
+        self,
+        inner: WorkerPipelineProcess,
+        *,
+        name: str | None = None,
+        queue_max_size: int = 1,
+        join_timeout_s: float = 2.0,
+    ) -> None:
+        self.inner = inner
+        self.name = name or inner.__class__.__name__
+        self.queue_max_size = max(1, int(queue_max_size))
+        self.join_timeout_s = float(join_timeout_s)
+        self._queue: py_queue.Queue[Any] | None = None
+        self._thread: threading.Thread | None = None
+        self._context: WorkerContext | None = None
+        self._sentinel = object()
+
+    def on_start(self, context: WorkerContext) -> None:
+        self._context = context
+        self._queue = py_queue.Queue(maxsize=self.queue_max_size)
+
+        # Initialize heavy resources in the async thread, not in the camera loop.
+        self._thread = threading.Thread(
+            target=self._run,
+            name=f"worker-pipeline-{self.name}",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def on_frame(self, context: WorkerContext, frame: WorkerFrame) -> None:
+        q = self._queue
+        if q is None:
+            return
+
+        try:
+            q.put_nowait(frame)
+            return
+        except py_queue.Full:
+            pass
+
+        # Latest-frame policy: discard one stale frame and enqueue the newest.
+        try:
+            q.get_nowait()
+        except (py_queue.Empty, Exception):
+            pass
+
+        try:
+            q.put_nowait(frame)
+        except py_queue.Full:
+            pass
+
+    def on_stop(self, context: WorkerContext) -> None:
+        q = self._queue
+        if q is not None:
+            try:
+                q.put_nowait(self._sentinel)
+            except py_queue.Full:
+                try:
+                    q.get_nowait()
+                except Exception:
+                    pass
+                try:
+                    q.put_nowait(self._sentinel)
+                except Exception:
+                    pass
+
+        thread = self._thread
+        if thread is not None and thread.is_alive() and thread is not threading.current_thread():
+            thread.join(timeout=self.join_timeout_s)
+
+    def _run(self) -> None:
+        context = self._context
+        q = self._queue
+        if context is None or q is None:
+            return
+
+        try:
+            self.inner.on_start(context)
+
+            while not context.stop_event.is_set():
+                try:
+                    item = q.get(timeout=0.1)
+                except py_queue.Empty:
+                    continue
+
+                if item is self._sentinel:
+                    break
+
+                try:
+                    self.inner.on_frame(context, item)
+                except Exception:
+                    _put_drop_oldest(
+                        context.status_queue,
+                        {
+                            "state": "pipeline_error",
+                            "pipeline": self.name,
+                            "error": traceback.format_exc(),
+                            "timestamp_s": time.time(),
+                        },
+                    )
+        except Exception:
+            _put_drop_oldest(
+                context.status_queue,
+                {
+                    "state": "pipeline_error",
+                    "pipeline": self.name,
+                    "error": traceback.format_exc(),
+                    "timestamp_s": time.time(),
+                },
+            )
+        finally:
+            try:
+                self.inner.on_stop(context)
+            except Exception:
+                _put_drop_oldest(
+                    context.status_queue,
+                    {
+                        "state": "pipeline_stop_error",
+                        "pipeline": self.name,
+                        "error": traceback.format_exc(),
+                        "timestamp_s": time.time(),
+                    },
+                )
+
+
 class CaptureRequestProcess(WorkerPipelineProcess):
     """Encode requested streams from the latest frame and return JPEG text."""
 
