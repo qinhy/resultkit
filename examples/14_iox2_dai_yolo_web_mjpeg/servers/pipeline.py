@@ -50,11 +50,19 @@ def _shape(x: Any) -> tuple[int, ...]:
 
 
 def _to_cv_array(mat: Any, *, downsample: int = 1, rgb_to_bgr: bool = True) -> Any:
-    """Convert a Torch tensor image to a CPU OpenCV array inside the worker."""
-    
+    """Convert a Torch tensor image to a CPU OpenCV array inside the worker.
+
+    This generic converter keeps the old normalization auto-detection behavior
+    for non-preview callers such as JPEG capture. Do not use it in the live
+    preview hot path because ``float(x.max())`` synchronizes CUDA tensors.
+    """
+
     x = mat.detach()
     if x.ndim == 4 and x.shape[0] == 1:
         x = x[0]
+    if x.ndim == 3 and x.shape[0] == 2 and x.shape[-1] not in (1, 3, 4):
+        # Stereo tensor [2, H, W] -> side-by-side grayscale preview/capture [H, 2W].
+        x = torch.cat((x[0], x[1]), dim=1)
     if x.ndim == 3 and x.shape[0] in (1, 3, 4) and x.shape[-1] not in (1, 3, 4):
         x = x.permute(1, 2, 0)
 
@@ -65,6 +73,49 @@ def _to_cv_array(mat: Any, *, downsample: int = 1, rgb_to_bgr: bool = True) -> A
     if x.dtype.is_floating_point:
         max_value = float(x.max()) if x.numel() else 1.0
         x = x * 255.0 if max_value <= 1.5 else x
+        x = x.clamp(0, 255)
+    x = x.to(dtype=torch.uint8)
+
+    arr = x.cpu().numpy()
+    if arr.ndim == 3 and arr.shape[-1] == 4:
+        arr = arr[:, :, :3]
+    if rgb_to_bgr and arr.ndim == 3 and arr.shape[-1] == 3:
+        arr = arr[:, :, ::-1].copy()
+    if arr.ndim == 3 and arr.shape[-1] == 1:
+        arr = arr[:, :, 0]
+    return arr
+
+
+def _to_cv_array_preview(
+    mat: Any,
+    *,
+    downsample: int = 1,
+    rgb_to_bgr: bool = True,
+    input_normalized: bool = True,
+) -> Any:
+    """Convert a Torch tensor image for live preview without CUDA max() sync.
+
+    Preview knows from config whether decoder tensors are normalized. Avoiding
+    data-dependent auto-detection removes an extra CUDA synchronization point
+    when YOLO is busy. A CUDA -> CPU copy is still required for OpenCV display.
+    """
+
+    x = mat.detach()
+    if x.ndim == 4 and x.shape[0] == 1:
+        x = x[0]
+    if x.ndim == 3 and x.shape[0] == 2 and x.shape[-1] not in (1, 3, 4):
+        # Stereo tensor [2, H, W] -> side-by-side grayscale preview/capture [H, 2W].
+        x = torch.cat((x[0], x[1]), dim=1)
+    if x.ndim == 3 and x.shape[0] in (1, 3, 4) and x.shape[-1] not in (1, 3, 4):
+        x = x.permute(1, 2, 0)
+
+    step = max(1, int(downsample))
+    if step > 1:
+        x = x[::step, ::step]
+
+    if x.dtype.is_floating_point:
+        if input_normalized:
+            x = x * 255.0
         x = x.clamp(0, 255)
     x = x.to(dtype=torch.uint8)
 
@@ -364,17 +415,6 @@ def _set_latest_yolo_result(context: Any, result: dict[str, Any]) -> None:
             context.shared_state["yolo_latest"] = result
     except Exception:
         pass
-
-
-def _get_latest_yolo_result(context: Any) -> dict[str, Any] | None:
-    """Read the newest YOLO detection metadata from this worker process."""
-
-    try:
-        with context.shared_lock:
-            result = context.shared_state.get("yolo_latest")
-            return dict(result) if isinstance(result, dict) else None
-    except Exception:
-        return None
 
 
 def _draw_yolo_detections_on_bgr(image: Any, result: dict[str, Any], *, config: dict[str, Any]) -> None:
@@ -801,7 +841,7 @@ class UltralyticsYoloProcess(WorkerPipelineProcess):
         with torch.inference_mode():
             with torch.cuda.stream(cuda_stream):
                 x, orig_hw = _as_bchw_cuda_tensor(
-                    frame.tensors[stream],
+                    frame.tensors[stream].clone(),
                     device=self.device,
                     half=half,
                     input_normalized=input_normalized,
@@ -970,7 +1010,13 @@ class CaptureRequestProcess(WorkerPipelineProcess):
 
 
 class PreviewProcess(WorkerPipelineProcess):
-    """Optional local OpenCV preview windows for RGB/left/right streams."""
+    """Optional local OpenCV preview windows for RGB/left/right streams.
+
+    This is the only pipeline stage that should own OpenCV HighGUI windows.
+    YOLO publishes small detection metadata to ``context.shared_state``; this
+    preview stage can optionally overlay that metadata without making the YOLO
+    thread call ``cv2.imshow`` / ``cv2.waitKey``.
+    """
 
     window_names: tuple[str, str, str] = (
         "camera_rgb",
@@ -978,27 +1024,55 @@ class PreviewProcess(WorkerPipelineProcess):
         "camera_right",
     )
 
+    def _latest_yolo_result(self, context: WorkerContext) -> dict[str, Any] | None:
+        try:
+            with context.shared_lock:
+                result = context.shared_state.get("yolo_latest")
+            return result if isinstance(result, dict) else None
+        except Exception:
+            return None
+
     def _make_rgb_preview(self, context: WorkerContext, frame: WorkerFrame) -> Any:
         rgb_step = int(context.config["preview_rgb_downsample"])
-        return _to_cv_array(
+        image = _to_cv_array_preview(
             _first_image(frame.tensors["rgb"]),
             downsample=rgb_step,
             rgb_to_bgr=True,
+            input_normalized=bool(context.config.get("normalize_rgb", True)),
         )
+
+        if bool(context.config.get("preview_yolo_overlay", True)):
+            result = self._latest_yolo_result(context)
+            if result is not None and result.get("stream") == "rgb":
+                _draw_yolo_detections_on_bgr(image, result, config=context.config)
+
+        return image
 
     def on_frame(self, context: WorkerContext, frame: WorkerFrame) -> None:
         if not bool(context.config.get("preview", False)):
             return
 
         stereo_step = int(context.config["preview_stereo_downsample"])
+        stereo_normalized = bool(context.config.get("normalize_stereo", True))
+
         cv2.imshow(self.window_names[0], self._make_rgb_preview(context, frame))
         cv2.imshow(
             self.window_names[1],
-            _to_cv_array(_first_image(frame.tensors["left"]), downsample=stereo_step, rgb_to_bgr=False),
+            _to_cv_array_preview(
+                _first_image(frame.tensors["left"]),
+                downsample=stereo_step,
+                rgb_to_bgr=False,
+                input_normalized=stereo_normalized,
+            ),
         )
         cv2.imshow(
             self.window_names[2],
-            _to_cv_array(_first_image(frame.tensors["right"]), downsample=stereo_step, rgb_to_bgr=False),
+            _to_cv_array_preview(
+                _first_image(frame.tensors["right"]),
+                downsample=stereo_step,
+                rgb_to_bgr=False,
+                input_normalized=stereo_normalized,
+            ),
         )
 
         if cv2.waitKey(1) & 0xFF in (ord("q"), 27):
@@ -1013,39 +1087,6 @@ class PreviewProcess(WorkerPipelineProcess):
                 cv2.destroyWindow(window_name)
         except Exception:
             pass
-
-
-class YoloPreviewProcess(PreviewProcess):
-    """OpenCV preview that overlays the latest worker-local YOLO detections."""
-
-    def _make_rgb_preview(self, context: WorkerContext, frame: WorkerFrame) -> Any:
-        image = super()._make_rgb_preview(context, frame)
-
-        if not bool(context.config.get("preview_yolo", True)):
-            return image
-
-        result = _get_latest_yolo_result(context)
-        if not result:
-            return image
-
-        # Draw only detections for the RGB stream on the RGB preview.
-        if str(result.get("stream", "rgb")) != "rgb":
-            return image
-
-        max_age_s = float(context.config.get("preview_yolo_max_age_s", 1.0))
-        if max_age_s >= 0:
-            age_s = time.time() - float(result.get("timestamp_s", 0.0))
-            if age_s > max_age_s:
-                return image
-
-        max_lag = int(context.config.get("preview_yolo_max_frame_lag", 30))
-        if max_lag >= 0:
-            yolo_frame_id = int(result.get("frame_id", -1))
-            if yolo_frame_id >= 0 and frame.frame_id - yolo_frame_id > max_lag:
-                return image
-
-        _draw_yolo_detections_on_bgr(image, result, config=context.config)
-        return image
 
 
 class AsyncPreviewProcess(AsyncWorkerPipelineProcess):
@@ -1069,19 +1110,3 @@ class AsyncPreviewProcess(AsyncWorkerPipelineProcess):
         )
 
 
-class AsyncYoloPreviewProcess(AsyncWorkerPipelineProcess):
-    """Threaded latest-frame preview that draws worker-local YOLO boxes."""
-
-    def __init__(
-        self,
-        *,
-        queue_max_size: int = 1,
-        join_timeout_s: float = 2.0,
-    ) -> None:
-        super().__init__(
-            YoloPreviewProcess(),
-            name="preview",
-            queue_max_size=queue_max_size,
-            join_timeout_s=join_timeout_s,
-        )
- 

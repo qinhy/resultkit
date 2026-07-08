@@ -14,8 +14,8 @@ if EXAMPLE_DIR not in sys.path:
     sys.path.append(EXAMPLE_DIR)
 
 from iox2_jsonrpc import EmptyParams, RpcModel
-from pipeline import (PreviewProcess, YoloPreviewProcess, AsyncPreviewProcess,
-                      AsyncYoloPreviewProcess, CaptureRequestProcess,
+from pipeline import (PreviewProcess, AsyncPreviewProcess,
+                      CaptureRequestProcess,
                       UltralyticsYoloProcess, AsyncYoloProcess,
                       AsyncWorkerPipelineProcess, WorkerFrame, WorkerContext,
                       WorkerPipelineProcess)
@@ -134,7 +134,8 @@ def openapi_doc(key="yolo_status", id=1, params={}):
             }}
 
 
-__all__ = ["EmptyParams", "RpcModel", "PreviewProcess", "YoloPreviewProcess",
-           "AsyncPreviewProcess", "AsyncYoloPreviewProcess", "CaptureRequestProcess",
+__all__ = ["EmptyParams", "RpcModel", "PreviewProcess",
+           "AsyncPreviewProcess", "CaptureRequestProcess",
            "UltralyticsYoloProcess", "AsyncYoloProcess", "AsyncWorkerPipelineProcess",
-           "WorkerFrame", "WorkerContext", "WorkerPipelineProcess"]
+           "WorkerFrame", "WorkerContext", "WorkerPipelineProcess", "StoppableLoop",
+           "openapi_doc"]

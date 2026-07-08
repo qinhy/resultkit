@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import base64
 import multiprocessing as mp
 import queue as py_queue
 import threading
@@ -10,16 +9,19 @@ import traceback
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
-import torch
 from pydantic import Field
-import cv2
 
 from common import (EmptyParams, RpcModel, openapi_doc,
-                    AsyncPreviewProcess, AsyncYoloPreviewProcess,
+                    AsyncPreviewProcess,
                     AsyncYoloProcess, CaptureRequestProcess,
                     WorkerFrame, WorkerContext, WorkerPipelineProcess)
 
-from resultkit.dai.rgb_stereo_generator import DepthAIPoeRGBStereoTorchGenerator
+try:
+    # Preferred module name for the MJPEG + torchvision/nvJPEG decode generator.
+    from resultkit.dai.rgb_stereo_mjpeg_cuda_generator import DepthAIPoeRGBStereoMjpegTorchGenerator
+except ImportError:
+    # Fallback if you installed the same class under the shorter MJPEG module name.
+    from resultkit.dai.rgb_stereo_mjpeg_generator import DepthAIPoeRGBStereoMjpegTorchGenerator
 
 StreamName = Literal["rgb", "stereo", "left", "right"]
 STREAMS: tuple[StreamName, ...] = ("rgb", "stereo", "left", "right")
@@ -66,12 +68,29 @@ class CameraConfig(CameraBaseModel):
     stereo_height: int = 800
     capture_fps: int = 15
 
-    rgb_codec: str = "h265"
-    stereo_codec: str = "h265"
-    rgb_bitrate_kbps: int = 60000
-    stereo_bitrate_kbps: int = 6000
+    # MJPEG camera generator settings. The old H26x fields below are kept only
+    # for RPC/config compatibility with older clients; _build_dai_gen_from_config
+    # does not pass them to the MJPEG generator.
+    rgb_mjpeg_quality: int = 90
+    stereo_mjpeg_quality: int = 85
+    rgb_mjpeg_input_type: str = "NV12"
+    stereo_mjpeg_input_type: str = "NV12"
+    mjpeg_decode_backend: str = "torchvision-cuda"
+    mjpeg_decode_fallback_to_opencv: bool = True
 
-    decoder_backend: str = "pynvvideocodec"
+    # CUDA device used by the MJPEG decoder. Leave torch_device as None to use
+    # cuda:{gpu_id}; set torch_device="cuda:0" if you prefer explicit config.
+    gpu_id: int = 0
+    torch_device: str | None = None
+    non_blocking_gpu_copy: bool = True
+
+    # Deprecated H26x compatibility fields. They are accepted in requests but
+    # ignored by the MJPEG generator path.
+    rgb_codec: str = "mjpeg"
+    stereo_codec: str = "mjpeg"
+    rgb_bitrate_kbps: int = 0
+    stereo_bitrate_kbps: int = 0
+    decoder_backend: str = "mjpeg"
     gst_nvivafilter_so: str = "./libdepthai_cuda_preprocess.so"
     gst_nvivafilter_dtype: str = "fp16"
     gst_nvivafilter_channel_order: str = "rgba"
@@ -85,18 +104,19 @@ class CameraConfig(CameraBaseModel):
     normalize_rgb: bool = True
     normalize_stereo: bool = True
 
-    preview: bool = False
+    preview: bool = True
     preview_rgb_downsample: int = 10
     preview_stereo_downsample: int = 4
+    preview_yolo_overlay: bool = True
 
     # Async zero-copy CUDA Ultralytics YOLO inference. The model is created
     # inside the CameraWorker child process and inside the async YOLO thread.
     # Frames stay as CUDA tensors; only post-NMS detection summaries are copied
     # back to CPU for JSON status output.
-    yolo_enabled: bool = False
+    yolo_enabled: bool = True
     yolo_model_path: str = "yolov8n.pt"
     yolo_stream: StreamName = "rgb"
-    yolo_imgsz: int = 640
+    yolo_imgsz: int = 1280
     yolo_conf: float = 0.25
     yolo_iou: float = 0.45
     yolo_max_det: int = 100
@@ -110,23 +130,15 @@ class CameraConfig(CameraBaseModel):
     yolo_letterbox: bool = True
     yolo_pad_value: float = 114.0 / 255.0
     # GPU slicing before resize/letterbox. Keeps CUDA-only path, useful for quick load tests.
-    yolo_downsample: int = 1
+    yolo_downsample: int = 10
     yolo_frame_interval: int = 1
     yolo_queue_max_size: int = 1
     yolo_join_timeout_s: float = 2.0
     yolo_empty_cache_on_stop: bool = False
 
-    # v4 normal preview overlay: preview thread draws latest YOLO metadata.
-    # preview_yolo: bool = True
-    # preview_yolo_max_age_s: float = 1.0
-    # preview_yolo_max_frame_lag: int = 30
-    # preview_yolo_thickness: int = 2
-    # preview_yolo_font_scale: float = 0.5
-
-    # v5 debug-only paired overlay: UltralyticsYoloProcess draws directly from
-    # the exact frame/result pair that produced detections. This is useful for
-    # checking preprocessing/box scaling, but it adds a CPU frame copy and GUI
-    # call in the YOLO async thread.
+    # Debug-only paired overlay: disabled by default because the normal preview
+    # stage is the single owner of OpenCV HighGUI windows. Enable only when you
+    # specifically need exact YOLO-frame debug visualization.
     yolo_debug_preview: bool = False
     yolo_debug_window_name: str = "yolo_debug_rgb"
     yolo_debug_downsample: int = 1
@@ -186,6 +198,11 @@ class CameraStatusResult(CameraBaseModel):
     yolo_num_detections: int = 0
     yolo_detections: list[dict[str, Any]] = []
     yolo_zero_copy_cuda: bool = True
+
+    mjpeg_decode_backend: str = "torchvision-cuda"
+    rgb_mjpeg_quality: int = 90
+    stereo_mjpeg_quality: int = 85
+    rgb_valid_height: int | None = None
 
 
 class CaptureResult(CameraStatusResult):
@@ -265,10 +282,19 @@ def _sleep_until_stopped(stop_event: Any, seconds: float) -> None:
         time.sleep(min(0.1, end_s - time.monotonic()))
 
 
+def _packed_stereo_rows_per_side_from_config(config: Any) -> int:
+    stereo_values = int(config.stereo_width) * int(config.stereo_height)
+    values_per_row = 3 * int(config.rgb_width)
+    return (stereo_values + values_per_row - 1) // values_per_row
+
+
+def _rgb_valid_height_from_config(config: Any) -> int:
+    return max(0, int(config.rgb_height) - 2 * _packed_stereo_rows_per_side_from_config(config))
+
 def _build_dai_gen_from_config(config: dict[str, Any]) -> Any:
 
     camera_config = CameraConfig(**config)
-    return DepthAIPoeRGBStereoTorchGenerator(
+    return DepthAIPoeRGBStereoMjpegTorchGenerator(
         uuid=camera_config.uuid,
         sources=camera_config.sources,
         rgb_width=camera_config.rgb_width,
@@ -276,16 +302,15 @@ def _build_dai_gen_from_config(config: dict[str, Any]) -> Any:
         stereo_width=camera_config.stereo_width,
         stereo_height=camera_config.stereo_height,
         capture_fps=camera_config.capture_fps,
-        rgb_codec=camera_config.rgb_codec,
-        stereo_codec=camera_config.stereo_codec,
-        rgb_bitrate_kbps=camera_config.rgb_bitrate_kbps,
-        stereo_bitrate_kbps=camera_config.stereo_bitrate_kbps,
-        decoder_backend=camera_config.decoder_backend,
-        gst_nvivafilter_so=camera_config.gst_nvivafilter_so,
-        gst_nvivafilter_dtype=camera_config.gst_nvivafilter_dtype,
-        gst_nvivafilter_channel_order=camera_config.gst_nvivafilter_channel_order,
-        decoder_output_color=camera_config.decoder_output_color,
-        stereo_decoder_output_color=camera_config.stereo_decoder_output_color,
+        rgb_mjpeg_quality=camera_config.rgb_mjpeg_quality,
+        stereo_mjpeg_quality=camera_config.stereo_mjpeg_quality,
+        rgb_mjpeg_input_type=camera_config.rgb_mjpeg_input_type,
+        stereo_mjpeg_input_type=camera_config.stereo_mjpeg_input_type,
+        mjpeg_decode_backend=camera_config.mjpeg_decode_backend,
+        mjpeg_decode_fallback_to_opencv=camera_config.mjpeg_decode_fallback_to_opencv,
+        gpu_id=camera_config.gpu_id,
+        torch_device=camera_config.torch_device,
+        non_blocking_gpu_copy=camera_config.non_blocking_gpu_copy,
         rgb_camera_socket=camera_config.rgb_camera_socket,
         left_camera_socket=camera_config.left_camera_socket,
         right_camera_socket=camera_config.right_camera_socket,
@@ -305,7 +330,16 @@ def _emit_worker_status(status_queue: Any, state: str, **fields: Any) -> None:
 
 
 def _unpack_frame(gen: Any, mats: Any) -> dict[StreamName, Any]:
-    rgb, stereo, left, right = gen.unpack_packed_tensor(mats[0].data)
+    rgb_with_payload, stereo, left, right = gen.unpack_packed_tensor(mats[0].data)
+
+    # The MJPEG generator packs left stereo into top rows and right stereo into
+    # bottom rows of the returned RGB tensor. For preview, capture, and YOLO,
+    # publish a clean RGB view with those payload rows removed.
+    if hasattr(gen, "rgb_without_stereo_payload"):
+        rgb = gen.rgb_without_stereo_payload(rgb_with_payload)
+    else:
+        rgb = rgb_with_payload
+
     return {"rgb": rgb, "stereo": stereo, "left": left, "right": right}
 
 
@@ -385,10 +419,10 @@ def build_worker_pipeline(config: dict[str, Any]) -> list[WorkerPipelineProcess]
             )
         )
 
+
     if bool(config.get("preview", False)):
-        preview_cls = AsyncYoloPreviewProcess if bool(config.get("preview_yolo", True)) else AsyncPreviewProcess
         processes.append(
-            preview_cls(
+            AsyncPreviewProcess(
                 queue_max_size=1,
                 join_timeout_s=2.0,
             )
@@ -828,6 +862,10 @@ class CameraController:
             "yolo_num_detections": self._last_yolo_num_detections,
             "yolo_detections": self._last_yolo_detections,
             "yolo_zero_copy_cuda": True,
+            "mjpeg_decode_backend": self.config.mjpeg_decode_backend,
+            "rgb_mjpeg_quality": self.config.rgb_mjpeg_quality,
+            "stereo_mjpeg_quality": self.config.stereo_mjpeg_quality,
+            "rgb_valid_height": _rgb_valid_height_from_config(self.config),
         })
 
     def open(self, params: CameraConfig) -> CameraStatusResult:
@@ -904,7 +942,9 @@ class CameraController:
 
     def _capture_size(self, stream: str) -> tuple[int, int]:
         if stream == "rgb":
-            return self.config.rgb_width, self.config.rgb_height
+            return self.config.rgb_width, _rgb_valid_height_from_config(self.config)
+        if stream == "stereo":
+            return 2 * self.config.stereo_width, self.config.stereo_height
         return self.config.stereo_width, self.config.stereo_height
 
     def _build_capture_result(
