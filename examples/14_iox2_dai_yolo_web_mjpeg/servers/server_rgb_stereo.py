@@ -18,8 +18,8 @@ from resultkit.dai.rgb_stereo_mjpeg_generator import DepthAIPoeRGBStereoMjpegGen
 
 
 parser = argparse.ArgumentParser(description="Run the DepthAI MJPEG camera RPC server.")
-parser.add_argument("--service-name", default="OkadCamA", help="iceoryx2 service name")
-parser.add_argument("--controller-name", default="camera", help="camera controller name")
+parser.add_argument("--service-name", default="jrpc", help="iceoryx2 service name")
+parser.add_argument("--controller-name", default="cameraRgbd", help="camera controller name")
 parser.add_argument("--device", default="169.254.1.222", help="DepthAI device IP or identifier")
 args = parser.parse_args()
 

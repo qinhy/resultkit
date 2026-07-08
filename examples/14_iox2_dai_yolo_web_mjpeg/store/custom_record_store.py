@@ -11,24 +11,25 @@ Supported modes:
     - rgb_stereo
 
 The implementation intentionally uses only the Python standard library for core
-JSON/path/validation behavior. Image writing supports bytes, existing files,
-Pillow images, and NumPy arrays when Pillow is installed. PCD writing supports
+JSON/path/validation behavior. Camera image writing stores MJPEG/JPEG frames as .jpg files and supports
+bytes, existing files, Pillow images, and NumPy arrays when Pillow is installed.
+Disparity images remain PNG. PCD writing supports
 bytes, existing files, and simple Nx3/Nx4/Nx6/Nx7 point arrays/sequences.
 """
 
 from __future__ import annotations
 
+import argparse
 import calendar
 import json
 import re
 import shutil
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import NamedTemporaryFile
-from typing import Any, Literal, Mapping, Sequence
-from pathlib import Path
-from typing import Union
+from typing import Any, Literal, Mapping, Sequence, Union
+from zoneinfo import ZoneInfo
 
 
 BytesLike = Union[bytes, bytearray, memoryview]
@@ -42,12 +43,25 @@ GISKind = Literal[
     "map_notes",
 ]
 
+
+# parser = argparse.ArgumentParser(description="Custom synchronized single-frame record store")
+# parser.add_argument("--dual-rgb-cam0", default="cam_a")
+# parser.add_argument("--dual-rgb-cam1", default="cam_b")
+# parser.add_argument("--rgb-stereo-cam", default="cam_c")
+# args = parser.parse_args()
+
 SCHEMA_VERSION = "1.0"
 NS_PER_SECOND = 1_000_000_000
 
+# Camera streams come from MJPEG. Each single-frame capture is stored as one
+# JPEG frame using .jpg. Disparity is intentionally kept as .png.
+CAMERA_IMAGE_EXTENSION = ".jpg"
+CAMERA_IMAGE_ENCODING = "mjpeg_frame"
+JPEG_LIKE_SUFFIXES = {".jpg", ".jpeg", ".mjpg", ".mjpeg"}
+
 RECORD_ID_RE = re.compile(
     r"^(?P<hour>\d{2})(?P<minute>\d{2})(?P<second>\d{2})\."
-    r"(?P<nsec>\d{9})Z_(?P<sequence>\d{3,})$"
+    r"(?P<nsec>\d{9})JST_(?P<sequence>\d{3,})$"
 )
 
 VALID_MODES: set[str] = {"dual_rgb", "rgb_stereo"}
@@ -59,40 +73,44 @@ GIS_EXTENSIONS: dict[GISKind, str] = {
     "map_notes": ".geojson",
 }
 
+DUAL_RGB_CAM_NAME_0 = "cam_a" # args.dual_rgb_cam0
+DUAL_RGB_CAM_NAME_1 = "cam_b" # args.dual_rgb_cam1
+RGB_STEREO_CAM_NAME = "cam_c" # args.rgb_stereo_cam
+
 REQUIRED_FILES: dict[str, tuple[str, ...]] = {
     "dual_rgb": (
         "record.json",
-        "calib/cam_a.json",
-        "calib/cam_b.json",
+        f"calib/{DUAL_RGB_CAM_NAME_0}.json",
+        f"calib/{DUAL_RGB_CAM_NAME_1}.json",
         "calib/extrinsics.json",
         "gis/location.json",
         "gis/pose.json",
         "gis/coordinate_system.json",
-        "imgs/cam_a/rgb.png",
-        "imgs/cam_b/rgb.png",
+        f"imgs/{DUAL_RGB_CAM_NAME_0}/rgb.jpg",
+        f"imgs/{DUAL_RGB_CAM_NAME_1}/rgb.jpg",
     ),
     "rgb_stereo": (
         "record.json",
-        "calib/cam_c.json",
+        f"calib/{RGB_STEREO_CAM_NAME}.json",
         "gis/location.json",
         "gis/pose.json",
         "gis/coordinate_system.json",
-        "imgs/cam_c/rgb.png",
-        "imgs/cam_c/left.png",
-        "imgs/cam_c/right.png",
-        "depth/cam_c/disparity.png",
-        "depth/cam_c/disparity.json",
+        f"imgs/{RGB_STEREO_CAM_NAME}/rgb.jpg",
+        f"imgs/{RGB_STEREO_CAM_NAME}/left.jpg",
+        f"imgs/{RGB_STEREO_CAM_NAME}/right.jpg",
+        f"depth/{RGB_STEREO_CAM_NAME}/disparity.png",
+        f"depth/{RGB_STEREO_CAM_NAME}/disparity.json",
     ),
 }
 
 MODE_CAMERAS: dict[str, tuple[str, ...]] = {
-    "dual_rgb": ("cam_a", "cam_b"),
-    "rgb_stereo": ("cam_c",),
+    "dual_rgb": (DUAL_RGB_CAM_NAME_0, DUAL_RGB_CAM_NAME_1),
+    "rgb_stereo": (RGB_STEREO_CAM_NAME,),
 }
 
 MODE_STREAMS: dict[str, dict[str, tuple[str, ...]]] = {
-    "dual_rgb": {"cam_a": ("rgb",), "cam_b": ("rgb",)},
-    "rgb_stereo": {"cam_c": ("rgb", "left", "right")},
+    "dual_rgb": {DUAL_RGB_CAM_NAME_0: ("rgb",), DUAL_RGB_CAM_NAME_1: ("rgb",)},
+    "rgb_stereo": {RGB_STEREO_CAM_NAME: ("rgb", "left", "right")},
 }
 
 
@@ -119,13 +137,16 @@ def date_utc_from_timestamp_ns(timestamp_ns_utc: int) -> str:
     return datetime.fromtimestamp(seconds, tz=timezone.utc).strftime("%Y-%m-%d")
 
 
+JST = timezone(timedelta(hours=9), name="JST")
 def record_id_from_timestamp_ns(timestamp_ns_utc: int, sequence: int = 1) -> str:
-    """Return HHMMSS.NNNNNNNNNZ_SEQUENCE for a UTC nanosecond timestamp."""
+    """Return HHMMSS.NNNNNNNNNJST_SEQUENCE for a UTC nanosecond timestamp shown in JST."""
     if sequence < 0:
         raise ValueError("sequence must be non-negative")
+
     seconds, nsec = divmod(int(timestamp_ns_utc), NS_PER_SECOND)
-    dt = datetime.fromtimestamp(seconds, tz=timezone.utc)
-    return f"{dt:%H%M%S}.{nsec:09d}Z_{sequence:03d}"
+    dt = datetime.fromtimestamp(seconds, tz=timezone.utc).astimezone(JST)
+
+    return f"{dt:%H%M%S}.{nsec:09d}JST_{sequence:03d}"
 
 
 def timestamp_ns_from_date_and_record_id(date_utc: str, record_id: str) -> int:
@@ -213,7 +234,7 @@ def _write_bytes(path: Path, data: BytesLike) -> None:
     if not isinstance(data, bytes):
         raise TypeError(f"Expected bytes-like object, got {type(data).__name__}")
 
-    path.write_bytes(data)
+    _atomic_write_bytes(path, data)
 
 
 def _write_image_png(path: Path, image: Any) -> None:
@@ -257,6 +278,71 @@ def _write_image_png(path: Path, image: Any) -> None:
     raise TypeError(
         "Unsupported image type. Pass encoded bytes, an existing file path, "
         "a Pillow image, or a NumPy array."
+    )
+
+
+def _jpeg_ready_image(image: Any) -> Any:
+    """Return a Pillow image converted to a JPEG-compatible mode when needed."""
+    mode = getattr(image, "mode", None)
+    if mode in {"RGBA", "LA", "P"}:
+        return image.convert("RGB")
+    return image
+
+
+def _write_mjpeg_frame(path: Path, image: Any) -> None:
+    """Write a camera frame as a JPEG file.
+
+    MJPEG camera streams provide individual JPEG-compressed frames. For bytes-like
+    input, this function writes those encoded frame bytes directly to .jpg without
+    decoding/re-encoding. Pillow images and NumPy arrays are encoded as JPEG for
+    convenience in tests or non-camera call sites.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    if isinstance(image, (bytes, bytearray, memoryview)):
+        _atomic_write_bytes(path, bytes(image))
+        return
+
+    if _is_existing_file(image):
+        src = Path(image)
+        if src.suffix.lower() in JPEG_LIKE_SUFFIXES:
+            _copy_file(src, path)
+            return
+
+        try:
+            from PIL import Image  # type: ignore
+        except Exception as exc:  # pragma: no cover - depends on environment
+            raise TypeError(
+                "Only JPEG/MJPEG frame files can be copied directly. "
+                "Install pillow to transcode other image files to JPEG, or pass "
+                "encoded MJPEG/JPEG frame bytes."
+            ) from exc
+
+        with Image.open(src) as im:
+            _jpeg_ready_image(im).save(path, format="JPEG")
+        return
+
+    if hasattr(image, "save"):
+        _jpeg_ready_image(image).save(path, format="JPEG")
+        return
+
+    # NumPy array support without requiring NumPy as a hard dependency.
+    if hasattr(image, "shape") and hasattr(image, "dtype"):
+        try:
+            from PIL import Image  # type: ignore
+        except Exception as exc:  # pragma: no cover - depends on environment
+            raise TypeError(
+                "NumPy image arrays require Pillow to be installed. "
+                "Install pillow or pass encoded MJPEG/JPEG frame bytes/a file path."
+            ) from exc
+
+        pil_image = Image.fromarray(image)
+        _jpeg_ready_image(pil_image).save(path, format="JPEG")
+        return
+
+    raise TypeError(
+        "Unsupported image type. Pass encoded MJPEG/JPEG frame bytes, an existing "
+        "JPEG file path, a Pillow image, or a NumPy array."
     )
 
 
@@ -424,16 +510,17 @@ class CustomRecord:
         _write_json(out, data)
 
     def add_image(self, camera_id: str, stream: ImageStream, image: Any) -> None:
-        """Write imgs/{camera_id}/{stream}.png."""
+        """Write imgs/{camera_id}/{stream}.jpg from an MJPEG/JPEG frame."""
         if stream not in {"rgb", "left", "right"}:
             raise ValueError(f"Unsupported image stream: {stream!r}")
-        _write_image_png(self.path / "imgs" / camera_id / f"{stream}.png", image)
+        _write_mjpeg_frame(
+            self.path / "imgs" / camera_id / f"{stream}{CAMERA_IMAGE_EXTENSION}",
+            image,
+        )
 
     def add_mjpeg_image(self, camera_id: str, stream: ImageStream, image_bytes: Any) -> None:
-        """Write imgs/{camera_id}/{stream}.jpg."""
-        if stream not in {"rgb", "left", "right"}:
-            raise ValueError(f"Unsupported image stream: {stream!r}")
-        _write_bytes(self.path / "imgs" / camera_id / f"{stream}.jpg", image_bytes)
+        """Backward-compatible alias for add_image()."""
+        self.add_image(camera_id, stream, image_bytes)
 
     def add_yolo(
         self,
@@ -443,11 +530,11 @@ class CustomRecord:
         model_info: dict[str, Any],
         overlay_image: Any | None = None,
     ) -> None:
-        """Write yolo/{camera_id}/{stream}.json and optional overlay PNG."""
+        """Write yolo/{camera_id}/{stream}.json and optional overlay JPG."""
         if not stream:
             raise ValueError("stream must not be empty")
 
-        source_image = self.path / "imgs" / camera_id / f"{stream}.png"
+        source_image = self.path / "imgs" / camera_id / f"{stream}{CAMERA_IMAGE_EXTENSION}"
         payload = {
             "schema_version": SCHEMA_VERSION,
             "timestamp_ns": self.timestamp_ns_utc,
@@ -460,7 +547,10 @@ class CustomRecord:
         _write_json(self.path / "yolo" / camera_id / f"{stream}.json", payload)
 
         if overlay_image is not None:
-            _write_image_png(self.path / "yolo" / camera_id / f"{stream}_overlay.png", overlay_image)
+            _write_mjpeg_frame(
+                self.path / "yolo" / camera_id / f"{stream}_overlay{CAMERA_IMAGE_EXTENSION}",
+                overlay_image,
+            )
 
     def add_disparity(
         self,
@@ -475,8 +565,8 @@ class CustomRecord:
         default_metadata = {
             "schema_version": SCHEMA_VERSION,
             "source_streams": [
-                f"imgs/{camera_id}/left.png",
-                f"imgs/{camera_id}/right.png",
+                f"imgs/{camera_id}/left{CAMERA_IMAGE_EXTENSION}",
+                f"imgs/{camera_id}/right{CAMERA_IMAGE_EXTENSION}",
             ],
             "unit": "pixels",
             "encoding": "uint16_png",
@@ -504,8 +594,8 @@ class CustomRecord:
                 "source_disparity": f"depth/{camera_id}/disparity.png",
                 "source_disparity_metadata": f"depth/{camera_id}/disparity.json",
                 "source_streams": [
-                    f"imgs/{camera_id}/left.png",
-                    f"imgs/{camera_id}/right.png",
+                    f"imgs/{camera_id}/left{CAMERA_IMAGE_EXTENSION}",
+                    f"imgs/{camera_id}/right{CAMERA_IMAGE_EXTENSION}",
                 ],
                 "frame": f"{camera_id}_left",
                 "unit": "meters",
@@ -625,10 +715,13 @@ class CustomRecord:
             except Exception as exc:
                 issues.append(f"ERROR: could not read record.json: {exc}")
 
-        # No MJPEG single-frame files.
+        # Raw MJPEG stream extensions are not used for single extracted frames.
+        # Store extracted MJPEG/JPEG frames as .jpg instead.
         for file in record_path.rglob("*"):
             if file.is_file() and file.suffix.lower() in {".mjpeg", ".mjpg"}:
-                issues.append(f"WARNING: single-frame record should not use MJPEG: {self.rel(file)}")
+                issues.append(
+                    f"WARNING: store single MJPEG frames as .jpg, not {file.suffix}: {self.rel(file)}"
+                )
 
         # YOLO source_image references.
         for yolo_json in (record_path / "yolo").glob("*/*.json") if (record_path / "yolo").exists() else []:
@@ -701,12 +794,18 @@ class CustomRecord:
         def glob(pattern: str) -> list[str]:
             return sorted(_rel(p, base) for p in base.glob(pattern) if p.is_file())
 
+        def glob_many(*patterns: str) -> list[str]:
+            files: list[str] = []
+            for pattern in patterns:
+                files.extend(glob(pattern))
+            return sorted(files)
+
         return {
             "calibration": glob("calib/*.json"),
             "gis": glob("gis/*.json") + glob("gis/*.geojson"),
-            "images": glob("imgs/*/*.png"),
+            "images": glob_many("imgs/*/*.jpg", "imgs/*/*.jpeg"),
             "yolo": glob("yolo/*/*.json"),
-            "yolo_overlays": glob("yolo/*/*_overlay.png"),
+            "yolo_overlays": glob_many("yolo/*/*_overlay.jpg", "yolo/*/*_overlay.jpeg"),
             "disparity": glob("depth/*/disparity.png") + glob("depth/*/disparity.json"),
             "point_clouds": [
                 p for p in glob("pcd/*.pcd") if not p.startswith("pcd/objects/")
@@ -753,7 +852,7 @@ class CustomRecord:
                 "stream": Path(parts[2]).stem,
                 "path": rel_path,
                 "timestamp_ns": self.timestamp_ns_utc,
-                "encoding": "png",
+                "encoding": CAMERA_IMAGE_ENCODING,
             }
             # Width/height are optional and only available if Pillow exists.
             try:
@@ -878,6 +977,8 @@ class CustomStore:
 __all__ = [
     "CustomRecord",
     "CustomStore",
+    "CAMERA_IMAGE_ENCODING",
+    "CAMERA_IMAGE_EXTENSION",
     "GIS_EXTENSIONS",
     "GISKind",
     "ImageStream",

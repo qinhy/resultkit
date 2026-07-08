@@ -11,6 +11,7 @@ if EXAMPLE_DIR not in sys.path:
     sys.path.append(EXAMPLE_DIR)
 
 from iox2_jsonrpc import EmptyParams, RpcModel
+from store.custom_record_store import CustomRecord, CustomStore, RecordMode
 
 
 def openapi_doc(key="yolo_status", id=1, params={}):
@@ -33,4 +34,5 @@ __all__ = ["EmptyParams", "RpcModel", "PreviewProcess",
            "AsyncPreviewProcess", "CaptureRequestProcess",
            "UltralyticsYoloProcess", "AsyncYoloProcess", "AsyncWorkerPipelineProcess",
            "WorkerFrame", "WorkerContext", "WorkerPipelineProcess", "StoppableLoop",
-           "openapi_doc"]
+           "openapi_doc",
+           "CustomRecord", "CustomStore", "RecordMode"]
