@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from queue import Empty, Queue
 from threading import Event, Lock, Thread
-from typing import Any, Literal
+from typing import Any, List, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, computed_field
 import requests
@@ -41,20 +41,20 @@ class StartYoloParams(YoloBaseModel):
     size_mode: SizeMode = "tiling"
     cuda_device: int = 0
     db_record: CustomRecord = CustomRecord.empty()
-    input_jpg_paths: list[str] = [] # field(default_factory=list)
-    output_json_paths: list[str] = [] # field(default_factory=list)
+    input_jpg_paths: List[str] = [] # field(default_factory=list)
+    output_json_paths: List[str] = [] # field(default_factory=list)
     
-    hook_urls:list[str] = []
+    hook_urls:List[str] = []
 
     
     def model_post_init(self, context):
         if not self.db_record.is_empty():
-            self.input_jpg_paths = self.db_record.listup_rgb_image_paths
+            self.input_jpg_paths = [str(p) for p in self.db_record.listup_rgb_image_paths]
             self.output_json_paths = [self.to_output_json_paths(p) for p in self.input_jpg_paths]
             if self.db_record.mode == "dual_rgb":
                 self.hook_urls = []
             if self.db_record.mode == "rgb_stereo":
-                self.hook_urls = ["http://localhost:8000/controllers/pcd/start"]                
+                self.hook_urls = ["http://localhost:8000/controllers/pcd/to_pcd"]
         return super().model_post_init(context)
 
     @staticmethod
@@ -162,7 +162,7 @@ class YoloDetectResult(BaseModel):
     detections: list[YoloDetection] = Field(default_factory=list)
     has_masks: bool | None = None
     num_detections: int | None = None
-    model: YoloSettings
+    yolo_config: YoloSettings
     tile_size: int | None = None
     tile_overlap: int | None = None
     tile_count: int | None = None
@@ -262,8 +262,10 @@ class YoloDetector:
         return self._model
 
     def detect(self, params: StartYoloParams) -> YoloDetectResult:
-        for p in params.input_jpg_paths:
-            image_path = Path(p)
+        for image_path, output_json_path in zip(params.input_jpg_paths,params.output_json_paths):
+            image_path = Path(image_path)
+            output_json_path = Path(output_json_path)
+
             if not image_path.is_file():
                 raise FileNotFoundError(f"Input image does not exist: {image_path}")
 
@@ -274,10 +276,10 @@ class YoloDetector:
 
             result = YoloDetectResult(
                 input_jpg_path=str(image_path),
-                output_json_path=params.output_json_paths,
+                output_json_path=str(output_json_path),
                 size_mode=params.size_mode,
                 cuda_device=params.cuda_device,
-                model=self.settings,
+                yolo_config=self.settings,
                 **image_payload,
             )
 
@@ -287,11 +289,11 @@ class YoloDetector:
 
             if not params.db_record.is_empty():
                 for hook_url in params.hook_urls:
+                    payload = {"db_record": json.loads(params.db_record.model_dump_json())}
                     try:
-                        params = {"db_record": json.dumps(params.db_record.model_dump())}
-                        def push_request(hook_url=hook_url, params=params):
+                        def push_request(hook_url=hook_url, payload=payload):
                             try:
-                                requests.get(hook_url, params=params, timeout=0.5)
+                                requests.post(hook_url, json=payload, timeout=0.5)
                             except requests.RequestException:
                                 pass  # ignore timeout / connection errors
                         executor = ThreadPoolExecutor(max_workers=8)

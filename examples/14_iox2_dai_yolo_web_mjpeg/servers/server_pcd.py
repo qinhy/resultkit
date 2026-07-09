@@ -13,6 +13,7 @@ from common import *
 
 from iox2_jsonrpc import EmptyParams, RpcModel
 from store.custom_record_store import CustomRecord
+from server_yolo import YoloDetectResult
 
 _THIS_DIR = Path(__file__).absolute().parent
 for path in (
@@ -191,7 +192,7 @@ def _resize_yolo_mask_to_rgb(mask: np.ndarray, rgb_hw: tuple[int, int], threshol
     return m > float(threshold)
 
 
-def _segment_meta_dict(seg: "YoloSegment3D") -> dict[str, Any]:
+def _segment_meta_dict(seg: "DetectSegment3D") -> dict[str, Any]:
     return {
         "instance_id": int(seg.instance_id),
         "class_id": int(seg.class_id),
@@ -210,7 +211,7 @@ def _segment_meta_dict(seg: "YoloSegment3D") -> dict[str, Any]:
     }
 
 
-def _save_segments_npz(path: str | Path, result: "YoloSegments3D") -> Path:
+def _save_segments_npz(path: str | Path, result: "DetectSegments3D") -> Path:
     output_path = Path(path).expanduser()
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -232,7 +233,7 @@ def _save_segments_npz(path: str | Path, result: "YoloSegments3D") -> Path:
     return output_path
 
 
-def _result_segments_to_summary(segments: list["YoloSegment3D"]) -> list["YoloSegmentSummary"]:
+def _result_segments_to_summary(segments: list["DetectSegment3D"]) -> list["YoloSegmentSummary"]:
     summaries = []
     for seg in segments:
         summaries.append(
@@ -260,7 +261,7 @@ def _result_segments_to_summary(segments: list["YoloSegment3D"]) -> list["YoloSe
 
 
 @dataclass(frozen=True)
-class YoloSegment3D:
+class DetectSegment3D:
     instance_id: int
     class_id: int
     class_name: str
@@ -280,7 +281,7 @@ class YoloSegment3D:
 
 
 @dataclass(frozen=True)
-class YoloSegments3D:
+class DetectSegments3D:
     points_m: np.ndarray
     colors_rgb: np.ndarray
     pixels_rgb: np.ndarray
@@ -288,7 +289,7 @@ class YoloSegments3D:
     class_ids: np.ndarray
     confidences: np.ndarray
     instance_map: np.ndarray
-    segments: list[YoloSegment3D]
+    segments: list[DetectSegment3D]
     depth_rgb_m: np.ndarray | None
     disparity: np.ndarray | None
     rectification: Any | None
@@ -296,22 +297,22 @@ class YoloSegments3D:
 
 
 class DepthBaseModel(RpcModel):
-    service: Literal["serverDepth"] = "serverDepth"
+    service: Literal["jrpc"] = "jrpc"
 
 
 class DepthCalibrationParams(DepthBaseModel):
     source_translation_unit: TranslationUnit = "cm"
-    rgb_resolution: Resolution = _default_calibration_field("rgb_resolution", _as_resolution)
-    left_resolution: Resolution = _default_calibration_field("left_resolution", _as_resolution)
-    right_resolution: Resolution = _default_calibration_field("right_resolution", _as_resolution)
-    rgb_intrinsics: Matrix3x3 = _default_calibration_field("rgb_intrinsics")
-    left_intrinsics: Matrix3x3 = _default_calibration_field("left_intrinsics")
-    right_intrinsics: Matrix3x3 = _default_calibration_field("right_intrinsics")
-    left_to_right_extrinsics: Matrix4x4 = _default_calibration_field("left_to_right_extrinsics")
-    left_to_rgb_extrinsics: Matrix4x4 = _default_calibration_field("left_to_rgb_extrinsics")
-    rgb_distortion: DistortionCoefficients = _default_calibration_field("rgb_distortion", _as_float_tuple)
-    left_distortion: DistortionCoefficients = _default_calibration_field("left_distortion", _as_float_tuple)
-    right_distortion: DistortionCoefficients = _default_calibration_field("right_distortion", _as_float_tuple)
+    rgb_resolution: Resolution # = _default_calibration_field("rgb_resolution", _as_resolution)
+    left_resolution: Resolution # = _default_calibration_field("left_resolution", _as_resolution)
+    right_resolution: Resolution # = _default_calibration_field("right_resolution", _as_resolution)
+    rgb_intrinsics: Matrix3x3 # = _default_calibration_field("rgb_intrinsics")
+    left_intrinsics: Matrix3x3 # = _default_calibration_field("left_intrinsics")
+    right_intrinsics: Matrix3x3 # = _default_calibration_field("right_intrinsics")
+    left_to_right_extrinsics: Matrix4x4 # = _default_calibration_field("left_to_right_extrinsics")
+    left_to_rgb_extrinsics: Matrix4x4 # = _default_calibration_field("left_to_rgb_extrinsics")
+    rgb_distortion: DistortionCoefficients # = _default_calibration_field("rgb_distortion", _as_float_tuple)
+    left_distortion: DistortionCoefficients # = _default_calibration_field("left_distortion", _as_float_tuple)
+    right_distortion: DistortionCoefficients # = _default_calibration_field("right_distortion", _as_float_tuple)
 
 
 class SetDepthCalibrationResult(DepthBaseModel):
@@ -359,51 +360,17 @@ class BackendStatusResult(BackendParams):
     dnn_error: str | None = None
 
 
-class YoloConfigOverrides(BaseModel):
-    yolo_model_path: str | None = None
-    yolo_device: str | None = None
-    yolo_imgsz: int | None = None
-    yolo_conf: float | None = None
-    yolo_iou: float | None = None
-    yolo_max_det: int | None = None
-    yolo_classes: list[int] | None = None
-    yolo_half: bool | None = None
-    yolo_verbose: bool | None = None
-
-
-YOLO_KEYS = _model_field_names(YoloConfigOverrides)
-
-
-class YoloConfigParams(YoloConfigOverrides, DepthBaseModel):
-    yolo_model_path: str = "yolov8n-seg.pt"
-    yolo_device: str | None = None
-    yolo_imgsz: int | None = None
-    yolo_conf: float = 0.25
-    yolo_iou: float = 0.7
-    yolo_max_det: int = 100
-    yolo_classes: list[int] | None = None
-    yolo_half: bool = False
-    yolo_verbose: bool = False
-
-
-class YoloStatusResult(YoloConfigParams):
-    configured: bool = True
-    model_loaded: bool = False
-    ultralytics_available: bool = True
-    ultralytics_error: str | None = None
-
-
 class ToPcdParams(BackendOverrides):
     db_record: CustomRecord = CustomRecord.empty()
-    left_path: str
-    right_path: str
-    rgb_path: str
+    left_path: str = ""
+    right_path: str = ""
+    rgb_path: str = ""
     output_pcd_path: str = "colored_cloud.pcd"
     calibration: DepthCalibrationParams | None = None
     input_color_order: ColorOrder = "BGR"
     rgb_image_is_undistorted: bool = False
     alpha: float = 0.0
-    max_depth_m: float | None = 10.0
+    max_depth_m: float | None = 5.0
     stride: int = Field(default=1, ge=1)
     output_frame: OutputFrame = "left"
     save_binary_pcd: bool = True
@@ -414,12 +381,18 @@ class ToPcdParams(BackendOverrides):
     def model_post_init(self, context):
         if not self.db_record.is_empty() and self.db_record.is_stereo:
             left_path = self.db_record.listup_left_image_paths
-            right_path = self.db_record.listup_left_image_paths
+            right_path = self.db_record.listup_right_image_paths
             if len(left_path)!=1 or len(right_path)!=1:
                 raise ValueError("Invalid left_path:{left_path}, right_path:{right_path}")
-            self.left_path = left_path[0]
-            self.right_path = right_path[0]
-            self.output_pcd_path = self.db_record.expect_pcd_path
+            self.left_path = str(left_path[0])
+            self.right_path = str(right_path[0])
+            self.rgb_path = str(left_path[0]).replace("left", "rgb")
+            self.output_pcd_path = str(self.db_record.expect_pcd_path)            
+            with open(self.db_record.expect_stereo_calib) as f:
+                calib = json.load(f)
+                if "calibration" in calib:
+                    calib = calib["calibration"]
+                self.calibration = DepthCalibrationParams.model_validate(calib,extra="ignore")
         return super().model_post_init(context)
     
 
@@ -434,6 +407,7 @@ class ToPcdResult(DepthBaseModel):
     depth_mean_m: float | None = None
     disparity_width: int | None = None
     disparity_height: int | None = None
+    calibration: str | None = None
 
 
 class Ros2PublishParams(DepthBaseModel):
@@ -474,11 +448,11 @@ class YoloSegmentSummary(BaseModel):
     meta_path: str | None = None
 
 
-class ToYoloSegmentsParams(BackendOverrides, YoloConfigOverrides):
+class ToYoloSegmentsParams(BackendOverrides):
     left_path: str
     right_path: str
     rgb_path: str
-    output_dir: str = "yolo_segments_out"
+    output_dir: str = "detect_segments_out"
     frame_name: str = "frame"
     calibration: DepthCalibrationParams | None = None
     input_color_order: ColorOrder = "BGR"
@@ -494,32 +468,9 @@ class ToYoloSegmentsParams(BackendOverrides, YoloConfigOverrides):
     block_size: int = 5
     splat_px: int = Field(default=1, ge=0)
 
-    # YOLO mask/segment parameters
-    mask_threshold: float = 0.5
-    overlap_policy: YoloOverlapPolicy = "highest_confidence"
-    min_points: int = Field(default=30, ge=0)
 
-    # File outputs
-    save_pcd: bool = True
-    save_pixels: bool = True
-    save_meta: bool = True
-    save_combined_npz: bool = True
-    save_instance_map: bool = True
-    save_depth_rgb: bool = True
-
-    # Optional direct ROS 2 publishing
-    ros2_publish: bool = False
-    ros2_node_name: str = "depth_segment_publisher"
-    ros2_topic_prefix: str = "/perception/segments"
-    ros2_frame_id: str = "camera_rgb_optical_frame"
-    ros2_include_depth: bool = True
-    ros2_include_markers: bool = True
-    ros2_pretty_json: bool = False
-
-
-class ToYoloSegmentsResult(DepthBaseModel):
+class ToDetectSegmentsResult(DepthBaseModel):
     backend: DepthBackend
-    yolo_model_path: str
     output_dir: str
     frame_name: str
     output_frame: SegmentOutputFrame
@@ -539,16 +490,15 @@ class ToYoloSegmentsResult(DepthBaseModel):
 
 @dataclass
 class DepthController:
-    service_name: str = "serverDepth"
-    controller_name: str = "depth"
-    calibration_params: DepthCalibrationParams = field(default_factory=DepthCalibrationParams)
+    service_name: str = "jrpc"
+    controller_name: str = "pcd"
+    calibration_params: DepthCalibrationParams | None = field(default=None, init=False, repr=False)
     backend_params: BackendParams = field(default_factory=BackendParams)
-    yolo_params: YoloConfigParams = field(default_factory=YoloConfigParams)
     _dnn_predictor: FastFoundationStereoDisparity | None = field(default=None, init=False, repr=False)
     _dnn_predictor_key: tuple[Any, ...] | None = field(default=None, init=False, repr=False)
     _yolo_model: Any | None = field(default=None, init=False, repr=False)
     _yolo_model_key: tuple[Any, ...] | None = field(default=None, init=False, repr=False)
-    _last_yolo_segments: YoloSegments3D | None = field(default=None, init=False, repr=False)
+    _last_yolo_segments: DetectSegments3D | None = field(default=None, init=False, repr=False)
     _ros2_node: Any | None = field(default=None, init=False, repr=False)
     _ros2_publishers: dict[str, Any] = field(default_factory=dict, init=False, repr=False)
     _ros2_publishers_key: tuple[str, str] | None = field(default=None, init=False, repr=False)
@@ -582,23 +532,6 @@ class DepthController:
             **{key: getattr(self.backend_params, key) for key in BACKEND_KEYS},
         )
 
-    def _yolo_result(self) -> YoloStatusResult:
-        try:
-            import ultralytics  # noqa: F401
-            available = True
-            error = None
-        except ImportError as exc:
-            available = False
-            error = str(exc)
-
-        return YoloStatusResult(
-            configured=True,
-            model_loaded=self._yolo_model is not None,
-            ultralytics_available=available,
-            ultralytics_error=error,
-            **{key: getattr(self.yolo_params, key) for key in YOLO_KEYS},
-        )
-
     def _dnn_cache_key(self, backend: BackendParams) -> tuple[Any, ...]:
         values = [getattr(backend, key) for key in _DNN_CACHE_KEY_FIELDS]
         values[4] = int(values[4])
@@ -630,49 +563,6 @@ class DepthController:
         override_data = _model_to_dict(params)
         backend_data.update({key: override_data[key] for key in BACKEND_KEYS if override_data.get(key) is not None})
         return BackendParams(**backend_data)
-
-    def _effective_yolo(self, params: Any) -> YoloConfigParams:
-        yolo_data = {key: getattr(self.yolo_params, key) for key in YOLO_KEYS}
-        override_data = _model_to_dict(params)
-        yolo_data.update({key: override_data[key] for key in YOLO_KEYS if override_data.get(key) is not None})
-        return YoloConfigParams(**yolo_data)
-
-    def _yolo_cache_key(self, yolo: YoloConfigParams) -> tuple[Any, ...]:
-        return tuple(getattr(yolo, key) for key in _YOLO_CACHE_KEY_FIELDS)
-
-    def _get_yolo_model(self, yolo: YoloConfigParams) -> Any:
-        try:
-            from ultralytics import YOLO
-        except ImportError as exc:
-            raise ImportError("YOLO segmentation requires ultralytics: pip install ultralytics") from exc
-
-        cache_key = self._yolo_cache_key(yolo)
-        if self._yolo_model is None or self._yolo_model_key != cache_key:
-            self._yolo_model = YOLO(yolo.yolo_model_path)
-            self._yolo_model_key = cache_key
-        return self._yolo_model
-
-    def _run_yolo(self, rgb_image: np.ndarray, yolo: YoloConfigParams) -> Any:
-        model = self._get_yolo_model(yolo)
-        predict_kwargs: dict[str, Any] = {
-            "source": rgb_image,
-            "conf": float(yolo.yolo_conf),
-            "iou": float(yolo.yolo_iou),
-            "max_det": int(yolo.yolo_max_det),
-            "half": bool(yolo.yolo_half),
-            "verbose": bool(yolo.yolo_verbose),
-        }
-        if yolo.yolo_device is not None:
-            predict_kwargs["device"] = yolo.yolo_device
-        if yolo.yolo_imgsz is not None:
-            predict_kwargs["imgsz"] = int(yolo.yolo_imgsz)
-        if yolo.yolo_classes is not None:
-            predict_kwargs["classes"] = [int(value) for value in yolo.yolo_classes]
-
-        results = model.predict(**predict_kwargs)
-        if not results:
-            raise RuntimeError("YOLO returned no results")
-        return results[0]
 
     def _compute_rgb_aligned_depth(
         self,
@@ -756,7 +646,7 @@ class DepthController:
         )
         return depth_rgb_m, disparity, rect
 
-    def _yolo_result_to_segments(
+    def _detect_result_to_segments(
         self,
         *,
         yolo_result: Any,
@@ -777,14 +667,14 @@ class DepthController:
         save_pixels: bool,
         save_meta: bool,
         save_binary_pcd: bool,
-    ) -> YoloSegments3D:
+    ) -> DetectSegments3D:
         rgb_arr = np.asarray(rgb_image)
         rgb_h, rgb_w = rgb_arr.shape[:2]
 
         masks_obj = getattr(yolo_result, "masks", None)
         boxes_obj = getattr(yolo_result, "boxes", None)
 
-        empty = YoloSegments3D(
+        empty = DetectSegments3D(
             points_m=np.empty((0, 3), np.float64),
             colors_rgb=np.empty((0, 3), np.uint8),
             pixels_rgb=np.empty((0, 2), np.int32),
@@ -877,7 +767,7 @@ class DepthController:
             seg_dir = output_dir / "segments"
             seg_dir.mkdir(parents=True, exist_ok=True)
 
-        segments: list[YoloSegment3D] = []
+        segments: list[DetectSegment3D] = []
         combined_points: list[np.ndarray] = []
         combined_colors: list[np.ndarray] = []
         combined_pixels: list[np.ndarray] = []
@@ -925,7 +815,7 @@ class DepthController:
                     np.save(pixels_file, seg_pixels.astype(np.int32))
                     pixels_path = str(pixels_file)
 
-            seg = YoloSegment3D(
+            seg = DetectSegment3D(
                 instance_id=inst_id,
                 class_id=class_id,
                 class_name=class_name,
@@ -975,7 +865,7 @@ class DepthController:
             class_ids_out = np.empty((0,), np.int32)
             confidences_out = np.empty((0,), np.float32)
 
-        return YoloSegments3D(
+        return DetectSegments3D(
             points_m=points_out,
             colors_rgb=colors_out,
             pixels_rgb=pixels_out,
@@ -1023,7 +913,7 @@ class DepthController:
 
         return self._ros2_publishers
 
-    def _publish_segments_ros2(self, result: YoloSegments3D, params: Ros2PublishParams) -> Ros2PublishResult:
+    def _publish_segments_ros2(self, result: DetectSegments3D, params: Ros2PublishParams) -> Ros2PublishResult:
         try:
             import rclpy
             from ros2_utils import build_segment_ros_messages
@@ -1099,19 +989,9 @@ class DepthController:
         del params
         return self._backend_result()
 
-    def set_yolo(self, params: YoloConfigParams) -> YoloStatusResult:
-        old_cache_key = self._yolo_cache_key(self.yolo_params)
-        self.yolo_params = params
-        if old_cache_key != self._yolo_cache_key(params):
-            self._yolo_model = None
-            self._yolo_model_key = None
-        return self._yolo_result()
-
-    def yolo(self, params: EmptyParams) -> YoloStatusResult:
-        del params
-        return self._yolo_result()
-
     def to_pcd(self, params: ToPcdParams) -> ToPcdResult:
+
+        calibration=self._build_calibration(params.calibration)
         output_path = Path(params.output_pcd_path).expanduser()
         output_suffix = output_path.suffix.lower()
 
@@ -1123,7 +1003,7 @@ class DepthController:
             left_image=_read_image_or_npy(params.left_path, color=False),
             right_image=_read_image_or_npy(params.right_path, color=False),
             rgb_image=_read_image_or_npy(params.rgb_path, color=True),
-            calibration=self._build_calibration(params.calibration),
+            calibration=calibration,
             output_path=output_path if output_suffix == ".pcd" else None,
             min_disparity=float(params.min_disparity),
             max_depth_m=params.max_depth_m,
@@ -1171,21 +1051,21 @@ class DepthController:
             depth_mean_m=depth_mean_m,
             disparity_width=disparity_width,
             disparity_height=disparity_height,
+            calibration=str(calibration),
         )
 
-    def yolo_segments_to_pcd(self, params: ToYoloSegmentsParams) -> ToYoloSegmentsResult:
+    def detect_segments_to_pcd(self, params: ToYoloSegmentsParams) -> ToDetectSegmentsResult:
         output_dir = Path(params.output_dir).expanduser()
         output_dir.mkdir(parents=True, exist_ok=True)
 
         backend = self._effective_backend(params)
-        yolo = self._effective_yolo(params)
         calibration = self._build_calibration(params.calibration)
 
         left_image = _read_image_or_npy(params.left_path, color=False)
         right_image = _read_image_or_npy(params.right_path, color=False)
         rgb_image = _read_image_or_npy(params.rgb_path, color=True)
 
-        yolo_result = self._run_yolo(rgb_image, yolo)
+        yolo_result:YoloDetectResult = _read_detect_result(params.yolo_result_path)
         depth_rgb_m, disparity, rect = self._compute_rgb_aligned_depth(
             left_image=left_image,
             right_image=right_image,
@@ -1202,7 +1082,7 @@ class DepthController:
             splat_px=params.splat_px,
         )
 
-        result = self._yolo_result_to_segments(
+        result = self._detect_result_to_segments(
             yolo_result=yolo_result,
             depth_rgb_m=depth_rgb_m,
             disparity=disparity,
@@ -1214,31 +1094,31 @@ class DepthController:
             input_color_order=params.input_color_order,
             output_frame=params.output_frame,
             rgb_image_is_undistorted=params.rgb_image_is_undistorted,
-            mask_threshold=params.mask_threshold,
-            overlap_policy=params.overlap_policy,
-            min_points=params.min_points,
-            save_pcd=params.save_pcd,
-            save_pixels=params.save_pixels,
-            save_meta=params.save_meta,
+            # mask_threshold=params.mask_threshold,
+            # overlap_policy=params.overlap_policy,
+            # min_points=params.min_points,
+            # save_pcd=params.save_pcd,
+            # save_pixels=params.save_pixels,
+            # save_meta=params.save_meta,
             save_binary_pcd=params.save_binary_pcd,
         )
         self._last_yolo_segments = result
 
-        instance_map_path = None
-        depth_rgb_path = None
-        combined_npz_path = None
-        if params.save_instance_map:
-            path = output_dir / f"{params.frame_name}_instance_map.npy"
-            np.save(path, result.instance_map.astype(np.uint32))
-            instance_map_path = str(path)
-        if params.save_depth_rgb and result.depth_rgb_m is not None:
-            path = output_dir / f"{params.frame_name}_depth_rgb_m.npy"
-            np.save(path, result.depth_rgb_m.astype(np.float32))
-            depth_rgb_path = str(path)
-        if params.save_combined_npz:
-            path = output_dir / f"{params.frame_name}_segments_combined.npz"
-            _save_segments_npz(path, result)
-            combined_npz_path = str(path)
+        # instance_map_path = None
+        # depth_rgb_path = None
+        # combined_npz_path = None
+        # if params.save_instance_map:
+        #     path = output_dir / f"{params.frame_name}_instance_map.npy"
+        #     np.save(path, result.instance_map.astype(np.uint32))
+        #     instance_map_path = str(path)
+        # if params.save_depth_rgb and result.depth_rgb_m is not None:
+        #     path = output_dir / f"{params.frame_name}_depth_rgb_m.npy"
+        #     np.save(path, result.depth_rgb_m.astype(np.float32))
+        #     depth_rgb_path = str(path)
+        # if params.save_combined_npz:
+        #     path = output_dir / f"{params.frame_name}_segments_combined.npz"
+        #     _save_segments_npz(path, result)
+        #     combined_npz_path = str(path)
 
         ros2_result = None
         if params.ros2_publish:
@@ -1257,17 +1137,17 @@ class DepthController:
         depth_min_m, depth_max_m, depth_mean_m = _depth_statistics(result.points_m)
         disparity_height, disparity_width = (None, None) if result.disparity is None else result.disparity.shape[:2]
 
-        return ToYoloSegmentsResult(
+        return ToDetectSegmentsResult(
             backend=backend.backend,
-            yolo_model_path=yolo.yolo_model_path,
+            yolo_model_path=yolo_result.yolo_config.model_name,
             output_dir=str(output_dir),
             frame_name=params.frame_name,
             output_frame=result.output_frame,
             point_count=int(len(result.points_m)),
             segment_count=int(len(result.segments)),
-            instance_map_path=instance_map_path,
-            depth_rgb_path=depth_rgb_path,
-            combined_npz_path=combined_npz_path,
+            # instance_map_path=instance_map_path,
+            # depth_rgb_path=depth_rgb_path,
+            # combined_npz_path=combined_npz_path,
             disparity_width=disparity_width,
             disparity_height=disparity_height,
             depth_min_m=depth_min_m,
@@ -1304,7 +1184,7 @@ class DepthController:
         )
 
 
-def run_server(controller_name: str = "depth") -> None:
+def run_server(controller_name: str = "pcd") -> None:
     from iox2_jsonrpc.iceoryx import Iox2JsonRpcServer
 
     Iox2JsonRpcServer(DepthController(controller_name=controller_name)).run_forever()

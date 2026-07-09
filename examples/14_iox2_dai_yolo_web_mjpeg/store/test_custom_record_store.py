@@ -13,7 +13,7 @@ class CustomRecordStoreTests(unittest.TestCase):
     def test_timestamp_roundtrip(self):
         ts = 1783521310000000000
         record_id = record_id_from_timestamp_ns(ts, 1)
-        self.assertEqual(record_id, "143510.000000000Z_001")
+        self.assertEqual(record_id, "143510.000000000JST")
         self.assertEqual(timestamp_ns_from_date_and_record_id("2026-07-08", record_id), ts)
 
     def test_rgb_stereo_minimal_record_validation(self):

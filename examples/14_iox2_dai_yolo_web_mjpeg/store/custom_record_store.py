@@ -531,11 +531,6 @@ class CustomRecord(BaseModel):
         )
     
     @property
-    def datetime_utc(self) -> str:
-        """Return this record timestamp as an ISO-like UTC string."""
-        return datetime_utc_from_timestamp_ns(self.timestamp_ns_utc)
-
-    @property
     def image_path(self) -> Path:
         return self.path / "imgs"
     
@@ -577,6 +572,12 @@ class CustomRecord(BaseModel):
         else:
             return None
         
+    @property
+    def expect_stereo_calib(self) -> Path | None:
+        if self.is_stereo:
+            return self.path / "calib" / f"{RGB_STEREO_CAM_NAME}.json"
+        else:
+            return None
     @property
     def expect_pcd_path(self) -> Path | None:
         if self.is_stereo:

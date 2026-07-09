@@ -1,4 +1,6 @@
 import contextlib
+import json
+from pathlib import Path
 import time
 import traceback
 from dataclasses import dataclass
@@ -11,6 +13,27 @@ try:
 except Exception:  # Allows this file to run standalone during local tests.
     def logger(msg: str, level: str = "info"):
         print(f"[{level}] {msg}")
+
+
+DEPTHAI_DISTORTION_COEFF_NAMES = [
+    "k1", "k2", "p1", "p2", "k3", "k4", "k5", "k6",
+    "s1", "s2", "s3", "s4", "tau_x", "tau_y",
+]
+
+
+def _json_float_matrix(value) -> list[list[float]]:
+    return [[float(x) for x in row] for row in value]
+
+
+def _json_float_vector(value) -> list[float]:
+    return [float(x) for x in value]
+
+
+def _safe_float(value, default=None):
+    try:
+        return float(value)
+    except Exception:
+        return default
 
 
 @dataclass(frozen=True)
@@ -70,7 +93,7 @@ class _DepthAIPoeRGBStereoMjpegCapture:
     """
 
     def __init__(self, owner, source: str, idx: int):
-        self.owner = owner
+        self.owner:DepthAIPoeRGBStereoMjpegGenerator = owner
         self.source = source
         self.idx = idx
 
@@ -89,6 +112,8 @@ class _DepthAIPoeRGBStereoMjpegCapture:
 
         self._released = False
         self._exit_stack = contextlib.ExitStack()
+
+        self.calibration: dict[str, Any] | None = None
 
         self._start()
 
@@ -187,7 +212,7 @@ class _DepthAIPoeRGBStereoMjpegCapture:
         return encoder
 
     def _create_depthai_pipeline(self):
-        owner = self.owner
+        owner:DepthAIPoeRGBStereoMjpegGenerator = self.owner
 
         raw_pipeline = dai.Pipeline(self.device)
         if hasattr(raw_pipeline, "__enter__"):
@@ -270,7 +295,7 @@ class _DepthAIPoeRGBStereoMjpegCapture:
         logger(f"[{self.owner.uuid}:{path}] {msg}", level=level)
 
     def _start(self):
-        owner = self.owner
+        owner:DepthAIPoeRGBStereoMjpegGenerator = self.owner
 
         self._log("info", "Opening DepthAI device...")
         self.device = self._open_device()
@@ -278,6 +303,10 @@ class _DepthAIPoeRGBStereoMjpegCapture:
         self._log("info", "Connected DepthAI device:")
         self._log("status", f"  Device ID: {self.device.getDeviceInfo().getDeviceId()}")
         self._log("status", f"  Cameras: {self.device.getConnectedCameras()}")
+
+        self.calibration = self.owner.calibration = self.read_calibration_dict()
+        self._log("info", "DepthAI calibration loaded.")
+        self._log("status", f"DepthAI calibration {self.calibration}")
 
         self._log("info", "Starting DepthAI RGB + stereo MJPEG streaming pipeline:")
         self._log("status", f"  Source: {self.source}")
@@ -477,6 +506,156 @@ class _DepthAIPoeRGBStereoMjpegCapture:
         self._log("info", "DepthAI MJPEG resource release completed")
 
 
+    def _read_default_resolution(self, calib, socket, fallback: tuple[int, int]) -> list[int]:
+        try:
+            _matrix, width, height = calib.getDefaultIntrinsics(socket)
+            return [int(width), int(height)]
+        except Exception as e:
+            self._log("warning", f"could not read default resolution for {socket}: {e}")
+            return [int(fallback[0]), int(fallback[1])]
+
+    def _read_intrinsics(self, calib, socket, width: int, height: int) -> list[list[float]]:
+        try:
+            return _json_float_matrix(calib.getCameraIntrinsics(socket, int(width), int(height)))
+        except TypeError:
+            # Some DepthAI versions also allow getCameraIntrinsics(socket)
+            return _json_float_matrix(calib.getCameraIntrinsics(socket))
+        except Exception as e:
+            self._log("warning", f"could not read intrinsics for {socket}: {e}")
+            return [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 1.0]]
+
+    def _read_distortion(self, calib, socket) -> list[float]:
+        try:
+            return _json_float_vector(calib.getDistortionCoefficients(socket))
+        except Exception as e:
+            self._log("warning", f"could not read distortion coefficients for {socket}: {e}")
+            return []
+
+    def _read_extrinsics(self, calib, from_socket, to_socket) -> list[list[float]]:
+        try:
+            return _json_float_matrix(calib.getCameraExtrinsics(from_socket, to_socket))
+        except Exception as e:
+            self._log("warning", f"could not read extrinsics {from_socket} -> {to_socket}: {e}")
+            return [
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ]
+
+    def read_calibration_dict(self) -> dict[str, Any]:
+        """
+        Read DepthAI calibration from the connected device and normalize it into
+        the same shape as DEFAULT_CALIBRATION.
+
+        This does not decode frames and does not require cv2/numpy/torch.
+        """
+        if self.device is None:
+            raise RuntimeError("DepthAI device is not open")
+
+        owner:DepthAIPoeRGBStereoMjpegGenerator = self.owner
+        calib = self.device.readCalibration()
+
+        rgb_socket = self._camera_socket(owner.rgb_camera_socket)
+        left_socket = self._camera_socket(owner.left_camera_socket)
+        right_socket = self._camera_socket(owner.right_camera_socket)
+
+        rgb_resolution = self._read_default_resolution(
+            calib,
+            rgb_socket,
+            fallback=(owner.rgb_width, owner.rgb_height),
+        )
+        left_resolution = self._read_default_resolution(
+            calib,
+            left_socket,
+            fallback=(owner.stereo_width, owner.stereo_height),
+        )
+        right_resolution = self._read_default_resolution(
+            calib,
+            right_socket,
+            fallback=(owner.stereo_width, owner.stereo_height),
+        )
+
+        result: dict[str, Any] = {
+            "rgb_resolution": rgb_resolution,
+            "left_resolution": left_resolution,
+            "right_resolution": right_resolution,
+
+            # In practice, DepthAI stereo baseline APIs report centimeters.
+            # Your sample translation values around -7.5 match an OAK stereo baseline in cm.
+            "stereo_translation_units_hint": (
+                "DepthAI calibration extrinsic translation values are device calibration "
+                "units; Luxonis stereo baseline APIs report centimeters."
+            ),
+
+            "rgb_intrinsics": self._read_intrinsics(
+                calib, rgb_socket, owner.rgb_width, owner.rgb_height
+            ),
+            "left_intrinsics": self._read_intrinsics(
+                calib, left_socket, owner.stereo_width, owner.stereo_height
+            ),
+            "right_intrinsics": self._read_intrinsics(
+                calib, right_socket, owner.stereo_width, owner.stereo_height
+            ),
+
+            "left_to_right_extrinsics": self._read_extrinsics(
+                calib, left_socket, right_socket
+            ),
+            "left_to_rgb_extrinsics": self._read_extrinsics(
+                calib, left_socket, rgb_socket
+            ),
+
+            "rgb_distortion": self._read_distortion(calib, rgb_socket),
+            "left_distortion": self._read_distortion(calib, left_socket),
+            "right_distortion": self._read_distortion(calib, right_socket),
+
+            "distortion_coeff_order": DEPTHAI_DISTORTION_COEFF_NAMES,
+        }
+
+        # Optional helpful metadata.
+        try:
+            eeprom = calib.getEepromData()
+            result["board_name"] = getattr(eeprom, "boardName", None)
+            result["product_name"] = getattr(eeprom, "productName", None)
+        except Exception:
+            pass
+
+        try:
+            result["device_id"] = self.device.getDeviceInfo().getDeviceId()
+        except Exception:
+            pass
+
+        try:
+            if hasattr(calib, "getBaselineDistance"):
+                result["stereo_baseline_cm"] = _safe_float(calib.getBaselineDistance())
+        except Exception:
+            pass
+
+        try:
+            if hasattr(calib, "getFov"):
+                result["rgb_fov_deg"] = _safe_float(calib.getFov(rgb_socket))
+                result["left_fov_deg"] = _safe_float(calib.getFov(left_socket))
+                result["right_fov_deg"] = _safe_float(calib.getFov(right_socket))
+        except Exception:
+            pass
+
+        return result
+
+    def save_calibration_json(self, path: str | Path) -> None:
+        calibration = self.read_calibration_dict()
+        path = Path(path)
+        path.write_text(json.dumps(calibration, indent=2), encoding="utf-8")
+
+    def save_raw_depthai_eeprom_json(self, path: str | Path) -> None:
+        """
+        Save Luxonis' raw EEPROM calibration JSON, if you also want the vendor dump.
+        """
+        if self.device is None:
+            raise RuntimeError("DepthAI device is not open")
+
+        calib = self.device.readCalibration()
+        calib.eepromToJsonFile(str(path))
+
 class DepthAIPoeRGBStereoMjpegGenerator:
     """
     Low-latency DepthAI PoE RGB + stereo MJPEG generator.
@@ -549,6 +728,8 @@ class DepthAIPoeRGBStereoMjpegGenerator:
     )
 
     def __init__(self, *args, uuid: str = "DepthAI-MJPEG", sources=None, **kwargs):
+        self.calibration: dict[str, Any] | None = None
+
         if args:
             raise TypeError(
                 "DepthAIPoeRGBStereoMjpegGenerator accepts keyword arguments only. "

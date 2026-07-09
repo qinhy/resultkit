@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import multiprocessing as mp
 import queue as py_queue
 import struct
@@ -15,7 +16,7 @@ import numpy as np
 from common import EmptyParams, RpcModel, openapi_doc
 from resultkit.MatModel import CodecFormat, ColorFormat, Model4Mat
 from resultkit.dai.rgb_stereo_mjpeg_generator import DepthAIPoeRGBStereoMjpegGenerator
-
+from pcd_utils import StereoRgbCalibration
 
 parser = argparse.ArgumentParser(description="Run the DepthAI MJPEG camera RPC server.")
 parser.add_argument("--service-name", default="jrpc", help="iceoryx2 service name")
@@ -101,6 +102,11 @@ class CameraStatusResult(CameraBaseModel):
     encoded_payload_format: str = BUNDLE_FORMAT
     encoded_buffer_capacity_bytes: int
 
+    calibration_ready: bool = False
+    calibration: dict[str, Any] | None = None
+    stereo_baseline_cm: float | None = None
+    calibration_error: str | None = None
+
     last_frame_id: int | None = None
     last_frame_age_s: float | None = None
     last_encoded_nbytes: int | None = None
@@ -110,6 +116,17 @@ class CameraStatusResult(CameraBaseModel):
 
     camera_restart_count: int = 0
     process_restart_count: int = 0
+
+
+class CameraCalibrationResult(CameraBaseModel):
+    opened: bool
+    worker_alive: bool
+    worker_state: str | None = None
+    last_error: str | None = None
+    calibration_ready: bool = False
+    calibration: dict[str, Any] | None = None
+    stereo_baseline_cm: float | None = None
+    calibration_error: str | None = None
 
 
 @dataclass(frozen=True)
@@ -432,6 +449,7 @@ class CameraWorker:
     stop_event: Any
     frame_id: int = 0
     camera_restart_count: int = 0
+    calibration: dict[str, Any] | None = None
 
     def run(self) -> None:
         print("DepthAI MJPEG camera worker starting.", flush=True)
@@ -514,6 +532,22 @@ class CameraWorker:
             for frame in gen:
                 if self.stop_event.is_set():
                     break
+                
+                if self.frame_id==0:                    
+                    try:
+                        calibration_dict = json.loads(json.dumps(gen.calibration))
+                    except Exception:
+                        calibration_dict = gen.calibration
+
+                    self.calibration = calibration_dict
+
+                    emit_status(
+                        self.status_queue,
+                        "calibration",
+                        calibration=calibration_dict,
+                        camera_restart_count=self.camera_restart_count,
+                        last_frame_id=self.frame_id or None,
+                    )
 
                 self.frame_id += 1
                 last_timestamp_s = time.time()
@@ -608,8 +642,13 @@ class CameraController:
     _camera_restart_count: int = field(default=0, init=False, repr=False)
     _process_restart_count: int = field(default=0, init=False, repr=False)
 
+    _calibration_dict: dict[str, Any] | None = field(default=None, init=False, repr=False)
+    _stereo_baseline_cm: float | None = field(default=None, init=False, repr=False)
+    _calibration_error: str | None = field(default=None, init=False, repr=False)
+
     _watchdog_thread: threading.Thread | None = field(default=None, init=False, repr=False)
     _watchdog_stop: threading.Event = field(default_factory=threading.Event, init=False, repr=False)
+    
 
     @staticmethod
     def openapi_examples() -> dict[str, Any]:
@@ -617,6 +656,7 @@ class CameraController:
             **openapi_doc("camera_status", id=1, params={}),
             **openapi_doc("camera_start", id=2, params=model_to_dict(CameraConfig())),
             **openapi_doc("camera_stop", id=3, params={}),
+            **openapi_doc("camera_calibration", id=4, params={}),
         }
 
     def _is_worker_alive(self) -> bool:
@@ -640,11 +680,36 @@ class CameraController:
         self._camera_restart_count = 0
         self._process_restart_count = 0
 
+        self._calibration_dict = None
+        self._stereo_baseline_cm = None
+        self._calibration_error = None
+
     def _apply_worker_status_unlocked(self, msg: dict[str, Any]) -> None:
         if msg.get("state"):
             self._last_worker_state = str(msg["state"])
         if msg.get("error"):
             self._last_error = str(msg["error"])
+
+        if "calibration" in msg:
+            calibration = msg.get("calibration")
+
+            if isinstance(calibration, dict):
+                self._calibration_dict = calibration
+                self._calibration_error = None
+
+                try:
+                    pcd_calibration = StereoRgbCalibration.from_dict(
+                        calibration,
+                        source_translation_unit="cm",
+                    )
+                    self._stereo_baseline_cm = pcd_calibration.stereo_baseline_cm
+                except Exception:
+                    self._stereo_baseline_cm = None
+                    self._calibration_error = traceback.format_exc()
+            else:
+                self._calibration_error = (
+                    f"Worker sent invalid calibration payload type: {type(calibration).__name__}"
+                )
 
         self._camera_restart_count = int_or_keep(
             self._camera_restart_count,
@@ -800,6 +865,12 @@ class CameraController:
             encoded_topic=self.config.encoded_topic,
             encoded_payload_format=BUNDLE_FORMAT,
             encoded_buffer_capacity_bytes=self.config.encoded_buffer_capacity_bytes,
+
+            calibration_ready=self._calibration_dict is not None,
+            calibration=self._calibration_dict,
+            stereo_baseline_cm=self._stereo_baseline_cm,
+            calibration_error=self._calibration_error,
+
             last_frame_id=self._last_frame_id,
             last_frame_age_s=age_s,
             last_encoded_nbytes=self._last_encoded_nbytes,
@@ -838,6 +909,19 @@ class CameraController:
         with self._state_lock:
             return self._status_unlocked()
 
+    def calibration(self, params: EmptyParams) -> CameraCalibrationResult:
+        with self._state_lock:
+            self._drain_status_queue_unlocked()
+            return CameraCalibrationResult(
+                opened=bool(self.opened),
+                worker_alive=self._is_worker_alive(),
+                worker_state=self._last_worker_state,
+                last_error=self._last_error,
+                calibration_ready=self._calibration_dict is not None,
+                calibration=self._calibration_dict,
+                stereo_baseline_cm=self._stereo_baseline_cm,
+                calibration_error=self._calibration_error,
+            )
 
 def run_server(service_name: str = "serverCam", controller_name: str = "camera") -> None:
     from iox2_jsonrpc.iceoryx import Iox2JsonRpcServer

@@ -51,7 +51,7 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal, Mapping
+from typing import Any, Mapping
 
 import numpy as np
 import requests
@@ -95,12 +95,14 @@ from server_rgb_stereo import BUNDLE_MAGIC as RGB_STEREO_MAGIC
 from server_rgb_stereo import BUNDLE_VERSION as RGB_STEREO_VERSION
 from server_rgb_stereo import BUNDLE_FORMAT as RGB_STEREO_FORMAT
 from server_rgb_stereo import BUNDLE_HEADER as RGB_STEREO_HEADER
-from server_dual_rgb import BUNDLE_PREFIX as RGB_STEREO_PREFIX
-from server_dual_rgb import BUNDLE_TYPE as RGB_STEREO_TYPE
+from server_rgb_stereo import BUNDLE_PREFIX as RGB_STEREO_PREFIX
+from server_rgb_stereo import BUNDLE_TYPE as RGB_STEREO_TYPE
 from server_rgb_stereo import CAM_MODE as RGB_STEREO_CAM_MODE
 
 from store.custom_record_store import VALID_MODES
 from store.custom_record_store import DUAL_RGB_CAM_NAME_0, DUAL_RGB_CAM_NAME_1, RGB_STEREO_CAM_NAME
+
+REST_URL_BASE="http://localhost:8000"
 
 
 def default_dual_rgb_topic() -> str:
@@ -110,6 +112,13 @@ def default_dual_rgb_topic() -> str:
 def default_rgb_stereo_topic() -> str:
     return f"{DEFAULT_CAMERA_SERVICE_NAME}:{args.rgb_stereo_controller}:{RGB_STEREO_PREFIX}_{RGB_STEREO_TYPE}"
 
+
+def default_dual_rgb_rest(func="status") -> str:
+    return f"{REST_URL_BASE}/controllers/{args.dual_rgb_controller}/{func}"
+
+
+def default_rgb_stereo_rest(func="status") -> str:
+    return f"{REST_URL_BASE}/controllers/{args.rgb_stereo_controller}/{func}"
 
 class StoreBaseModel(RpcModel):
     service: str = args.service_name
@@ -179,10 +188,8 @@ class CaptureResult(StoreBaseModel):
     frame_index: int | None = None
     timestamp_ns_utc: int | None = None
     images: list[str] = []
+    db_record: CustomRecord | None = None
     validation_issues: list[str] = []
-    yolo: dict[str, Any] | None = None
-    pcd: dict[str, Any] | None = None
-    ros2: dict[str, Any] | None = None
     error: str | None = None
 
 
@@ -424,7 +431,7 @@ class ModeSubscriber:
                 continue
 
             try:
-                if self.mode == RGB_STEREO_CAM_MODE:
+                if self.mode == DUAL_RGB_CAM_MODE:
                     bundle = unpack_dual_rgb_mjpeg_bundle(pkt)
                 else:
                     bundle = unpack_rgb_stereo_mjpeg_bundle(pkt)
@@ -452,46 +459,6 @@ class ModeSubscriber:
 # ---------------------------------------------------------------------------
 # Record writing
 # ---------------------------------------------------------------------------
-
-
-def add_default_calibration(record: CustomRecord, frame: CapturedFrame) -> None:
-    if frame.mode == RGB_STEREO_CAM_MODE:
-        bundle = frame.bundle
-        assert isinstance(bundle, DualRGBMjpegBundle)
-        calib = {
-            "source": "server_store_default",
-            "note": "Replace with real camera calibration when available.",
-            "width": bundle.rgb_width,
-            "height": bundle.rgb_height,
-        }
-        record.add_calibration(DUAL_RGB_CAM_NAME_0, {**calib, "camera": DUAL_RGB_CAM_NAME_0})
-        record.add_calibration(DUAL_RGB_CAM_NAME_1, {**calib, "camera": DUAL_RGB_CAM_NAME_1})
-        record.add_extrinsics(
-            {
-                "source": "server_store_default",
-                "note": "Identity placeholder; replace with measured cam_from to cam_to extrinsics.",
-                "from": DUAL_RGB_CAM_NAME_0,
-                "to": DUAL_RGB_CAM_NAME_1,
-                "translation_m": [0.0, 0.0, 0.0],
-                "rotation_xyzw": [0.0, 0.0, 0.0, 1.0],
-            }
-        )
-    else:
-        bundle = frame.bundle
-        assert isinstance(bundle, RGBStereoMjpegBundle)
-        record.add_calibration(
-            RGB_STEREO_CAM_NAME,
-            {
-                "source": "server_store_default",
-                "note": "Replace with real RGB/stereo calibration when available.",
-                "camera": RGB_STEREO_CAM_NAME,
-                "rgb_width": bundle.rgb_width,
-                "rgb_height": bundle.rgb_height,
-                "stereo_width": bundle.stereo_width,
-                "stereo_height": bundle.stereo_height,
-            },
-        )
-
 
 def add_gis_payload(record: CustomRecord, gis: Any | None) -> None:
     """Write canonical GIS files, even if the request does not provide GIS."""
@@ -566,7 +533,8 @@ def save_frame_to_store(
     frame: CapturedFrame,
     *,
     field_id: str,
-    gis: Any | None,
+    gis: Any | None = None,
+    calib: Any | None = None,
 ) -> tuple[CustomRecord, list[str]]:
     # Use wall-clock UTC for the record directory. Camera pts_ns is a frame PTS, not UTC.
     timestamp_ns_utc = utc_now_ns()
@@ -587,15 +555,39 @@ def save_frame_to_store(
     else:
         raise FileExistsError(f"Could not allocate unique record_id: {last_error}")
 
-    add_default_calibration(record, frame)
     add_gis_payload(record, gis)
 
-    if frame.mode == RGB_STEREO_CAM_MODE:
-        assert isinstance(frame.bundle, DualRGBMjpegBundle)
+    if frame.mode == DUAL_RGB_CAM_MODE:
+        bundle = frame.bundle
+        assert isinstance(bundle, DualRGBMjpegBundle)
+        calib = {
+            "source": "server_store_default",
+            "note": "Replace with real camera calibration when available.",
+            "width": bundle.rgb_width,
+            "height": bundle.rgb_height,
+        }
+        record.add_calibration(DUAL_RGB_CAM_NAME_0, {**calib, "camera": DUAL_RGB_CAM_NAME_0})
+        record.add_calibration(DUAL_RGB_CAM_NAME_1, {**calib, "camera": DUAL_RGB_CAM_NAME_1})
+        record.add_extrinsics(
+            {
+                "source": "server_store_default",
+                "note": "Identity placeholder; replace with measured cam_from to cam_to extrinsics.",
+                "from": DUAL_RGB_CAM_NAME_0,
+                "to": DUAL_RGB_CAM_NAME_1,
+                "translation_m": [0.0, 0.0, 0.0],
+                "rotation_xyzw": [0.0, 0.0, 0.0, 1.0],
+            }
+        )
+
         images = save_dual_rgb_images(record, frame.bundle)
-    else:
-        assert isinstance(frame.bundle, RGBStereoMjpegBundle)
+
+    if frame.mode == RGB_STEREO_CAM_MODE:
+        bundle = frame.bundle
+        assert isinstance(bundle, RGBStereoMjpegBundle)
+        if calib is not None:
+            record.add_calibration(RGB_STEREO_CAM_NAME,calib)
         images = save_rgb_stereo_images(record, frame.bundle)
+
 
     write_json(
         record.path / "logs" / "capture_frame.json",
@@ -672,24 +664,23 @@ class StoreController:
     _subscribers: dict[str, ModeSubscriber] = field(default_factory=dict, init=False, repr=False)
     _last_error: str | None = field(default=None, init=False, repr=False)
     _last_capture: dict[str, Any] | None = field(default=None, init=False, repr=False)
+    _calibration_dicts: dict[str, dict] = field(default_factory=dict, init=False, repr=False)
 
     @staticmethod
     def openapi_examples() -> dict[str, Any]:
         return {
             **openapi_doc("store_status", id=1, params={}),
             **openapi_doc("store_configure", id=2, params=model_to_dict(StoreConfig())),
-            **openapi_doc("store_watch", id=3, params={"mode": DUAL_RGB_CAM_MODE}),
-            **openapi_doc(
-                "store_capture",
-                id=4,
-                params={"mode": DUAL_RGB_CAM_MODE, "field_id": "field_01", "gis": None},
+            **openapi_doc("store_watch", id=3, params={"mode": RGB_STEREO_CAM_MODE}),
+            **openapi_doc("store_capture",id=4,
+                params={"mode": RGB_STEREO_CAM_MODE, "field_id": "field_01", "gis": None},
             ),
         }
 
     def _topic_for_mode(self, mode: RecordMode) -> str:
-        if mode == RGB_STEREO_CAM_MODE:
-            return self.config.dual_rgb_topic
         if mode == DUAL_RGB_CAM_MODE:
+            return self.config.dual_rgb_topic
+        if mode == RGB_STEREO_CAM_MODE:
             return self.config.rgb_stereo_topic
         raise ValueError(f"Unsupported mode: {mode!r}")
 
@@ -738,6 +729,12 @@ class StoreController:
             mode = params.mode
             try:
                 sub = self._ensure_subscriber_unlocked(mode)
+                if mode not in self._calibration_dicts:
+                    if mode == DUAL_RGB_CAM_MODE:
+                        calib = requests.get(default_dual_rgb_rest("calibration"))
+                    if mode == RGB_STEREO_CAM_MODE:
+                        calib = requests.get(default_rgb_stereo_rest("calibration"))
+                    self._calibration_dicts[mode] = calib.json()
                 self._last_error = None
                 return WatchResult(ok=True, mode=mode, topic=sub.topic, subscribed_modes=sorted(self._subscribers.keys()))
             except Exception:
@@ -775,14 +772,18 @@ class StoreController:
                 frame = sub.read_one(timeout_s, fresh=bool(params.fresh_frame))
 
                 store = CustomStore(self.config.root_path)
+                calib = self._calibration_dicts.get(mode)
                 record, images = save_frame_to_store(
                     store,
                     frame,
                     field_id=field_id,
                     gis=params.gis,
+                    calib=calib,
                 )
-
+                payload = {"db_record": json.loads(record.model_dump_json())}
                 for hook_url in params.hook_urls:
+                    # res = requests.get(hook_url, params=params, timeout=0.5)
+                    # print(res)
                     try:
                         # hook_url = "http://localhost:8000/controllers/yolo/start"
                         # db_record = {
@@ -794,15 +795,13 @@ class StoreController:
                         #     "date_utc": "1970-01-01",
                         #     "path": r"dual_rgb\1970-01-01\null\000000.000000000JST",
                         # }
-                        params = {"db_record": json.dumps(record)}
-                        def push_request(hook_url=hook_url, params=params):
+                        def push_request(hook_url=hook_url, payload=payload):
                             try:
-                                requests.get(hook_url, params=params, timeout=0.5)
+                                requests.post(hook_url, json=payload, timeout=0.5)
                             except requests.RequestException:
                                 pass  # ignore timeout / connection errors
                         executor = ThreadPoolExecutor(max_workers=8)
                         executor.submit(push_request)
-
                     except Exception:
                         pass
 
@@ -818,6 +817,7 @@ class StoreController:
                     "frame_index": frame.frame_index,
                     "timestamp_ns_utc": record.timestamp_ns_utc,
                     "images": images,
+                    **payload,
                 }
                 self._last_capture = result_dict
                 self._last_error = None
