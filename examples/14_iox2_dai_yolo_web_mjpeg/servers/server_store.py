@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+from concurrent.futures import ThreadPoolExecutor
 import json
 import subprocess
 import threading
@@ -53,6 +54,7 @@ from pathlib import Path
 from typing import Any, Literal, Mapping
 
 import numpy as np
+import requests
 
 from common import EmptyParams, RpcModel, openapi_doc, CustomRecord, CustomStore, RecordMode
 from resultkit.MatModel import CodecFormat, ColorFormat, Model4Mat
@@ -74,15 +76,6 @@ parser.add_argument("--no-auto-subscribe-on-capture", dest="auto_subscribe_on_ca
 parser.add_argument("--save-original-mjpeg", action="store_true", default=True, help="deprecated no-op; MJPEG/JPEG frames are always saved as canonical .jpg images")
 parser.add_argument("--no-save-original-mjpeg", dest="save_original_mjpeg", action="store_false", help="deprecated no-op; canonical camera images are still saved as .jpg")
 parser.add_argument("--require-png", action="store_true", default=False, help="deprecated no-op; camera frames are not decoded to PNG")
-parser.add_argument("--yolo-url", default=None, help="optional HTTP JSON-RPC endpoint for server_yolo")
-parser.add_argument("--yolo-method", default="capture", help="JSON-RPC method name for server_yolo")
-parser.add_argument("--yolo-command", default=None, help="optional shell command hook for server_yolo")
-parser.add_argument("--pcd-url", default=None, help="optional HTTP JSON-RPC endpoint for server_pcd")
-parser.add_argument("--pcd-method", default="capture", help="JSON-RPC method name for server_pcd")
-parser.add_argument("--pcd-command", default=None, help="optional shell command hook for server_pcd")
-parser.add_argument("--hook-timeout-s", type=float, default=60.0)
-parser.add_argument("--ros2-pcd-topic", default="/pcds", help="ROS2 topic name used by --ros2-publish-command")
-parser.add_argument("--ros2-publish-command", default=None, help="optional command that publishes a PCD; receives {pcd_path} and {topic}")
 args = parser.parse_args()
 
 
@@ -94,21 +87,28 @@ from server_dual_rgb import BUNDLE_MAGIC as DUAL_RGB_MAGIC
 from server_dual_rgb import BUNDLE_VERSION as DUAL_RGB_VERSION
 from server_dual_rgb import BUNDLE_FORMAT as DUAL_RGB_FORMAT
 from server_dual_rgb import BUNDLE_HEADER as DUAL_RGB_HEADER
+from server_dual_rgb import BUNDLE_PREFIX as DUAL_RGB_PREFIX
+from server_dual_rgb import BUNDLE_TYPE as DUAL_RGB_TYPE
+from server_dual_rgb import CAM_MODE as DUAL_RGB_CAM_MODE
 
 from server_rgb_stereo import BUNDLE_MAGIC as RGB_STEREO_MAGIC
 from server_rgb_stereo import BUNDLE_VERSION as RGB_STEREO_VERSION
 from server_rgb_stereo import BUNDLE_FORMAT as RGB_STEREO_FORMAT
 from server_rgb_stereo import BUNDLE_HEADER as RGB_STEREO_HEADER
+from server_dual_rgb import BUNDLE_PREFIX as RGB_STEREO_PREFIX
+from server_dual_rgb import BUNDLE_TYPE as RGB_STEREO_TYPE
+from server_rgb_stereo import CAM_MODE as RGB_STEREO_CAM_MODE
 
-VALID_MODES: tuple[RecordMode, ...] = ("dual_rgb", "rgb_stereo")
+from store.custom_record_store import VALID_MODES
+from store.custom_record_store import DUAL_RGB_CAM_NAME_0, DUAL_RGB_CAM_NAME_1, RGB_STEREO_CAM_NAME
 
 
 def default_dual_rgb_topic() -> str:
-    return f"{DEFAULT_CAMERA_SERVICE_NAME}:{args.dual_rgb_controller}:dual_rgb_mjpeg"
+    return f"{DEFAULT_CAMERA_SERVICE_NAME}:{args.dual_rgb_controller}:{DUAL_RGB_PREFIX}_{DUAL_RGB_TYPE}"
 
 
 def default_rgb_stereo_topic() -> str:
-    return f"{DEFAULT_CAMERA_SERVICE_NAME}:{args.rgb_stereo_controller}:rgb_stereo_mjpeg"
+    return f"{DEFAULT_CAMERA_SERVICE_NAME}:{args.rgb_stereo_controller}:{RGB_STEREO_PREFIX}_{RGB_STEREO_TYPE}"
 
 
 class StoreBaseModel(RpcModel):
@@ -128,18 +128,6 @@ class StoreConfig(StoreBaseModel):
     save_original_mjpeg: bool = args.save_original_mjpeg
     require_png: bool = args.require_png
 
-    yolo_url: str | None = args.yolo_url
-    yolo_method: str = args.yolo_method
-    yolo_command: str | None = args.yolo_command
-
-    pcd_url: str | None = args.pcd_url
-    pcd_method: str = args.pcd_method
-    pcd_command: str | None = args.pcd_command
-
-    hook_timeout_s: float = args.hook_timeout_s
-    ros2_pcd_topic: str = args.ros2_pcd_topic
-    ros2_publish_command: str | None = args.ros2_publish_command
-
 
 class WatchParams(StoreBaseModel):
     mode: RecordMode
@@ -155,6 +143,8 @@ class CaptureParams(StoreBaseModel):
     call_yolo: bool = False
     call_pcd: bool = False
     publish_ros2: bool = False
+
+    hook_urls:list[str] = ["http://localhost:8000/controllers/yolo/start"]
 
     validate: bool = False
 
@@ -434,7 +424,7 @@ class ModeSubscriber:
                 continue
 
             try:
-                if self.mode == "dual_rgb":
+                if self.mode == RGB_STEREO_CAM_MODE:
                     bundle = unpack_dual_rgb_mjpeg_bundle(pkt)
                 else:
                     bundle = unpack_rgb_stereo_mjpeg_bundle(pkt)
@@ -465,7 +455,7 @@ class ModeSubscriber:
 
 
 def add_default_calibration(record: CustomRecord, frame: CapturedFrame) -> None:
-    if frame.mode == "dual_rgb":
+    if frame.mode == RGB_STEREO_CAM_MODE:
         bundle = frame.bundle
         assert isinstance(bundle, DualRGBMjpegBundle)
         calib = {
@@ -474,14 +464,14 @@ def add_default_calibration(record: CustomRecord, frame: CapturedFrame) -> None:
             "width": bundle.rgb_width,
             "height": bundle.rgb_height,
         }
-        record.add_calibration("cam_a", {**calib, "camera": "cam_a"})
-        record.add_calibration("cam_b", {**calib, "camera": "cam_b"})
+        record.add_calibration(DUAL_RGB_CAM_NAME_0, {**calib, "camera": DUAL_RGB_CAM_NAME_0})
+        record.add_calibration(DUAL_RGB_CAM_NAME_1, {**calib, "camera": DUAL_RGB_CAM_NAME_1})
         record.add_extrinsics(
             {
                 "source": "server_store_default",
-                "note": "Identity placeholder; replace with measured cam_a_to_cam_b extrinsics.",
-                "from": "cam_a",
-                "to": "cam_b",
+                "note": "Identity placeholder; replace with measured cam_from to cam_to extrinsics.",
+                "from": DUAL_RGB_CAM_NAME_0,
+                "to": DUAL_RGB_CAM_NAME_1,
                 "translation_m": [0.0, 0.0, 0.0],
                 "rotation_xyzw": [0.0, 0.0, 0.0, 1.0],
             }
@@ -490,11 +480,11 @@ def add_default_calibration(record: CustomRecord, frame: CapturedFrame) -> None:
         bundle = frame.bundle
         assert isinstance(bundle, RGBStereoMjpegBundle)
         record.add_calibration(
-            "cam_c",
+            RGB_STEREO_CAM_NAME,
             {
                 "source": "server_store_default",
                 "note": "Replace with real RGB/stereo calibration when available.",
-                "camera": "cam_c",
+                "camera": RGB_STEREO_CAM_NAME,
                 "rgb_width": bundle.rgb_width,
                 "rgb_height": bundle.rgb_height,
                 "stereo_width": bundle.stereo_width,
@@ -505,20 +495,20 @@ def add_default_calibration(record: CustomRecord, frame: CapturedFrame) -> None:
 
 def add_gis_payload(record: CustomRecord, gis: Any | None) -> None:
     """Write canonical GIS files, even if the request does not provide GIS."""
-    default_coordinate_system = {
-        "source": "server_store_default",
-        "name": "unknown",
-        "note": "No coordinate system was provided in the capture request.",
-    }
-    default_location = {
-        "source": "server_store_default",
-        "status": "not_provided",
-    }
-    default_pose = {
-        "source": "server_store_default",
-        "status": "not_provided",
-        "frame": "unknown",
-    }
+    # default_coordinate_system = {
+    #     "source": "server_store_default",
+    #     "name": "unknown",
+    #     "note": "No coordinate system was provided in the capture request.",
+    # }
+    # default_location = {
+    #     "source": "server_store_default",
+    #     "status": "not_provided",
+    # }
+    # default_pose = {
+    #     "source": "server_store_default",
+    #     "status": "not_provided",
+    #     "frame": "unknown",
+    # }
 
     if gis is None:
         # record.add_gis("location", default_location)
@@ -528,31 +518,35 @@ def add_gis_payload(record: CustomRecord, gis: Any | None) -> None:
 
     if isinstance(gis, Mapping):
         if "location" in gis or "pose" in gis or "coordinate_system" in gis:
-            record.add_gis("location", gis.get("location", default_location))
-            record.add_gis("pose", gis.get("pose", default_pose))
-            record.add_gis("coordinate_system", gis.get("coordinate_system", default_coordinate_system))
+            if "location" in gis:
+                record.add_gis("location", gis["location"])
+            if "pose" in gis:
+                record.add_gis("pose", gis["pose"])
+            if "coordinate_system" in gis:
+                record.add_gis("coordinate_system", gis["coordinate_system"])
+
             for optional_kind in ("geofences", "map_notes"):
                 if optional_kind in gis:
                     record.add_gis(optional_kind, gis[optional_kind])  # type: ignore[arg-type]
-        else:
-            # A flat GIS payload, e.g. {lat, lon, alt}. Treat it as the location.
-            record.add_gis("location", dict(gis))
-            record.add_gis("pose", default_pose)
-            record.add_gis("coordinate_system", gis.get("coordinate_system", default_coordinate_system))
+        # else:
+        #     # A flat GIS payload, e.g. {lat, lon, alt}. Treat it as the location.
+        #     record.add_gis("location", dict(gis))
+        #     record.add_gis("pose", default_pose)
+        #     record.add_gis("coordinate_system", gis.get("coordinate_system", default_coordinate_system))
         write_json(record.path / "gis" / "request.json", gis)
         return
 
     # Keep unusual request payloads rather than losing them.
-    record.add_gis("location", {"source": "request", "value": gis})
-    record.add_gis("pose", default_pose)
-    record.add_gis("coordinate_system", default_coordinate_system)
-    write_json(record.path / "gis" / "request.json", {"value": gis})
+    # record.add_gis("location", {"source": "request", "value": gis})
+    # record.add_gis("pose", default_pose)
+    # record.add_gis("coordinate_system", default_coordinate_system)
+    # write_json(record.path / "gis" / "request.json", {"value": gis})
 
 
 def save_dual_rgb_images(record: CustomRecord, bundle: DualRGBMjpegBundle) -> list[str]:
     """Save synchronized dual-RGB MJPEG frames as canonical .jpg camera images."""
     saved: list[str] = []
-    for camera_id, jpeg in (("cam_a", bundle.camera0), ("cam_b", bundle.camera1)):
+    for camera_id, jpeg in ((DUAL_RGB_CAM_NAME_0, bundle.camera0), (DUAL_RGB_CAM_NAME_1, bundle.camera1)):
         record.add_image(camera_id, "rgb", jpeg)
         saved.append(f"imgs/{camera_id}/rgb.jpg")
     return saved
@@ -562,7 +556,7 @@ def save_rgb_stereo_images(record: CustomRecord, bundle: RGBStereoMjpegBundle) -
     """Save synchronized RGB/stereo MJPEG frames as canonical .jpg camera images."""
     saved: list[str] = []
     for stream, jpeg in (("rgb", bundle.rgb), ("left", bundle.left), ("right", bundle.right)):
-        record.add_image("cam_c", stream, jpeg)
+        record.add_image(RGB_STEREO_CAM_NAME, stream, jpeg)
         saved.append(f"imgs/cam_c/{stream}.jpg")
     return saved
 
@@ -596,7 +590,7 @@ def save_frame_to_store(
     add_default_calibration(record, frame)
     add_gis_payload(record, gis)
 
-    if frame.mode == "dual_rgb":
+    if frame.mode == RGB_STEREO_CAM_MODE:
         assert isinstance(frame.bundle, DualRGBMjpegBundle)
         images = save_dual_rgb_images(record, frame.bundle)
     else:
@@ -623,7 +617,8 @@ def save_frame_to_store(
 
 
 def call_http_jsonrpc(url: str, method: str, params: dict[str, Any], timeout_s: float) -> dict[str, Any]:
-    payload = json.dumps({"jsonrpc": "2.0", "id": int(time.time_ns() & 0x7FFFFFFF), "method": method, "params": params}).encode("utf-8")
+    payload = json.dumps({"jsonrpc": "2.0", "id": int(time.time_ns() & 0x7FFFFFFF),
+                          "method": method, "params": params}).encode("utf-8")
     req = urllib.request.Request(
         url,
         data=payload,
@@ -642,90 +637,6 @@ def call_http_jsonrpc(url: str, method: str, params: dict[str, Any], timeout_s: 
     return dict(parsed) if isinstance(parsed, Mapping) else {"result": parsed}
 
 
-def format_command(command: str, params: dict[str, Any]) -> str:
-    # Only simple scalar placeholders are intended. Complex data is passed through
-    # SERVER_STORE_PARAMS_JSON in the child environment.
-    fmt = {
-        key: value
-        for key, value in params.items()
-        if isinstance(value, (str, int, float, bool)) or value is None
-    }
-    return command.format(**fmt)
-
-
-def call_shell_command(command: str, params: dict[str, Any], timeout_s: float) -> dict[str, Any]:
-    rendered = format_command(command, params)
-    env = None
-    try:
-        import os
-
-        env = dict(os.environ)
-        env["SERVER_STORE_PARAMS_JSON"] = json.dumps(params, default=str)
-    except Exception:
-        env = None
-
-    proc = subprocess.run(
-        rendered,
-        shell=True,
-        text=True,
-        capture_output=True,
-        timeout=float(timeout_s),
-        env=env,
-    )
-    result: dict[str, Any] = {
-        "command": rendered,
-        "returncode": proc.returncode,
-        "stdout": proc.stdout,
-        "stderr": proc.stderr,
-    }
-    if proc.returncode != 0:
-        raise RuntimeError(f"Command failed: {rendered!r}: {proc.stderr or proc.stdout}")
-    # If the command prints JSON, surface it as parsed_json too.
-    stripped = proc.stdout.strip()
-    if stripped:
-        try:
-            result["parsed_json"] = json.loads(stripped)
-        except Exception:
-            pass
-    return result
-
-
-def call_optional_hook(
-    *,
-    name: str,
-    url: str | None,
-    method: str,
-    command: str | None,
-    params: dict[str, Any],
-    timeout_s: float,
-) -> dict[str, Any]:
-    if not url and not command:
-        return {"called": False, "reason": f"{name} hook is not configured"}
-
-    result: dict[str, Any] = {"called": True, "name": name}
-    if url:
-        result["http_jsonrpc"] = call_http_jsonrpc(url, method, params, timeout_s)
-    if command:
-        result["command"] = call_shell_command(command, params, timeout_s)
-    return result
-
-
-def hook_params(record: CustomRecord, frame: CapturedFrame, *, images: list[str], gis: Any | None) -> dict[str, Any]:
-    return {
-        "mode": frame.mode,
-        "field_id": record.field_id,
-        "record_id": record.record_id,
-        "date_utc": record.date_utc,
-        "timestamp_ns_utc": record.timestamp_ns_utc,
-        "record_path": record.path.as_posix(),
-        "topic": frame.topic,
-        "frame_index": frame.frame_index,
-        "camera_pts_ns": frame.pts_ns,
-        "images": images,
-        "gis": gis,
-    }
-
-
 def store_raw_hook_result(record: CustomRecord, name: str, result: dict[str, Any]) -> None:
     write_json(record.path / "logs" / f"hook_{name}_result.json", result)
 
@@ -741,115 +652,8 @@ def extract_result_payload(result: dict[str, Any]) -> Any:
     return value
 
 
-def apply_yolo_result(record: CustomRecord, result: dict[str, Any]) -> None:
-    """Best-effort support for simple YOLO result shapes.
-
-    Supported examples:
-        {"model": {...}, "detections": [{"camera":"cam_a", "stream":"rgb", ...}]}
-        {"detections_by_stream": {"cam_a/rgb": [{...}], "cam_b/rgb": [{...}]}}
-    If the external server already wrote into record.path, this function simply
-    stores the raw hook result under logs/.
-    """
-    payload = extract_result_payload(result)
-    if not isinstance(payload, Mapping):
-        return
-
-    model_info = dict(payload.get("model", {})) if isinstance(payload.get("model"), Mapping) else {}
-
-    detections = payload.get("detections")
-    if isinstance(detections, list):
-        grouped: dict[tuple[str, str], list[dict[str, Any]]] = {}
-        for det in detections:
-            if not isinstance(det, Mapping):
-                continue
-            camera = str(det.get("camera") or det.get("camera_id") or "cam_c")
-            stream = str(det.get("stream") or "rgb")
-            grouped.setdefault((camera, stream), []).append(dict(det))
-        for (camera, stream), items in grouped.items():
-            record.add_yolo(camera, stream, items, model_info)
-
-    by_stream = payload.get("detections_by_stream")
-    if isinstance(by_stream, Mapping):
-        for key, items in by_stream.items():
-            if not isinstance(items, list):
-                continue
-            key_str = str(key)
-            if "/" in key_str:
-                camera, stream = key_str.split("/", 1)
-            else:
-                camera, stream = key_str, "rgb"
-            record.add_yolo(camera, stream, [dict(x) for x in items if isinstance(x, Mapping)], model_info)
-
-
 def decode_base64_bytes(value: str) -> bytes:
     return base64.b64decode(value.encode("ascii"))
-
-
-def apply_pcd_result(record: CustomRecord, result: dict[str, Any]) -> list[str]:
-    """Best-effort support for simple PCD result shapes.
-
-    Supported examples:
-        {"pcd_path": "/tmp/cloud.pcd"}
-        {"pcd_base64": "..."}
-        {"cloud": [[x,y,z], ...]}
-        {"objects": [{"class_id":0, "class_name":"plant", "object_index":1, "pcd_path":"..."}]}
-    """
-    payload = extract_result_payload(result)
-    if not isinstance(payload, Mapping):
-        return []
-
-    produced: list[str] = []
-    metadata = dict(payload.get("metadata", {})) if isinstance(payload.get("metadata"), Mapping) else {}
-
-    cloud: Any | None = None
-    if "pcd_path" in payload:
-        cloud = str(payload["pcd_path"])
-    elif "pcd_base64" in payload:
-        cloud = decode_base64_bytes(str(payload["pcd_base64"]))
-    elif "pcd" in payload:
-        cloud = payload["pcd"]
-    elif "cloud" in payload:
-        cloud = payload["cloud"]
-
-    if cloud is not None:
-        record.add_point_cloud("cam_c", cloud, metadata=metadata)
-        produced.append((record.path / "pcd" / "cam_c.pcd").as_posix())
-
-    objects = payload.get("objects")
-    if isinstance(objects, list):
-        for i, obj in enumerate(objects, start=1):
-            if not isinstance(obj, Mapping):
-                continue
-            obj_cloud: Any | None = None
-            if "pcd_path" in obj:
-                obj_cloud = str(obj["pcd_path"])
-            elif "pcd_base64" in obj:
-                obj_cloud = decode_base64_bytes(str(obj["pcd_base64"]))
-            elif "pcd" in obj:
-                obj_cloud = obj["pcd"]
-            elif "cloud" in obj:
-                obj_cloud = obj["cloud"]
-            if obj_cloud is None:
-                continue
-
-            class_id = int(obj.get("class_id", 0))
-            class_name = str(obj.get("class_name", "object"))
-            object_index = int(obj.get("object_index", i))
-            obj_meta = {k: v for k, v in dict(obj).items() if k not in {"pcd_path", "pcd_base64", "pcd", "cloud"}}
-            record.add_object_point_cloud(class_id, class_name, object_index, obj_cloud, metadata=obj_meta)
-            produced.append((record.path / "pcd" / "objects" / f"class{class_id:02d}_{class_name}_{object_index:03d}.pcd").as_posix())
-
-    return produced
-
-
-def publish_pcds_with_command(command: str | None, pcd_paths: list[str], *, topic: str, base_params: dict[str, Any], timeout_s: float) -> dict[str, Any]:
-    if not command:
-        return {"called": False, "reason": "ros2 publish command is not configured"}
-    results = []
-    for pcd_path in pcd_paths:
-        params = {**base_params, "pcd_path": pcd_path, "topic": topic}
-        results.append(call_shell_command(command, params, timeout_s))
-    return {"called": True, "topic": topic, "published": results}
 
 
 # ---------------------------------------------------------------------------
@@ -874,18 +678,18 @@ class StoreController:
         return {
             **openapi_doc("store_status", id=1, params={}),
             **openapi_doc("store_configure", id=2, params=model_to_dict(StoreConfig())),
-            **openapi_doc("store_watch", id=3, params={"mode": "rgb_stereo"}),
+            **openapi_doc("store_watch", id=3, params={"mode": DUAL_RGB_CAM_MODE}),
             **openapi_doc(
                 "store_capture",
                 id=4,
-                params={"mode": "rgb_stereo", "field_id": "field_01", "gis": None},
+                params={"mode": DUAL_RGB_CAM_MODE, "field_id": "field_01", "gis": None},
             ),
         }
 
     def _topic_for_mode(self, mode: RecordMode) -> str:
-        if mode == "dual_rgb":
+        if mode == RGB_STEREO_CAM_MODE:
             return self.config.dual_rgb_topic
-        if mode == "rgb_stereo":
+        if mode == DUAL_RGB_CAM_MODE:
             return self.config.rgb_stereo_topic
         raise ValueError(f"Unsupported mode: {mode!r}")
 
@@ -978,61 +782,31 @@ class StoreController:
                     gis=params.gis,
                 )
 
-                base = hook_params(record, frame, images=images, gis=params.gis)
-
-                yolo_result = None
-                if bool(params.call_yolo):
-                    yolo_result = call_optional_hook(
-                        name="yolo",
-                        url=self.config.yolo_url,
-                        method=self.config.yolo_method,
-                        command=self.config.yolo_command,
-                        params=base,
-                        timeout_s=float(self.config.hook_timeout_s),
-                    )
-                    store_raw_hook_result(record, "yolo", yolo_result)
+                for hook_url in params.hook_urls:
                     try:
-                        apply_yolo_result(record, yolo_result)
+                        # hook_url = "http://localhost:8000/controllers/yolo/start"
+                        # db_record = {
+                        #     "root_path": ".",
+                        #     "mode": "dual_rgb",
+                        #     "field_id": "null",
+                        #     "record_id": "000000.000000000JST",
+                        #     "timestamp_ns_utc": 0,
+                        #     "date_utc": "1970-01-01",
+                        #     "path": r"dual_rgb\1970-01-01\null\000000.000000000JST",
+                        # }
+                        params = {"db_record": json.dumps(record)}
+                        def push_request(hook_url=hook_url, params=params):
+                            try:
+                                requests.get(hook_url, params=params, timeout=0.5)
+                            except requests.RequestException:
+                                pass  # ignore timeout / connection errors
+                        executor = ThreadPoolExecutor(max_workers=8)
+                        executor.submit(push_request)
+
                     except Exception:
-                        write_json(record.path / "logs" / "hook_yolo_apply_error.json", {"error": traceback.format_exc()})
+                        pass
 
-                pcd_result = None
-                ros2_result = None
-                pcd_paths: list[str] = []
-                if mode == "rgb_stereo" and bool(params.call_pcd):
-                    pcd_result = call_optional_hook(
-                        name="pcd",
-                        url=self.config.pcd_url,
-                        method=self.config.pcd_method,
-                        command=self.config.pcd_command,
-                        params=base,
-                        timeout_s=float(self.config.hook_timeout_s),
-                    )
-                    store_raw_hook_result(record, "pcd", pcd_result)
-                    try:
-                        pcd_paths = apply_pcd_result(record, pcd_result)
-                    except Exception:
-                        write_json(record.path / "logs" / "hook_pcd_apply_error.json", {"error": traceback.format_exc()})
 
-                    if bool(params.publish_ros2):
-                        # If server_pcd wrote the canonical PCD itself, include it even
-                        # when apply_pcd_result did not create it.
-                        canonical_pcd = record.path / "pcd" / "cam_c.pcd"
-                        if canonical_pcd.exists() and canonical_pcd.as_posix() not in pcd_paths:
-                            pcd_paths.append(canonical_pcd.as_posix())
-                        ros2_result = publish_pcds_with_command(
-                            self.config.ros2_publish_command,
-                            pcd_paths,
-                            topic=self.config.ros2_pcd_topic,
-                            base_params=base,
-                            timeout_s=float(self.config.hook_timeout_s),
-                        )
-                        store_raw_hook_result(record, "ros2", ros2_result)
-
-                validation_issues = record.close(validate=bool(params.validate))
-
-                # record.close() was called after the hooks so the manifest includes
-                # any yolo/pcd files produced by hooks.
                 result_dict = {
                     "ok": True,
                     "mode": mode,
@@ -1044,10 +818,6 @@ class StoreController:
                     "frame_index": frame.frame_index,
                     "timestamp_ns_utc": record.timestamp_ns_utc,
                     "images": images,
-                    "validation_issues": validation_issues,
-                    "yolo": yolo_result,
-                    "pcd": pcd_result,
-                    "ros2": ros2_result,
                 }
                 self._last_capture = result_dict
                 self._last_error = None

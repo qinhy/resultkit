@@ -57,9 +57,11 @@ DEFAULT_SOURCES = _parse_cli_sources()
 NS_PER_SECOND = 1_000_000_000
 PUBSUB_HEADER_BYTES = 8
 
+BUNDLE_PREFIX = CAM_MODE = "dual_rgb"
+BUNDLE_TYPE = "mjpeg"
 BUNDLE_MAGIC = b"DRGB"
 BUNDLE_VERSION = 1
-BUNDLE_FORMAT = "dual_rgb_mjpeg_bundle_v1"
+BUNDLE_FORMAT = f"{BUNDLE_PREFIX}_{BUNDLE_TYPE}_bundle_v{BUNDLE_VERSION}"
 
 # magic[4], version:u16, header_nbytes:u16,
 # frame_index:u64, pts_ns:u64,
@@ -103,7 +105,7 @@ class CameraConfig(CameraBaseModel):
     log_fps: bool = True
     log_camera_fps: bool = False
 
-    encoded_topic: str = f"{args.service_name}:{args.controller_name}:dual_rgb_mjpeg"
+    encoded_topic: str = f"{args.service_name}:{args.controller_name}:{BUNDLE_PREFIX}_{BUNDLE_TYPE}"
     encoded_buffer_capacity_bytes: int = 64 * 1024 * 1024
 
     retry_forever: bool = True

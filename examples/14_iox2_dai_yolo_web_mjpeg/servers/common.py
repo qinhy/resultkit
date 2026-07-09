@@ -5,6 +5,8 @@ import sys
 
 from pathlib import Path
 
+from pydantic import BaseModel
+
 EXAMPLE_DIR = os.path.dirname(os.path.dirname(Path(__file__).absolute()))
 
 if EXAMPLE_DIR not in sys.path:

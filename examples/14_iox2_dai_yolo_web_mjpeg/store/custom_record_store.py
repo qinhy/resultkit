@@ -19,7 +19,6 @@ bytes, existing files, and simple Nx3/Nx4/Nx6/Nx7 point arrays/sequences.
 
 from __future__ import annotations
 
-import argparse
 import calendar
 import json
 import re
@@ -28,8 +27,8 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import NamedTemporaryFile
-from typing import Any, Literal, Mapping, Sequence, Union
-from zoneinfo import ZoneInfo
+from typing import Any, List, Literal, Mapping, Sequence, Union, cast
+from pydantic import BaseModel, ConfigDict, Field, computed_field, field_validator, model_validator
 
 
 BytesLike = Union[bytes, bytearray, memoryview]
@@ -56,12 +55,12 @@ NS_PER_SECOND = 1_000_000_000
 # Camera streams come from MJPEG. Each single-frame capture is stored as one
 # JPEG frame using .jpg. Disparity is intentionally kept as .png.
 CAMERA_IMAGE_EXTENSION = ".jpg"
-CAMERA_IMAGE_ENCODING = "mjpeg_frame"
+CAMERA_IMAGE_ENCODING = "mjpeg"
 JPEG_LIKE_SUFFIXES = {".jpg", ".jpeg", ".mjpg", ".mjpeg"}
 
 RECORD_ID_RE = re.compile(
     r"^(?P<hour>\d{2})(?P<minute>\d{2})(?P<second>\d{2})\."
-    r"(?P<nsec>\d{9})JST_(?P<sequence>\d{3,})$"
+    r"(?P<nsec>\d{9})JST$"
 )
 
 VALID_MODES: set[str] = {"dual_rgb", "rgb_stereo"}
@@ -139,14 +138,12 @@ def date_utc_from_timestamp_ns(timestamp_ns_utc: int) -> str:
 
 JST = timezone(timedelta(hours=9), name="JST")
 def record_id_from_timestamp_ns(timestamp_ns_utc: int, sequence: int = 1) -> str:
-    """Return HHMMSS.NNNNNNNNNJST_SEQUENCE for a UTC nanosecond timestamp shown in JST."""
-    if sequence < 0:
-        raise ValueError("sequence must be non-negative")
-
+    """Return HHMMSS.NNNNNNNNNJST for a UTC nanosecond timestamp shown in JST."""
+    # if sequence < 0:
+    #     raise ValueError("sequence must be non-negative")
     seconds, nsec = divmod(int(timestamp_ns_utc), NS_PER_SECOND)
     dt = datetime.fromtimestamp(seconds, tz=timezone.utc).astimezone(JST)
-
-    return f"{dt:%H%M%S}.{nsec:09d}JST_{sequence:03d}"
+    return f"{dt:%H%M%S}.{nsec:09d}JST"
 
 
 def timestamp_ns_from_date_and_record_id(date_utc: str, record_id: str) -> int:
@@ -220,21 +217,6 @@ def _is_existing_file(value: Any) -> bool:
         except OSError:
             return False
     return False
-
-
-def _write_bytes(path: Path, data: BytesLike) -> None:
-    """Write raw bytes to path, creating parent directories if needed."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-
-    if isinstance(data, memoryview):
-        data = data.tobytes()
-    elif isinstance(data, bytearray):
-        data = bytes(data)
-
-    if not isinstance(data, bytes):
-        raise TypeError(f"Expected bytes-like object, got {type(data).__name__}")
-
-    _atomic_write_bytes(path, data)
 
 
 def _write_image_png(path: Path, image: Any) -> None:
@@ -445,41 +427,169 @@ def _with_schema(data: Mapping[str, Any] | dict[str, Any]) -> dict[str, Any]:
     return result
 
 
-class CustomRecord:
+class CustomRecord(BaseModel):
     """One synchronized single-frame capture record."""
 
-    def __init__(
-        self,
-        root_path: str | Path,
-        mode: RecordMode,
-        field_id: str,
-        record_id: str,
-        timestamp_ns_utc: int,
-        date_utc: str | None = None,
-    ):
+    root_path: Path
+    mode: RecordMode
+    field_id: str
+    record_id: str
+    timestamp_ns_utc: int
+    date_utc: str | None = None
+
+    @staticmethod
+    def empty() -> "CustomRecord":
+        return CustomRecord(
+            root_path=Path("."),
+            mode="dual_rgb",
+            field_id="null",
+            record_id="000000.000000000JST",
+            timestamp_ns_utc=0,
+            date_utc=None,
+        )
+    
+    def is_empty(self) -> bool:
+        return self.field_id == "null"
+
+    @field_validator("mode")
+    @classmethod
+    def _validate_mode(cls, mode: RecordMode) -> RecordMode:
         if mode not in VALID_MODES:
             raise ValueError(f"Unsupported mode: {mode!r}")
+        return mode
+
+    @field_validator("record_id")
+    @classmethod
+    def _validate_record_id(cls, record_id: str) -> str:
         if not RECORD_ID_RE.match(record_id):
             raise ValueError(f"Invalid record_id: {record_id!r}")
+        return record_id
+
+    @field_validator("field_id")
+    @classmethod
+    def _validate_field_id(cls, field_id: str) -> str:
         if not field_id:
             raise ValueError("field_id must not be empty")
+        return field_id
 
-        self.root_path = Path(root_path)
-        self.mode: RecordMode = mode
-        self.field_id = field_id
-        self.record_id = record_id
-        self.timestamp_ns_utc = int(timestamp_ns_utc)
-        self.date_utc = date_utc or date_utc_from_timestamp_ns(timestamp_ns_utc)
+    @model_validator(mode="after")
+    def _fill_date_utc(self) -> "CustomRecord":
+        if self.date_utc is None:
+            self.date_utc = date_utc_from_timestamp_ns(self.timestamp_ns_utc)
+        return self
 
+    @computed_field
     @property
     def path(self) -> Path:
         """Return the leaf record directory path."""
-        return self.root_path / self.mode / self.date_utc / self.field_id / self.record_id
+        return (
+            self.root_path
+            / self.mode
+            / self.date_utc
+            / self.field_id
+            / self.record_id
+        )
 
+    @computed_field
     @property
     def datetime_utc(self) -> str:
         """Return this record timestamp as an ISO-like UTC string."""
         return datetime_utc_from_timestamp_ns(self.timestamp_ns_utc)
+
+    @classmethod
+    def from_path(cls, path: str | Path) -> "CustomRecord":
+        """
+        Construct a CustomRecord from a leaf record directory path.
+
+        Expected layout:
+            <root_path>/<mode>/<date_utc>/<field_id>/<record_id>
+        """
+        path = Path(path)
+
+        if len(path.parts) < 4:
+            raise ValueError(f"Path is too short to be a record path: {path}")
+
+        mode = path.parts[-4]
+        date_utc = path.parts[-3]
+        field_id = path.parts[-2]
+        record_id = path.parts[-1]
+
+        root_path = Path(*path.parts[:-4]) if path.parts[:-4] else Path(".")
+
+        timestamp_ns_utc = timestamp_ns_from_date_and_record_id(
+            date_utc,
+            record_id,
+        )
+
+        return cls(
+            root_path=root_path,
+            mode=cast(RecordMode, mode),
+            field_id=field_id,
+            record_id=record_id,
+            timestamp_ns_utc=timestamp_ns_utc,
+            date_utc=date_utc,
+        )
+    
+    @property
+    def datetime_utc(self) -> str:
+        """Return this record timestamp as an ISO-like UTC string."""
+        return datetime_utc_from_timestamp_ns(self.timestamp_ns_utc)
+
+    @property
+    def image_path(self) -> Path:
+        return self.path / "imgs"
+    
+    @property
+    def depth_path(self) -> Path:
+        return self.path / "depth"
+    
+    @property
+    def pcd_path(self) -> Path:
+        return self.path / "pcd"
+    
+    @property
+    def listup_rgb_image_paths(self) -> List[Path]:
+        return list(self.image_path.rglob(f"rgb{CAMERA_IMAGE_EXTENSION}"))
+    
+    @property
+    def listup_left_image_paths(self) -> List[Path]:
+        return list(self.image_path.rglob(f"left{CAMERA_IMAGE_EXTENSION}"))
+    
+    @property
+    def listup_right_image_paths(self) -> List[Path]:
+        return list(self.image_path.rglob(f"right{CAMERA_IMAGE_EXTENSION}"))
+    
+    @property
+    def is_stereo(self) -> bool:
+        return self.mode == "rgb_stereo"
+
+    @property
+    def expect_disparity_path(self) -> Path | None:
+        if self.is_stereo:
+            return self.path / "depth" / f"{RGB_STEREO_CAM_NAME}" / "disparity.png"
+        else:
+            return None
+        
+    @property
+    def expect_disparity_json_path(self) -> Path | None:
+        if self.is_stereo:
+            return self.path / "depth" / f"{RGB_STEREO_CAM_NAME}" / "disparity.json"
+        else:
+            return None
+        
+    @property
+    def expect_pcd_path(self) -> Path | None:
+        if self.is_stereo:
+            return self.path / "pcd" / f"{RGB_STEREO_CAM_NAME}.pcd"
+        else:
+            return None
+    
+    @property
+    def expect_pcd_seg_dir(self) -> Path | None:
+        if self.is_stereo:
+            return self.path / "pcd" / f"{RGB_STEREO_CAM_NAME}_segs"
+        else:
+            return None
 
     def mkdirs(self) -> None:
         """Create the leaf record directory."""
@@ -517,7 +627,7 @@ class CustomRecord:
             self.path / "imgs" / camera_id / f"{stream}{CAMERA_IMAGE_EXTENSION}",
             image,
         )
-
+    
     def add_mjpeg_image(self, camera_id: str, stream: ImageStream, image_bytes: Any) -> None:
         """Backward-compatible alias for add_image()."""
         self.add_image(camera_id, stream, image_bytes)
