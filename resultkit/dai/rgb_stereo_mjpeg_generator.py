@@ -560,21 +560,24 @@ class _DepthAIPoeRGBStereoMjpegCapture:
         left_socket = self._camera_socket(owner.left_camera_socket)
         right_socket = self._camera_socket(owner.right_camera_socket)
 
-        rgb_resolution = self._read_default_resolution(
-            calib,
-            rgb_socket,
-            fallback=(owner.rgb_width, owner.rgb_height),
-        )
-        left_resolution = self._read_default_resolution(
-            calib,
-            left_socket,
-            fallback=(owner.stereo_width, owner.stereo_height),
-        )
-        right_resolution = self._read_default_resolution(
-            calib,
-            right_socket,
-            fallback=(owner.stereo_width, owner.stereo_height),
-        )
+        rgb_resolution = (owner.rgb_width, owner.rgb_height)
+        # self._read_default_resolution(
+        #     calib,
+        #     rgb_socket,
+        #     fallback=(owner.rgb_width, owner.rgb_height),
+        # )
+        left_resolution = (owner.stereo_width, owner.stereo_height)
+        # self._read_default_resolution(
+        #     calib,
+        #     left_socket,
+        #     fallback=(owner.stereo_width, owner.stereo_height),
+        # )
+        right_resolution = (owner.stereo_width, owner.stereo_height)
+        # self._read_default_resolution(
+        #     calib,
+        #     right_socket,
+        #     fallback=(owner.stereo_width, owner.stereo_height),
+        # )
 
         result: dict[str, Any] = {
             "rgb_resolution": rgb_resolution,

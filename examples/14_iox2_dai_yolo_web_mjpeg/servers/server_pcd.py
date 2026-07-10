@@ -1,19 +1,26 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sys
+import traceback
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+from queue import Empty, Full, Queue
+from threading import Event, Lock, RLock, Thread
 from typing import Any, Literal
 
 import numpy as np
 from pydantic import BaseModel, Field
 from common import *
 
+from common import HookDispatcher
 from iox2_jsonrpc import EmptyParams, RpcModel
 from store.custom_record_store import CustomRecord
 from server_yolo import YoloDetectResult
+
+logger = logging.getLogger(__name__)
 
 _THIS_DIR = Path(__file__).absolute().parent
 for path in (
@@ -327,8 +334,8 @@ class SetDepthCalibrationResult(DepthBaseModel):
 
 class BackendOverrides(BaseModel):
     backend: DepthBackend | None = None
-    repo_dir: str | None = None
-    model_path: str | None = None
+    repo_dir: str | None = "./examples/14_iox2_dai_yolo_web_mjpeg/fast-foundationstereo"
+    model_path: str | None = "weights/23-36-37/model_best_bp2_serialize.pth"
     model_dir: str | None = None
     device: str | None = None
     valid_iters: int | None = None
@@ -343,7 +350,7 @@ BACKEND_KEYS = _model_field_names(BackendOverrides)
 
 
 class BackendParams(BackendOverrides):
-    backend: DepthBackend = "dnn"#"sgbm"
+    backend: DepthBackend = "dnn" #"sgbm"
     device: str = "cuda"
     valid_iters: int = 8
     max_disp: int = 192
@@ -361,7 +368,7 @@ class BackendStatusResult(BackendParams):
 
 
 class ToPcdParams(BackendOverrides):
-    db_record: CustomRecord = CustomRecord.empty()
+    db_record: dict | None = None
     left_path: str = ""
     right_path: str = ""
     rgb_path: str = ""
@@ -377,23 +384,36 @@ class ToPcdParams(BackendOverrides):
     min_disparity: int = 0
     num_disparities: int = 128
     block_size: int = 5
+    hook_urls: list[list[str]] = Field(default_factory=list)
 
-    def model_post_init(self, context):
-        if not self.db_record.is_empty() and self.db_record.is_stereo:
-            left_path = self.db_record.listup_left_image_paths
-            right_path = self.db_record.listup_right_image_paths
-            if len(left_path)!=1 or len(right_path)!=1:
-                raise ValueError("Invalid left_path:{left_path}, right_path:{right_path}")
-            self.left_path = str(left_path[0])
-            self.right_path = str(right_path[0])
-            self.rgb_path = str(left_path[0]).replace("left", "rgb")
-            self.output_pcd_path = str(self.db_record.expect_pcd_path)            
-            with open(self.db_record.expect_stereo_calib) as f:
-                calib = json.load(f)
-                if "calibration" in calib:
-                    calib = calib["calibration"]
-                self.calibration = DepthCalibrationParams.model_validate(calib,extra="ignore")
-        return super().model_post_init(context)
+    @staticmethod
+    def from_db_record(db_record: CustomRecord) -> list[ToPcdParams]:
+        if db_record.is_empty():return []
+        img_ext = db_record.listup_left_image_paths[0].suffix
+
+        left_parent_paths = db_record.listup_left_image_parent_paths
+        left_path = [p/f"left{img_ext}" for p in left_parent_paths]
+        right_path = [p/f"right{img_ext}" for p in left_parent_paths]
+        rgb_path = [p/f"rgb{img_ext}" for p in left_parent_paths]
+        pcd_path = db_record.pcd_path
+        calib_path = db_record.calib_path
+
+        res = []
+        for rgb, l, r, lp in zip(rgb_path, left_path, right_path, left_parent_paths):
+            if rgb.exists() and l.exists() and r.exists():
+                cam_name = lp.name
+
+                param = ToPcdParams(rgb_path=str(rgb), left_path=str(l), right_path=str(r))
+                param.output_pcd_path = str(pcd_path/f"{cam_name}.pcd")
+                
+                with open(calib_path / f"{cam_name}.json" ) as f:
+                    calib = json.load(f)
+                    allowed_fields = set(_model_field_names(DepthCalibrationParams))
+                    calibration_data = {key: value for key, value in calib.items() if key in allowed_fields}
+                    param.calibration = DepthCalibrationParams.model_validate(calibration_data)
+
+                res.append(param)
+        return res
     
 
 class ToPcdResult(DepthBaseModel):
@@ -408,6 +428,18 @@ class ToPcdResult(DepthBaseModel):
     disparity_width: int | None = None
     disparity_height: int | None = None
     calibration: str | None = None
+
+
+class PcdAsyncResult(DepthBaseModel):
+    running: bool = False
+    queued: bool = False
+    queue_size: int = 0
+    requested_output_path: str | None = None
+    current_output_path: str | None = None
+    last_result: ToPcdResult | None = None
+    error: str | None = None
+
+
 
 
 class Ros2PublishParams(DepthBaseModel):
@@ -489,11 +521,23 @@ class ToDetectSegmentsResult(DepthBaseModel):
 
 
 @dataclass
-class DepthController:
-    service_name: str = "jrpc"
-    controller_name: str = "pcd"
-    calibration_params: DepthCalibrationParams | None = field(default=None, init=False, repr=False)
+class PcdRunner:
+    """Owns all point-cloud processing and its single background worker.
+
+    The runner is the processing layer. It owns calibration/backend settings,
+    cached DNN resources, conversion functions, queue lifecycle, result state,
+    ROS 2 publishing state, and completion-hook dispatch. It intentionally
+    processes one heavy job at a time to avoid concurrent GPU/OpenCV pressure.
+    """
+
+    input_queue: Queue[ToPcdParams] = field(
+        default_factory=lambda: Queue(maxsize=16),
+        repr=False,
+    )
+    calibration_params: DepthCalibrationParams | None = None
     backend_params: BackendParams = field(default_factory=BackendParams)
+    hook_dispatcher: HookDispatcher = field(default_factory=HookDispatcher, repr=False)
+
     _dnn_predictor: FastFoundationStereoDisparity | None = field(default=None, init=False, repr=False)
     _dnn_predictor_key: tuple[Any, ...] | None = field(default=None, init=False, repr=False)
     _yolo_model: Any | None = field(default=None, init=False, repr=False)
@@ -503,8 +547,93 @@ class DepthController:
     _ros2_publishers: dict[str, Any] = field(default_factory=dict, init=False, repr=False)
     _ros2_publishers_key: tuple[str, str] | None = field(default=None, init=False, repr=False)
 
+    _stop_event: Event = field(default_factory=Event, init=False, repr=False)
+    _thread: Thread | None = field(default=None, init=False, repr=False)
+    _lifecycle_lock: Lock = field(default_factory=Lock, init=False, repr=False)
+    _state_lock: Lock = field(default_factory=Lock, init=False, repr=False)
+    _config_lock: RLock = field(default_factory=RLock, init=False, repr=False)
+    _process_lock: Lock = field(default_factory=Lock, init=False, repr=False)
+
+    _exception: Exception | None = field(default=None, init=False, repr=False)
+    _last_result: ToPcdResult | None = field(default=None, init=False, repr=False)
+    _current_output_path: str | None = field(default=None, init=False, repr=False)
+
+    @property
+    def is_running(self) -> bool:
+        thread = self._thread
+        return thread is not None and thread.is_alive()
+
+    def start(self) -> None:
+        with self._lifecycle_lock:
+            if self.is_running:
+                return
+            self._stop_event.clear()
+            self._thread = Thread(target=self._run, name="PcdRunner", daemon=True)
+            self._thread.start()
+
+    def stop(self, timeout: float = 5.0) -> None:
+        """Stop accepting queued work after the current conversion returns."""
+        self._stop_event.set()
+        thread = self._thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=timeout)
+
+    def snapshot(self) -> tuple[str | None, ToPcdResult | None, Exception | None]:
+        with self._state_lock:
+            return self._current_output_path, self._last_result, self._exception
+
+    def _run(self) -> None:
+        logger.info("PCD runner started")
+
+        while not self._stop_event.is_set():
+            try:
+                params = self.input_queue.get(timeout=0.2)
+            except Empty:
+                continue
+
+            with self._state_lock:
+                self._current_output_path = params.output_pcd_path
+
+            try:
+                # All heavy processing is owned and serialized by this runner.
+                with self._process_lock:
+                    result = self._convert_to_pcd(params)
+
+                with self._state_lock:
+                    self._last_result = result
+                    self._exception = None
+
+                logger.info(
+                    "PCD conversion completed: output=%s points=%s",
+                    result.output_path,
+                    result.point_count,
+                )
+
+                if params.hook_urls:
+                    try:
+                        self.hook_dispatcher.dispatch(
+                            db_record=params.db_record,
+                            hook_chains=params.hook_urls,
+                        )
+                    except Exception:
+                        logger.exception("Could not dispatch PCD completion hooks")
+
+            except Exception as exc:
+                with self._state_lock:
+                    self._exception = exc
+                logger.error("PCD conversion failed: %s\n%s", exc, traceback.format_exc())
+            finally:
+                with self._state_lock:
+                    self._current_output_path = None
+                self.input_queue.task_done()
+
+        logger.info("PCD runner stopped")
+
     def _build_calibration(self, params: DepthCalibrationParams | None = None) -> StereoRgbCalibration:
-        calibration_data = _model_to_dict(params or self.calibration_params)
+        if params is None:
+            with self._config_lock:
+                params = self.calibration_params
+        calibration_data = _model_to_dict(params)
         calibration_data.pop("service", None)
         translation_unit = calibration_data.pop("source_translation_unit", "cm")
         return StereoRgbCalibration.from_dict(calibration_data, source_translation_unit=translation_unit)
@@ -524,12 +653,15 @@ class DepthController:
         )
 
     def _backend_result(self) -> BackendStatusResult:
+        with self._config_lock:
+            backend_data = {key: getattr(self.backend_params, key) for key in BACKEND_KEYS}
+            predictor_loaded = self._dnn_predictor is not None
         return BackendStatusResult(
             configured=True,
-            predictor_loaded=self._dnn_predictor is not None,
+            predictor_loaded=predictor_loaded,
             dnn_available=_DNN_IMPORT_ERROR is None,
             dnn_error=None if _DNN_IMPORT_ERROR is None else str(_DNN_IMPORT_ERROR),
-            **{key: getattr(self.backend_params, key) for key in BACKEND_KEYS},
+            **backend_data,
         )
 
     def _dnn_cache_key(self, backend: BackendParams) -> tuple[Any, ...]:
@@ -559,7 +691,8 @@ class DepthController:
         return self._dnn_predictor
 
     def _effective_backend(self, params: Any) -> BackendParams:
-        backend_data = {key: getattr(self.backend_params, key) for key in BACKEND_KEYS}
+        with self._config_lock:
+            backend_data = {key: getattr(self.backend_params, key) for key in BACKEND_KEYS}
         override_data = _model_to_dict(params)
         backend_data.update({key: override_data[key] for key in BACKEND_KEYS if override_data.get(key) is not None})
         return BackendParams(**backend_data)
@@ -970,26 +1103,32 @@ class DepthController:
             )
 
     def set_calibration(self, params: DepthCalibrationParams) -> SetDepthCalibrationResult:
-        self.calibration_params = params
+        with self._config_lock:
+            self.calibration_params = params
         return self._calibration_result(self._build_calibration(params))
 
     def calibration(self, params: EmptyParams) -> SetDepthCalibrationResult:
         del params
-        return self._calibration_result(self._build_calibration())
+        with self._config_lock:
+            configured = self.calibration_params
+        return self._calibration_result(self._build_calibration(configured))
 
     def set_backend(self, params: BackendParams) -> BackendStatusResult:
-        old_cache_key = self._dnn_cache_key(self.backend_params)
-        self.backend_params = params
-        if old_cache_key != self._dnn_cache_key(params):
-            self._dnn_predictor = None
-            self._dnn_predictor_key = None
+        # Serialize cache replacement with any active DNN conversion.
+        with self._process_lock:
+            with self._config_lock:
+                old_cache_key = self._dnn_cache_key(self.backend_params)
+                self.backend_params = params
+                if old_cache_key != self._dnn_cache_key(params):
+                    self._dnn_predictor = None
+                    self._dnn_predictor_key = None
         return self._backend_result()
 
     def backend(self, params: EmptyParams) -> BackendStatusResult:
         del params
         return self._backend_result()
 
-    def to_pcd(self, params: ToPcdParams) -> ToPcdResult:
+    def _convert_to_pcd(self, params: ToPcdParams) -> ToPcdResult:
 
         calibration=self._build_calibration(params.calibration)
         output_path = Path(params.output_pcd_path).expanduser()
@@ -1054,7 +1193,63 @@ class DepthController:
             calibration=str(calibration),
         )
 
-    def detect_segments_to_pcd(self, params: ToYoloSegmentsParams) -> ToDetectSegmentsResult:
+    def _pcd_async_result(
+        self,
+        params: ToPcdParams | None = None,
+        *,
+        queued: bool = False,
+        error: str | None = None,
+    ) -> PcdAsyncResult:
+        current_output, last_result, exception = self.snapshot()
+        runner_error = None
+        if exception is not None:
+            runner_error = f"{exception.__class__.__name__}: {exception}"
+
+        return PcdAsyncResult(
+            running=self.is_running,
+            queued=queued,
+            queue_size=self.input_queue.qsize(),
+            requested_output_path=params.output_pcd_path if params is not None else None,
+            current_output_path=current_output,
+            last_result=last_result,
+            error=error or runner_error,
+        )
+
+    def submit_to_pcd(self, params: ToPcdParams) -> PcdAsyncResult:
+        """Queue a conversion and return immediately."""
+        if not self.is_running:
+            self.start()
+
+        try:
+            self.input_queue.put_nowait(params)
+        except Full:
+            return self._pcd_async_result(
+                params,
+                error=f"PCD queue is full (capacity={self.input_queue.maxsize})",
+            )
+
+        logger.info(
+            "Queued PCD conversion: output=%s queue_size=%s",
+            params.output_pcd_path,
+            self.input_queue.qsize(),
+        )
+        return self._pcd_async_result(params, queued=True)
+
+    def to_pcd_status(self, params: EmptyParams) -> PcdAsyncResult:
+        del params
+        return self._pcd_async_result()
+
+    def to_pcd_stop(self, params: EmptyParams) -> PcdAsyncResult:
+        del params
+        self.stop()
+        return self._pcd_async_result()
+
+    def convert_to_pcd_sync(self, params: ToPcdParams) -> ToPcdResult:
+        """Run through the same complete processor without the queue."""
+        with self._process_lock:
+            return self._convert_to_pcd(params)
+
+    def _detect_segments_to_pcd(self, params: ToYoloSegmentsParams) -> ToDetectSegmentsResult:
         output_dir = Path(params.output_dir).expanduser()
         output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1157,6 +1352,10 @@ class DepthController:
             segments=_result_segments_to_summary(result.segments),
         )
 
+    def detect_segments_to_pcd(self, params: ToYoloSegmentsParams) -> ToDetectSegmentsResult:
+        with self._process_lock:
+            return self._detect_segments_to_pcd(params)
+
     def publish_last_yolo_segments(self, params: Ros2PublishParams) -> Ros2PublishResult:
         if self._last_yolo_segments is None:
             raise ValueError("No YOLO segment result is cached. Call yolo_segments_to_pcd first.")
@@ -1184,10 +1383,78 @@ class DepthController:
         )
 
 
+@dataclass
+class DepthController:
+    """Thin JSON-RPC facade; all processing lives in ``PcdRunner``."""
+
+    service_name: str = "jrpc"
+    controller_name: str = "pcd"
+    runner: PcdRunner = field(default_factory=PcdRunner, repr=False)
+
+    def set_calibration(self, params: DepthCalibrationParams) -> SetDepthCalibrationResult:
+        return self.runner.set_calibration(params)
+
+    def calibration(self, params: EmptyParams) -> SetDepthCalibrationResult:
+        return self.runner.calibration(params)
+
+    def set_backend(self, params: BackendParams) -> BackendStatusResult:
+        return self.runner.set_backend(params)
+
+    def backend(self, params: EmptyParams) -> BackendStatusResult:
+        return self.runner.backend(params)
+
+    def to_pcd(self, params: ToPcdParams) -> PcdAsyncResult:
+        db_record = CustomRecord(**params.db_record)
+        if db_record.is_empty():
+            return self.runner.submit_to_pcd(params)
+        
+        res = PcdAsyncResult()
+        for params in ToPcdParams.from_db_record(db_record):
+            print(params)
+            res = self.runner.submit_to_pcd(params)
+        return res
+
+    def to_pcd_status(self, params: EmptyParams) -> PcdAsyncResult:
+        return self.runner.to_pcd_status(params)
+
+    def to_pcd_stop(self, params: EmptyParams) -> PcdAsyncResult:
+        return self.runner.to_pcd_stop(params)
+
+    def to_pcd_sync(self, params: ToPcdParams) -> ToPcdResult:
+        return self.runner.convert_to_pcd_sync(params)
+
+    def detect_segments_to_pcd(self, params: ToYoloSegmentsParams) -> ToDetectSegmentsResult:
+        return self.runner.detect_segments_to_pcd(params)
+
+    def publish_last_yolo_segments(self, params: Ros2PublishParams) -> Ros2PublishResult:
+        return self.runner.publish_last_yolo_segments(params)
+
+    def ros2_status(self, params: EmptyParams) -> Ros2PublishResult:
+        return self.runner.ros2_status(params)
+
 def run_server(controller_name: str = "pcd") -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+
     from iox2_jsonrpc.iceoryx import Iox2JsonRpcServer
 
     Iox2JsonRpcServer(DepthController(controller_name=controller_name)).run_forever()
 
+def test():
+    # cl = DepthController(controller_name="pcd")
+    cl = PcdRunner()
+    ps = ToPcdParams.from_db_record(
+            CustomRecord(**{'root_path': 'recording', 'mode': 'rgb_stereo', 'field_id': 'field_01', 
+                            'record_id': '150256.586650200JST', 
+                   'timestamp_ns_utc': 1783660851835039500, 'date_utc': '2026-07-10', 
+        'path': 'recording\\rgb_stereo\\2026-07-10\\field_01\\150256.586650200JST', 'datetime_utc': '2026-07-10T05:20:51.835039500Z'}
+        ))
+    for p in ps:
+        print(p)
+        cl._convert_to_pcd(p)
+        
 if __name__ == "__main__":
     run_server()
+    # test()

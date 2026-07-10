@@ -14,7 +14,7 @@ from typing import Any, List, Literal
 from pydantic import BaseModel, ConfigDict, Field, computed_field
 import requests
 
-from common import EmptyParams, RpcModel, openapi_doc
+from common import EmptyParams, HookDispatcher, RpcModel, openapi_doc
 from store.custom_record_store import CustomRecord
 
 logger = logging.getLogger(__name__)
@@ -43,30 +43,20 @@ class StartYoloParams(YoloBaseModel):
     db_record: CustomRecord = CustomRecord.empty()
     input_jpg_paths: List[str] = [] # field(default_factory=list)
     output_json_paths: List[str] = [] # field(default_factory=list)
-    
-    hook_urls:List[str] = []
+
+    hook_urls:list[list[str]] = [[]]
 
     
     def model_post_init(self, context):
         if not self.db_record.is_empty():
-            self.input_jpg_paths = [str(p) for p in self.db_record.listup_rgb_image_paths]
-            self.output_json_paths = [self.to_output_json_paths(p) for p in self.input_jpg_paths]
-            if self.db_record.mode == "dual_rgb":
-                self.hook_urls = []
-            if self.db_record.mode == "rgb_stereo":
-                self.hook_urls = ["http://localhost:8000/controllers/pcd/to_pcd"]
-        return super().model_post_init(context)
+            input_jpg_paths = [p for p in self.db_record.listup_rgb_image_paths]
+            # jpg_parent_names = [p.parent.name for p in input_jpg_paths]
+            output_json_paths = [p.parents[2] / "yolo" / p.parent.name /f"{p.stem}.json" for p in input_jpg_paths]
 
-    @staticmethod
-    def to_output_json_paths(p) -> str:
-        jpg = Path(p)
-        # Original behavior was: jpg.parent.parent.parent / "yolo" / file.json.
-        # Keep it when possible, but avoid raising on short/relative paths.
-        try:
-            base_dir = jpg.parents[2]
-        except IndexError:
-            base_dir = jpg.parent
-        return str(base_dir / "yolo" / f"{jpg.stem}.json")
+            self.input_jpg_paths = [str(p) for p in input_jpg_paths]
+            self.output_json_paths = [str(p) for p in output_json_paths]
+
+        return super().model_post_init(context)
 
 
 class YoloSettings(YoloBaseModel):
@@ -286,20 +276,6 @@ class YoloDetector:
             output_path = Path(result.output_json_path)
             output_path.parent.mkdir(parents=True, exist_ok=True)
             output_path.write_text(result.to_json_text(), encoding="utf-8")
-
-            if not params.db_record.is_empty():
-                for hook_url in params.hook_urls:
-                    payload = {"db_record": json.loads(params.db_record.model_dump_json())}
-                    try:
-                        def push_request(hook_url=hook_url, payload=payload):
-                            try:
-                                requests.post(hook_url, json=payload, timeout=0.5)
-                            except requests.RequestException:
-                                pass  # ignore timeout / connection errors
-                        executor = ThreadPoolExecutor(max_workers=8)
-                        executor.submit(push_request)
-                    except Exception:
-                        pass
 
         return result
 
@@ -897,6 +873,7 @@ class YoloRunner:
         self._stop_event = Event()
         self._thread: Thread | None = None
         self._lock = Lock()
+        self._hooks: HookDispatcher = HookDispatcher()
 
     @property
     def is_running(self) -> bool:
@@ -929,6 +906,13 @@ class YoloRunner:
 
             try:
                 result = self.detector.detect(params)
+                if params.hook_urls and params.hook_urls[0]:
+                    print(params.hook_urls)
+                    self._hooks.dispatch(
+                        db_record=params.db_record,
+                        hook_chains=params.hook_urls,
+                    )
+
                 self.last_output_json_path = result.output_json_path
                 self.exception = None
             except Exception as exc:  # Keep the worker alive after bad requests.

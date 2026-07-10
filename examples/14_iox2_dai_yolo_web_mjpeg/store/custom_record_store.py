@@ -531,6 +531,10 @@ class CustomRecord(BaseModel):
         )
     
     @property
+    def calib_path(self) -> Path:
+        return self.path / "calib"
+    
+    @property
     def image_path(self) -> Path:
         return self.path / "imgs"
     
@@ -547,8 +551,16 @@ class CustomRecord(BaseModel):
         return list(self.image_path.rglob(f"rgb{CAMERA_IMAGE_EXTENSION}"))
     
     @property
+    def listup_rgb_image_parent_paths(self) -> List[Path]:
+        return [p.parent for p in self.listup_rgb_image_paths]
+    
+    @property
     def listup_left_image_paths(self) -> List[Path]:
         return list(self.image_path.rglob(f"left{CAMERA_IMAGE_EXTENSION}"))
+    
+    @property
+    def listup_left_image_parent_paths(self) -> List[Path]:
+        return [p.parent for p in self.listup_left_image_paths]
     
     @property
     def listup_right_image_paths(self) -> List[Path]:

@@ -46,16 +46,26 @@ def store_watch(sts=[
 def store_capture(sts=[
         "rgbd_left",
         "rgbd_right"
-    ]):
+    ],to_yolo=True,to_pcd=False):
     logging.info("\n=== store.capture ===")
-    store_capture = call_method("store", "capture", {
+    params = {
         "service": "jrpc",
         "stream_ids": sts,
         "field_id": "field_01",
         "gis": None,
         "capture_timeout_s": None,
-        "fresh_frame": True
-    })
+        "fresh_frame": True,
+        "hook_urls": [[]]
+    }
+    if to_yolo:
+        params["hook_urls"][0].append(
+            "http://localhost:8000/controllers/yolo/start"
+        )
+    if to_pcd:        
+        params["hook_urls"][0].append(
+            "http://localhost:8000/controllers/pcd/to_pcd"
+        )
+    store_capture = call_method("store", "capture", params)
     logging.info(store_capture)
 
 
@@ -79,7 +89,7 @@ def main() -> None:
     store_watch()
     time.sleep(3)
 
-    store_capture()
+    store_capture(to_yolo=True,to_pcd=True)
 
     # # get decodepub status
     # logging.info("\n=== decodepub.status ===")
@@ -132,4 +142,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     # main()
-    store_capture()
+    store_capture(to_yolo=True,to_pcd=True)
+    pass

@@ -29,6 +29,10 @@ dev = [
     "depthai>=3.7.1",
     "pyopengl>=3.1.10",
     "pyopengl-accelerate>=3.1.10",
+    "timm>=1.0.27",
+    "imageio>=2.37.3",
+    "omegaconf>=2.3.1",
+    "triton-windows>=3.7.1.post27",
 ]
 
 [tool.uv.sources]

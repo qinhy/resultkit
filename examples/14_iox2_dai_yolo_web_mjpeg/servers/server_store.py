@@ -24,7 +24,7 @@ from typing import Any, Mapping
 import numpy as np
 import requests
 
-from common import EmptyParams, RpcModel, openapi_doc, CustomStore
+from common import EmptyParams, HookDispatcher, RpcModel, openapi_doc, CustomStore
 from resultkit.MatModel import CodecFormat, ColorFormat, Model4Mat
 from server_rgb_stereo import BUNDLE_MAGIC, BUNDLE_VERSION, BUNDLE_FORMAT, BUNDLE_HEADER, BUNDLE_PREFIX, BUNDLE_TYPE
 # from store.custom_record_store import RGB_STEREO_CAM_NAME
@@ -57,6 +57,8 @@ STREAMS = {
     (STREAM_IDS[i] if i < len(STREAM_IDS) else controller): f"{CAMERA_SERVICE}:{controller}:{BUNDLE_PREFIX}_{BUNDLE_TYPE}"
     for i, controller in enumerate(CONTROLLERS)
 }
+ThreadExecutor = ThreadPoolExecutor(max_workers=8)
+
 
 def default_rgbd_rest(stream_id: str,func="status") -> str:
     return f"{REST_URL_BASE}/controllers/{stream_id}/{func}"
@@ -82,6 +84,12 @@ class CaptureParams(StreamsParams):
     gis: Any | None = None
     capture_timeout_s: float | None = None
     fresh_frame: bool = True
+    # hook_urls:list[list[str]] = [[]]
+    hook_urls:list[list[str]] = [
+            ["http://localhost:8000/controllers/yolo/start"
+             "http://localhost:8000/controllers/pcd/to_pcd"
+            ],
+    ]
 
 
 class StatusResult(StoreModel):
@@ -111,7 +119,7 @@ class StreamCapture(StoreModel):
     frame_index: int | None = None
     timestamp_ns_utc: int | None = None
     images: list[str] = []
-    db_record: Any | None = None
+    db_record: dict | None = None
     error: str | None = None
 
 
@@ -300,6 +308,7 @@ class StoreController:
     _last_error: str | None = field(default=None, init=False, repr=False)
     _last_capture: dict[str, Any] | None = field(default=None, init=False, repr=False)
     _calibration_dicts: dict[str, dict] = field(default_factory=dict, init=False, repr=False)
+    _hooks: HookDispatcher = field(default_factory=HookDispatcher,init=False,repr=False)
 
     @staticmethod
     def openapi_examples() -> dict[str, Any]:
@@ -411,6 +420,12 @@ class StoreController:
                             captures.append(save_frame(stream_id, store, frames[stream_id],
                                                        field_id, ts, params.gis,
                                                        calib))
+                            
+                            if captures[-1].db_record is not None:
+                                self._hooks.dispatch(
+                                    db_record=captures[-1].db_record,
+                                    hook_chains=params.hook_urls,
+                                )
                         except Exception:
                             captures.append(StreamCapture(ok=False, stream_id=stream_id, field_id=field_id,
                                     topic=self.config.streams[stream_id], error=traceback.format_exc()))

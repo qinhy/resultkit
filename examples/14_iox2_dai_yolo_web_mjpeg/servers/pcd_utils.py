@@ -595,4 +595,23 @@ if __name__ == "__main__":
     # )
 
     # print(f"Saved {len(cloud.points_m):,} colored points")
+
+    left = read_image("recording/rgb_stereo/2026-07-10/field_01/145058.976618400JST/imgs/rgbd_left/left.jpg", color=False)
+    right = read_image("recording/rgb_stereo/2026-07-10/field_01/145058.976618400JST/imgs/rgbd_left/right.jpg", color=False)
+    rgb = read_image("recording/rgb_stereo/2026-07-10/field_01/145058.976618400JST/imgs/rgbd_left/rgb.jpg", color=True)  # cv2 gives BGR
+    with open("recording/rgb_stereo/2026-07-10/field_01/145058.976618400JST/calib/rgbd_left.json") as f:
+        calibration = StereoRgbCalibration.from_dict(json.load(f))
+    
+    cloud = stereo_rgb_to_colored_point_cloud(
+        left,
+        right,
+        rgb,
+        calibration=calibration,
+        output_path="colored_cloud.pcd",
+        input_color_order="BGR",
+        num_disparities=160,
+        block_size=5,
+        max_depth_m=5.0,
+        stride=1,
+    )    
     pass
