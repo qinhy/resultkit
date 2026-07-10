@@ -343,7 +343,7 @@ BACKEND_KEYS = _model_field_names(BackendOverrides)
 
 
 class BackendParams(BackendOverrides):
-    backend: DepthBackend = "sgbm"
+    backend: DepthBackend = "dnn"#"sgbm"
     device: str = "cuda"
     valid_iters: int = 8
     max_disp: int = 192
@@ -1188,3 +1188,6 @@ def run_server(controller_name: str = "pcd") -> None:
     from iox2_jsonrpc.iceoryx import Iox2JsonRpcServer
 
     Iox2JsonRpcServer(DepthController(controller_name=controller_name)).run_forever()
+
+if __name__ == "__main__":
+    run_server()

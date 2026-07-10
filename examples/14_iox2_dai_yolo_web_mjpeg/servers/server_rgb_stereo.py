@@ -18,11 +18,18 @@ from resultkit.MatModel import CodecFormat, ColorFormat, Model4Mat
 from resultkit.dai.rgb_stereo_mjpeg_generator import DepthAIPoeRGBStereoMjpegGenerator
 from pcd_utils import StereoRgbCalibration
 
-parser = argparse.ArgumentParser(description="Run the DepthAI MJPEG camera RPC server.")
-parser.add_argument("--service-name", default="jrpc", help="iceoryx2 service name")
-parser.add_argument("--controller-name", default="cameraRgbd", help="camera controller name")
-parser.add_argument("--device", default="169.254.1.222", help="DepthAI device IP or identifier")
-args = parser.parse_args()
+class Args:
+    service_name="jrpc"
+    controller_name="cameraRgbd"
+    device="169.254.1.222"
+args = Args()
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Run the DepthAI MJPEG camera RPC server.")
+    parser.add_argument("--service-name", default="jrpc", help="iceoryx2 service name")
+    parser.add_argument("--controller-name", default="cameraRgbd", help="camera controller name")
+    parser.add_argument("--device", default="169.254.1.222", help="DepthAI device IP or identifier")
+    args = parser.parse_args()
 
 
 NS_PER_SECOND = 1_000_000_000
