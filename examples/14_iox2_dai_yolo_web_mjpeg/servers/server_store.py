@@ -28,6 +28,7 @@ from common import EmptyParams, HookDispatcher, RpcModel, openapi_doc, CustomSto
 from resultkit.MatModel import CodecFormat, ColorFormat, Model4Mat
 from server_rgb_stereo import BUNDLE_MAGIC, BUNDLE_VERSION, BUNDLE_FORMAT, BUNDLE_HEADER, BUNDLE_PREFIX, BUNDLE_TYPE
 # from store.custom_record_store import RGB_STEREO_CAM_NAME
+from resultkit.logger import logger
 
 VERSION = "v5"
 RECORD_MODE = "rgb_stereo"
@@ -58,6 +59,16 @@ STREAMS = {
     for i, controller in enumerate(CONTROLLERS)
 }
 ThreadExecutor = ThreadPoolExecutor(max_workers=8)
+
+logger(f"[{args.service_name}:{args.controller_name}:init] module configuration loaded",
+    extra={
+        "version": VERSION,
+        "service_name": args.service_name,
+        "controller_name": args.controller_name,
+        "store_root": args.store_root,
+        "streams": STREAMS,
+    },
+)
 
 
 def default_rgbd_rest(stream_id: str,func="status") -> str:
@@ -160,26 +171,53 @@ class Subscriber:
 
     def open(self) -> None:
         if self.sub is None:
-            self.sub = Model4Mat.EncodedImageMatPubSub(
-                codec=CodecFormat.MJPEG,
-                color_format=ColorFormat.BGR,
-                frame_index=0,
-                pts_ns=0,
-                dts_ns=0,
-                is_keyframe=True,
-                width=0,
-                height=0,
-                valid_nbytes=0,
-                data=np.zeros((self.capacity_bytes,), dtype=np.uint8),
+            logger(f"[{args.service_name}:{args.controller_name}:Subscriber:open] opening subscriber",
+                extra={
+                    "stream_id": self.stream_id,
+                    "topic": self.topic,
+                    "capacity_bytes": self.capacity_bytes,
+                },
             )
-            self.sub.set_id(self.topic).init()
-            self.sub.is_pub = False
-            self.sub.valid_nbytes = 0
+            try:
+                self.sub = Model4Mat.EncodedImageMatPubSub(
+                    codec=CodecFormat.MJPEG,
+                    color_format=ColorFormat.BGR,
+                    frame_index=0,
+                    pts_ns=0,
+                    dts_ns=0,
+                    is_keyframe=True,
+                    width=0,
+                    height=0,
+                    valid_nbytes=0,
+                    data=np.zeros((self.capacity_bytes,), dtype=np.uint8),
+                )
+                self.sub.set_id(self.topic).init()
+                self.sub.is_pub = False
+                self.sub.valid_nbytes = 0
+                logger(f"[{args.service_name}:{args.controller_name}:Subscriber:open] subscriber opened",
+                    extra={"stream_id": self.stream_id, "topic": self.topic},
+                )
+            except Exception:
+                self.sub = None
+                logger(f"[{args.service_name}:{args.controller_name}:Subscriber:open:error] failed to open subscriber",level="error",
+                    extra={"stream_id": self.stream_id, "topic": self.topic},
+                )
+                raise
 
     def read(self, timeout_s: float, fresh: bool) -> Frame:
         self.open()
+        logger(f"[{args.service_name}:{args.controller_name}:Subscriber:read] waiting for frame",
+            extra={
+                "stream_id": self.stream_id,
+                "topic": self.topic,
+                "timeout_s": timeout_s,
+                "fresh": fresh,
+                "last_frame_index": self.last_frame_index,
+            },
+        )
         deadline = time.monotonic() + max(0.0, float(timeout_s))
         last_error = None
+        invalid_packet_count = 0
         while time.monotonic() <= deadline:
             pkt = self.sub.sub()
             if packet_size(pkt) <= 0:
@@ -189,14 +227,35 @@ class Subscriber:
                 bundle = unpack(pkt)
             except Exception as exc:
                 last_error = str(exc)
+                invalid_packet_count += 1
                 time.sleep(0.001)
                 continue
             if fresh and bundle.frame_index == self.last_frame_index:
                 time.sleep(0.001)
                 continue
             self.last_frame_index = bundle.frame_index
+            logger(f"[{args.service_name}:{args.controller_name}:Subscriber:read] frame received",
+                extra={
+                    "stream_id": self.stream_id,
+                    "topic": self.topic,
+                    "frame_index": bundle.frame_index,
+                    "pts_ns": bundle.pts_ns,
+                    "invalid_packet_count": invalid_packet_count,
+                },
+            )
             return Frame(self.stream_id, self.topic, bundle.frame_index, bundle.pts_ns, bundle, time.time_ns())
         suffix = f" Last error: {last_error}" if last_error else ""
+        logger(f"[{args.service_name}:{args.controller_name}:Subscriber:read] timed out waiting for frame",
+            level="warning",
+            extra={
+                "stream_id": self.stream_id,
+                "topic": self.topic,
+                "timeout_s": timeout_s,
+                "fresh": fresh,
+                "invalid_packet_count": invalid_packet_count,
+                "last_error": last_error,
+            },
+        )
         raise TimeoutError(f"Timed out waiting for {self.stream_id!r} on {self.topic!r}.{suffix}")
 
 
@@ -231,11 +290,15 @@ def unpack(pkt: Any) -> Bundle:
 def write_json(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, sort_keys=False) + "\n", encoding="utf-8")
+    logger(f"[{args.service_name}:{args.controller_name}:write_json] wrote JSON file", extra={"path": path.as_posix()})
 
 
 def add_gis(record: Any, gis: Any | None) -> None:
     if gis is None:
         return
+    logger(f"[{args.service_name}:{args.controller_name}:add_gis] saving GIS data",
+        extra={"record_id": getattr(record, "record_id", None), "mapping": isinstance(gis, Mapping)},
+    )
     if isinstance(gis, Mapping):
         for kind in ("location", "pose", "coordinate_system", "geofences", "map_notes"):
             if kind in gis:
@@ -248,6 +311,15 @@ def add_gis(record: Any, gis: Any | None) -> None:
 def save_frame(cam_name:str, store: CustomStore, frame: Frame, field_id: str,
                ts, gis: Any | None, calib: Any | None) -> StreamCapture:    
     # ts = time.time_ns()
+    logger(f"[{args.service_name}:{args.controller_name}:save_frame] saving frame",
+        extra={
+            "stream_id": frame.stream_id,
+            "camera_name": cam_name,
+            "field_id": field_id,
+            "frame_index": frame.frame_index,
+            "timestamp_ns": ts,
+        },
+    )
     for sequence in range(1, 1000):
         try:
             record = store.add_record(RECORD_MODE, ts, field_id, sequence, exist_ok=True)
@@ -257,14 +329,34 @@ def save_frame(cam_name:str, store: CustomStore, frame: Frame, field_id: str,
     else:
         raise FileExistsError("Could not allocate unique record_id")
 
+    logger(f"[{args.service_name}:{args.controller_name}:save_frame] record allocated",
+        extra={
+            "stream_id": frame.stream_id,
+            "record_id": record.record_id,
+            "record_path": record.path.as_posix(),
+            "sequence": sequence,
+        },
+    )
+
     add_gis(record, gis)
     images = []
     for name, data in (("rgb", frame.bundle.rgb), ("left", frame.bundle.left), ("right", frame.bundle.right)):
         record.add_image(cam_name, name, data)
         images.append(f"imgs/{cam_name}/{name}.jpg")
 
+    logger(f"[{args.service_name}:{args.controller_name}:save_frame] images saved",
+        extra={
+            "stream_id": frame.stream_id,
+            "record_id": record.record_id,
+            "images": images,
+        },
+    )
+
     if calib:
         record.add_calibration(cam_name,calib)
+        logger(f"[{args.service_name}:{args.controller_name}:save_frame] calibration saved",
+            extra={"stream_id": frame.stream_id, "record_id": record.record_id},
+        )
 
     write_json(record.path / "logs" / "capture_frame.json", {
         "stream_id": frame.stream_id,
@@ -274,7 +366,7 @@ def save_frame(cam_name:str, store: CustomStore, frame: Frame, field_id: str,
         "received_ns_utc": frame.received_ns_utc,
         "saved_ns_utc": ts,
     })
-    return StreamCapture(
+    result = StreamCapture(
         ok=True,
         stream_id=frame.stream_id,
         field_id=field_id,
@@ -287,6 +379,15 @@ def save_frame(cam_name:str, store: CustomStore, frame: Frame, field_id: str,
         images=images,
         db_record=json.loads(record.model_dump_json()),
     )
+    logger(f"[{args.service_name}:{args.controller_name}:save_frame] frame saved",
+        extra={
+            "stream_id": frame.stream_id,
+            "record_id": record.record_id,
+            "record_path": record.path.as_posix(),
+            "frame_index": frame.frame_index,
+        },
+    )
+    return result
 
 
 def dump_model(model: Any) -> dict[str, Any]:
@@ -310,6 +411,16 @@ class StoreController:
     _calibration_dicts: dict[str, dict] = field(default_factory=dict, init=False, repr=False)
     _hooks: HookDispatcher = field(default_factory=HookDispatcher,init=False,repr=False)
 
+    def __post_init__(self) -> None:
+        logger(f"[{args.service_name}:{args.controller_name}:init] controller initialized",
+            extra={
+                "service_name": self.service_name,
+                "controller_name": self.controller_name,
+                "root_path": self.config.root_path,
+                "streams": self.config.streams,
+            },
+        )
+
     @staticmethod
     def openapi_examples() -> dict[str, Any]:
         return {
@@ -320,9 +431,17 @@ class StoreController:
 
     def _check(self, stream_ids: list[str]) -> list[str]:
         if not isinstance(stream_ids, list) or not stream_ids or not all(isinstance(x, str) and x for x in stream_ids):
+            logger(f"[{args.service_name}:{args.controller_name}:check] invalid stream_ids",
+                level="warning",
+                extra={"stream_ids": stream_ids},
+            )
             raise ValueError("stream_ids must be a non-empty list of strings, e.g. ['left'] or ['left', 'right']")
         unknown = [x for x in stream_ids if x not in self.config.streams]
         if unknown:
+            logger(f"[{args.service_name}:{args.controller_name}:check] unknown stream_ids",
+                level="warning",
+                extra={"unknown": unknown, "known": sorted(self.config.streams)},
+            )
             raise ValueError(f"Unknown stream_ids {unknown!r}; known={sorted(self.config.streams)}")
         return stream_ids
 
@@ -330,9 +449,16 @@ class StoreController:
         topic = self.config.streams[stream_id]
         sub = self._subs.get(stream_id)
         if sub is None or sub.topic != topic:
+            logger(f"[{args.service_name}:{args.controller_name}:sub] creating subscriber",
+                extra={"stream_id": stream_id, "topic": topic},
+            )
             sub = Subscriber(stream_id, topic, int(self.config.subscriber_capacity_bytes))
             sub.open()
             self._subs[stream_id] = sub
+        else:
+            logger(f"[{args.service_name}:{args.controller_name}:sub] reusing subscriber",
+                extra={"stream_id": stream_id, "topic": topic},
+            )
         return sub
 
     def _status(self) -> StatusResult:
@@ -347,50 +473,108 @@ class StoreController:
 
     def configure(self, params: StoreConfig) -> StatusResult:
         with self._lock:
+            logger(f"[{args.service_name}:{args.controller_name}:configure] applying configuration",
+                extra={"config": dump_model(params) if params is not None else None},
+            )
             self.config = params or self.config
             self._subs.clear()
             self._last_error = None
-            return self._status()
+            result = self._status()
+            logger(f"[{args.service_name}:{args.controller_name}:configure] configuration applied",
+                extra={"root_path": result.root_path, "streams": result.streams},
+            )
+            return result
 
     def status(self, params: EmptyParams) -> StatusResult:
         with self._lock:
-            return self._status()
+            result = self._status()
+            logger(f"[{args.service_name}:{args.controller_name}:status] status requested",
+                extra={
+                    "opened": result.opened,
+                    "subscribed_streams": result.subscribed_streams,
+                    "has_last_error": result.last_error is not None,
+                },
+            )
+            return result
 
     def _set_calib(self, stream_id):
         if stream_id not in self._calibration_dicts:
-            calib = requests.get(default_rgbd_rest(stream_id,"calibration"))
+            url = default_rgbd_rest(stream_id,"calibration")
+            logger(f"[{args.service_name}:{args.controller_name}:calibration] requesting calibration",
+                extra={"stream_id": stream_id, "url": url},
+            )
+            calib = requests.get(url)
             self._calibration_dicts[stream_id] = calib.json()
             if "calibration" in self._calibration_dicts[stream_id]:
                 self._calibration_dicts[stream_id] = self._calibration_dicts[stream_id]["calibration"]
+            logger(f"[{args.service_name}:{args.controller_name}:calibration] calibration cached",
+                extra={
+                    "stream_id": stream_id,
+                    "status_code": calib.status_code,
+                    "keys": list(self._calibration_dicts[stream_id]),
+                },
+            )
+        else:
+            logger(f"[{args.service_name}:{args.controller_name}:calibration] using cached calibration",
+                extra={"stream_id": stream_id},
+            )
 
     def watch(self, params: StreamsParams) -> WatchResult:
         with self._lock:
+            logger(f"[{args.service_name}:{args.controller_name}:watch] watch requested",
+                extra={"stream_ids": getattr(params, "stream_ids", [])},
+            )
             try:
                 stream_ids = self._check(params.stream_ids)
                 for stream_id in stream_ids:
                     self._sub(stream_id)
                     self._set_calib(stream_id)
                 self._last_error = None
-                return WatchResult(ok=True, stream_ids=stream_ids, subscribed_streams=sorted(self._subs))
+                result = WatchResult(ok=True, stream_ids=stream_ids, subscribed_streams=sorted(self._subs))
+                logger(f"[{args.service_name}:{args.controller_name}:watch] streams watched",
+                    extra={"stream_ids": stream_ids, "subscribed_streams": result.subscribed_streams},
+                )
+                return result
             except Exception:
                 self._last_error = traceback.format_exc()
+                logger(f"[{args.service_name}:{args.controller_name}:watch:error] watch failed",level="error",
+                    extra={"stream_ids": getattr(params, "stream_ids", [])},
+                )
                 return WatchResult(ok=False, stream_ids=getattr(params, "stream_ids", []), subscribed_streams=sorted(self._subs), error=self._last_error)
 
     def unwatch(self, params: StreamsParams) -> WatchResult:
         with self._lock:
+            logger(f"[{args.service_name}:{args.controller_name}:unwatch] unwatch requested",
+                extra={"stream_ids": getattr(params, "stream_ids", [])},
+            )
             try:
                 stream_ids = self._check(params.stream_ids)
                 for stream_id in stream_ids:
                     self._subs.pop(stream_id, None)
                 self._last_error = None
-                return WatchResult(ok=True, stream_ids=stream_ids, subscribed_streams=sorted(self._subs))
+                result = WatchResult(ok=True, stream_ids=stream_ids, subscribed_streams=sorted(self._subs))
+                logger(f"[{args.service_name}:{args.controller_name}:unwatch] streams unwatched",
+                    extra={"stream_ids": stream_ids, "subscribed_streams": result.subscribed_streams},
+                )
+                return result
             except Exception:
                 self._last_error = traceback.format_exc()
+                logger(f"[{args.service_name}:{args.controller_name}:unwatch:error] unwatch failed",level="error",
+                    extra={"stream_ids": getattr(params, "stream_ids", [])},
+                )
                 return WatchResult(ok=False, stream_ids=getattr(params, "stream_ids", []), subscribed_streams=sorted(self._subs), error=self._last_error)
 
     def capture(self, params: CaptureParams) -> CaptureResult:
         with self._lock:
             field_id = str(params.field_id or "field_01")
+            logger(f"[{args.service_name}:{args.controller_name}:capture] capture requested",
+                extra={
+                    "stream_ids": getattr(params, "stream_ids", []),
+                    "field_id": field_id,
+                    "fresh_frame": getattr(params, "fresh_frame", True),
+                    "capture_timeout_s": getattr(params, "capture_timeout_s", None),
+                },
+            )
             try:
                 stream_ids = self._check(params.stream_ids)
                 subs = {}
@@ -400,6 +584,13 @@ class StoreController:
                 timeout_s = float(params.capture_timeout_s or self.config.capture_timeout_s)
                 captures: list[StreamCapture] = []
                 store = CustomStore(self.config.root_path)
+                logger(f"[{args.service_name}:{args.controller_name}:capture] subscribers ready",
+                    extra={
+                        "stream_ids": stream_ids,
+                        "timeout_s": timeout_s,
+                        "root_path": self.config.root_path,
+                    },
+                )
 
                 with ThreadPoolExecutor(max_workers=len(subs)) as pool:
                     futures = {pool.submit(sub.read, timeout_s, bool(params.fresh_frame)): stream_id for stream_id, sub in subs.items()}
@@ -408,9 +599,20 @@ class StoreController:
                         stream_id = futures[future]
                         try:
                             frames[stream_id] = future.result()
+                            logger(f"[{args.service_name}:{args.controller_name}:capture] frame acquired",
+                                extra={
+                                    "stream_id": stream_id,
+                                    "frame_index": frames[stream_id].frame_index,
+                                    "topic": frames[stream_id].topic,
+                                },
+                            )
                         except Exception:
+                            error = traceback.format_exc()
+                            logger(f"[{args.service_name}:{args.controller_name}:capture:error] frame acquisition failed",level="error",
+                                extra={"stream_id": stream_id, "field_id": field_id},
+                            )
                             captures.append(StreamCapture(ok=False, stream_id=stream_id, field_id=field_id,
-                                    topic=self.config.streams[stream_id], error=traceback.format_exc()))
+                                    topic=self.config.streams[stream_id], error=error))
 
                 ts = time.time_ns()
                 for stream_id in stream_ids:
@@ -420,15 +622,36 @@ class StoreController:
                             captures.append(save_frame(stream_id, store, frames[stream_id],
                                                        field_id, ts, params.gis,
                                                        calib))
+                            logger(f"[{args.service_name}:{args.controller_name}:capture] stream capture saved",
+                                extra={
+                                    "stream_id": stream_id,
+                                    "field_id": field_id,
+                                    "record_id": captures[-1].record_id,
+                                },
+                            )
                             
                             if captures[-1].db_record is not None:
+                                logger(f"[{args.service_name}:{args.controller_name}:capture] dispatching hooks",
+                                    extra={
+                                        "stream_id": stream_id,
+                                        "record_id": captures[-1].record_id,
+                                        "hook_chains": params.hook_urls,
+                                    },
+                                )
                                 self._hooks.dispatch(
                                     db_record=captures[-1].db_record,
                                     hook_chains=params.hook_urls,
                                 )
+                                logger(f"[{args.service_name}:{args.controller_name}:capture] hooks dispatched",
+                                    extra={"stream_id": stream_id, "record_id": captures[-1].record_id},
+                                )
                         except Exception:
+                            error = traceback.format_exc()
+                            logger(f"[{args.service_name}:{args.controller_name}:capture:error] failed to save stream capture",level="error",
+                                extra={"stream_id": stream_id, "field_id": field_id},
+                            )
                             captures.append(StreamCapture(ok=False, stream_id=stream_id, field_id=field_id,
-                                    topic=self.config.streams[stream_id], error=traceback.format_exc()))
+                                    topic=self.config.streams[stream_id], error=error))
 
                 captures.sort(key=lambda x: stream_ids.index(x.stream_id))
                 ok = all(x.ok for x in captures)
@@ -436,9 +659,25 @@ class StoreController:
                 result = CaptureResult(ok=ok, stream_ids=stream_ids, field_id=field_id, captures=captures, error=error)
                 self._last_capture = dump_model(result)
                 self._last_error = error
+                logger(f"[{args.service_name}:{args.controller_name}:capture] capture completed",
+                    level="info" if ok else "warning",
+                    extra={
+                        "ok": ok,
+                        "stream_ids": stream_ids,
+                        "field_id": field_id,
+                        "success_count": sum(1 for capture in captures if capture.ok),
+                        "failure_count": sum(1 for capture in captures if not capture.ok),
+                    },
+                )
                 return result
             except Exception:
                 self._last_error = traceback.format_exc()
+                logger(f"[{args.service_name}:{args.controller_name}:capture:error] capture failed",level="error",
+                    extra={
+                        "stream_ids": getattr(params, "stream_ids", []),
+                        "field_id": field_id,
+                    },
+                )
                 result = CaptureResult(ok=False, stream_ids=getattr(params, "stream_ids", []), field_id=field_id, captures=[], error=self._last_error)
                 self._last_capture = dump_model(result)
                 return result
@@ -446,7 +685,21 @@ class StoreController:
 
 def run_server(service_name: str = args.service_name, controller_name: str = args.controller_name) -> None:
     from iox2_jsonrpc.iceoryx import Iox2JsonRpcServer
-    Iox2JsonRpcServer(StoreController(service_name=service_name, controller_name=controller_name)).run_forever()
+    logger(f"[{args.service_name}:{controller_name}:run_server] starting RPC server",
+        extra={"service_name": service_name, "controller_name": controller_name},
+    )
+    try:
+        Iox2JsonRpcServer(StoreController(service_name=service_name, controller_name=controller_name)).run_forever()
+    except KeyboardInterrupt:
+        logger(f"[{args.service_name}:{controller_name}:run_server] server interrupted", level="warning")
+        raise
+    except Exception:
+        logger(f"[{args.service_name}:{args.controller_name}:run_server:error] server stopped with an error",level="error",
+            extra={"service_name": service_name, "controller_name": controller_name},
+        )
+        raise
+    finally:
+        logger(f"[{args.service_name}:{controller_name}:run_server] server stopped")
 
 
 if __name__ == "__main__":

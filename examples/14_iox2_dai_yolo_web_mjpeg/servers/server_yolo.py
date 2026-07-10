@@ -1,23 +1,33 @@
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
 import json
-import logging
 import math
-import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
 from queue import Empty, Queue
 from threading import Event, Lock, Thread
+import time
 from typing import Any, List, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, computed_field
-import requests
+from pydantic import BaseModel, ConfigDict, Field
+
+import torch
+from torchvision.io import ImageReadMode, decode_jpeg, read_file
+import torch.nn.functional as F
+from ultralytics import YOLO
 
 from common import EmptyParams, HookDispatcher, RpcModel, openapi_doc
 from store.custom_record_store import CustomRecord
+from resultkit.logger import logger
 
-logger = logging.getLogger(__name__)
+
+DEFAULT_SERVICE_NAME = "jrpc"
+DEFAULT_CONTROLLER_NAME = "yolo"
+
+logger(
+    f"[{DEFAULT_SERVICE_NAME}:{DEFAULT_CONTROLLER_NAME}:init] module loaded",
+    extra={"module": __name__},
+)
 
 
 SizeMode = Literal["resize", "tiling"]
@@ -27,11 +37,7 @@ MaskOrder = Literal["row_major"]
 
 
 class YoloBaseModel(RpcModel):
-    service: Literal["yolo"] = "yolo"
-
-    def model_post_init(self, context: Any) -> None:
-        logger.debug("[Yolo %s]", self.__class__.__name__)
-        return super().model_post_init(context)
+    service:str = DEFAULT_SERVICE_NAME
 
 
 class StartYoloParams(YoloBaseModel):
@@ -55,6 +61,14 @@ class StartYoloParams(YoloBaseModel):
 
             self.input_jpg_paths = [str(p) for p in input_jpg_paths]
             self.output_json_paths = [str(p) for p in output_json_paths]
+            logger(
+                f"[{DEFAULT_SERVICE_NAME}:{DEFAULT_CONTROLLER_NAME}:params] image paths derived from record",
+                extra={
+                    "record_id": getattr(self.db_record, "record_id", None),
+                    "input_count": len(self.input_jpg_paths),
+                    "output_count": len(self.output_json_paths),
+                },
+            )
 
         return super().model_post_init(context)
 
@@ -62,7 +76,7 @@ class StartYoloParams(YoloBaseModel):
 class YoloSettings(YoloBaseModel):
     """Runtime settings for model inference and detection serialization."""
 
-    model_name: str = "yolov8n.pt"
+    model_name: str = "yolov8n-seg.pt"
 
     # Kept as ``imgz`` for compatibility with the original JSON-RPC contract.
     # Ultralytics calls this parameter ``imgsz``.
@@ -169,100 +183,311 @@ class YoloDetectResult(BaseModel):
 
 
 class YoloDetector:
-    """Torch-first wrapper around Ultralytics YOLO weights.
+    """High-throughput Torch-first wrapper around Ultralytics YOLO weights.
 
-    This avoids ``YOLO.predict()`` and runs a direct PyTorch forward pass,
-    followed by torch/torchvision NMS. It keeps Ultralytics only for loading
-    ``.pt`` weights and model metadata.
+    Performance-oriented changes compared with the original implementation:
+
+    * JPEG files are decoded with ``torchvision.io.decode_jpeg``. On CUDA this
+      uses nvJPEG and returns a CHW uint8 tensor directly on the GPU.
+    * The model is moved/cast only when the requested device or precision
+      changes, instead of once per image or tile.
+    * Letterbox resize, normalization, padding, and tile crops stay in Torch.
+    * Tiles are submitted to the model in batches. Configure the batch size by
+      adding ``tile_batch_size`` to ``YoloSettings``; otherwise it defaults to 8.
+    * Detection tensors are copied to CPU in bulk instead of synchronizing once
+      for every scalar.
+    * Mask RLE creation uses vectorized run-boundary detection rather than a
+      Python loop over every pixel.
+
+    This class assumes the same project-level dependencies and data models as
+    the original class: ``YoloSettings``, ``StartYoloParams``,
+    ``YoloDetectResult``, ``YoloDetection``, ``YoloInstanceMask``, ``YoloTile``,
+    ``YOLO``, ``logger``, ``DEFAULT_SERVICE_NAME``, and
+    ``DEFAULT_CONTROLLER_NAME``.
     """
 
-    def __init__(self, settings: YoloSettings | None = None) -> None:
+    def __init__(
+        self,
+        settings: YoloSettings | None = None,
+        service_name: str = DEFAULT_SERVICE_NAME,
+        controller_name: str = DEFAULT_CONTROLLER_NAME,
+    ) -> None:
+        self.service_name = service_name
+        self.controller_name = controller_name
         self.settings = settings or YoloSettings()
+
         self._model: Any | None = None
         self._model_name_loaded: str | None = None
+        self._model_device: Any | None = None
+        self._model_dtype: Any | None = None
+
         self._names: dict[int, str] = {}
         self._nc: int = 0
         self._mask_coeff_count: int = 0
         self._is_segment_model: bool = False
+
         self._lock = Lock()
+        self._nvjpeg_fallback_warning_emitted = False
+
+        logger(
+            f"[{self.service_name}:{self.controller_name}:detector:init] detector initialized",
+            extra={
+                "model_name": self.settings.model_name,
+                "imgsz": self.settings.imgsz,
+                "confidence": self.settings.confidence,
+                "iou": self.settings.iou,
+                "include_masks": self.settings.include_masks,
+                "tile_batch_size": self._tile_batch_size(),
+            },
+        )
 
     def change_settings(self, settings: YoloSettings) -> None:
         with self._lock:
-            reload_model = settings.model_name != self.settings.model_name
+            previous_model_name = self.settings.model_name
+            reload_model = settings.model_name != previous_model_name
+
+            logger(
+                f"[{self.service_name}:{self.controller_name}:detector:settings] applying detector settings",
+                extra={
+                    "previous_model_name": previous_model_name,
+                    "model_name": settings.model_name,
+                    "reload_model": reload_model,
+                    "imgsz": settings.imgsz,
+                    "confidence": settings.confidence,
+                    "iou": settings.iou,
+                    "max_detections": settings.max_detections,
+                    "include_masks": settings.include_masks,
+                    "tile_batch_size": max(
+                        1,
+                        int(getattr(settings, "tile_batch_size", 8) or 8),
+                    ),
+                },
+            )
+
             self.settings = settings
+
             if reload_model:
                 self._model = None
                 self._model_name_loaded = None
+                self._model_device = None
+                self._model_dtype = None
                 self._names = {}
                 self._nc = 0
                 self._mask_coeff_count = 0
                 self._is_segment_model = False
 
+            logger(
+                f"[{self.service_name}:{self.controller_name}:detector:settings] detector settings applied",
+                extra={
+                    "model_name": self.settings.model_name,
+                    "reload_model": reload_model,
+                },
+            )
+
+    def _tile_batch_size(self) -> int:
+        """Return a safe tile batch size without requiring a schema change."""
+        return max(1, int(getattr(self.settings, "tile_batch_size", 8) or 8))
+
     def _load_model(self) -> Any:
         """Load the underlying PyTorch module from Ultralytics weights."""
-        if self._model is not None and self._model_name_loaded == self.settings.model_name:
+        if (
+            self._model is not None
+            and self._model_name_loaded == self.settings.model_name
+        ):
             return self._model
 
-        try:
-            from ultralytics import YOLO
-        except ImportError as exc:
-            raise RuntimeError(
-                "The 'ultralytics' package is required to load YOLO weights. "
-                "Install it with: pip install ultralytics"
-            ) from exc
+        with self._lock:
+            if (
+                self._model is not None
+                and self._model_name_loaded == self.settings.model_name
+            ):
+                return self._model
 
-        yolo = YOLO(self.settings.model_name)
-        model = yolo.model
-        model.eval()
+            logger(
+                f"[{self.service_name}:{self.controller_name}:model:load] loading YOLO model",
+                extra={"model_name": self.settings.model_name},
+            )
 
-        # fuse() is available on Ultralytics PyTorch models and usually makes
-        # Conv+BatchNorm inference a little faster. If it is unavailable or not
-        # supported by a custom model, continue without failing startup.
-        try:
-            model.fuse()
-        except Exception:
-            logger.debug("YOLO model fuse() skipped", exc_info=True)
+            try:
+                yolo = YOLO(self.settings.model_name)
+                model = yolo.model
+                model.eval()
 
-        names = getattr(yolo, "names", None) or getattr(model, "names", {}) or {}
-        if isinstance(names, dict):
-            self._names = {int(k): str(v) for k, v in names.items()}
-        else:
-            self._names = {idx: str(name) for idx, name in enumerate(names)}
+                try:
+                    model.fuse()
+                except Exception as exc:
+                    logger(
+                        f"[{self.service_name}:{self.controller_name}:model:fuse] model fuse skipped",
+                        level="warning",
+                        extra={
+                            "model_name": self.settings.model_name,
+                            "error": str(exc),
+                        },
+                    )
 
-        head = None
-        try:
-            head = model.model[-1]
-        except Exception:
-            head = None
+                names = (
+                    getattr(yolo, "names", None)
+                    or getattr(model, "names", {})
+                    or {}
+                )
+                if isinstance(names, dict):
+                    self._names = {int(k): str(v) for k, v in names.items()}
+                else:
+                    self._names = {
+                        idx: str(name) for idx, name in enumerate(names)
+                    }
 
-        self._nc = int(getattr(head, "nc", len(self._names) or 0) or 0)
-        if self._nc and not self._names:
-            self._names = {idx: str(idx) for idx in range(self._nc)}
+                head = None
+                try:
+                    head = model.model[-1]
+                except Exception:
+                    head = None
 
-        self._mask_coeff_count = int(getattr(head, "nm", 0) or 0)
-        self._is_segment_model = bool(
-            self._mask_coeff_count
-            or getattr(yolo, "task", None) == "segment"
-            or getattr(model, "task", None) == "segment"
-            or (head is not None and "Segment" in head.__class__.__name__)
-        )
+                self._nc = int(
+                    getattr(head, "nc", len(self._names) or 0) or 0
+                )
+                if self._nc and not self._names:
+                    self._names = {
+                        idx: str(idx) for idx in range(self._nc)
+                    }
 
-        self._model = model
-        self._model_name_loaded = self.settings.model_name
-        return self._model
+                self._mask_coeff_count = int(
+                    getattr(head, "nm", 0) or 0
+                )
+                self._is_segment_model = bool(
+                    self._mask_coeff_count
+                    or getattr(yolo, "task", None) == "segment"
+                    or getattr(model, "task", None) == "segment"
+                    or (
+                        head is not None
+                        and "Segment" in head.__class__.__name__
+                    )
+                )
+            except Exception:
+                logger(
+                    f"[{self.service_name}:{self.controller_name}:model:load:error] failed to load YOLO model",
+                    level="error",
+                    extra={"model_name": self.settings.model_name},
+                )
+                raise
+
+            self._model = model
+            self._model_name_loaded = self.settings.model_name
+            self._model_device = None
+            self._model_dtype = None
+
+            logger(
+                f"[{self.service_name}:{self.controller_name}:model:load] YOLO model loaded",
+                extra={
+                    "model_name": self.settings.model_name,
+                    "class_count": self._nc,
+                    "mask_coeff_count": self._mask_coeff_count,
+                    "task": (
+                        "segment" if self._is_segment_model else "detect"
+                    ),
+                },
+            )
+
+            return self._model
+
+    def _prepare_model(self, device: Any) -> tuple[Any, Any]:
+        """Move/cast the model only when device or precision changes."""
+
+        model = self._load_model()
+        use_half = bool(self.settings.half and device.type == "cuda")
+        dtype = torch.float16 if use_half else torch.float32
+
+        if self._model_device != device or self._model_dtype != dtype:
+            with self._lock:
+                if self._model_device != device or self._model_dtype != dtype:
+                    model.to(device=device, dtype=dtype)
+                    model.eval()
+                    self._model_device = device
+                    self._model_dtype = dtype
+
+                    if device.type == "cuda":
+                        # Letterboxed model inputs have a stable spatial size.
+                        torch.backends.cudnn.benchmark = True
+
+                    logger(
+                        f"[{self.service_name}:{self.controller_name}:model:prepare] model prepared",
+                        extra={
+                            "device": str(device),
+                            "dtype": str(dtype),
+                        },
+                    )
+
+        return model, dtype
 
     def detect(self, params: StartYoloParams) -> YoloDetectResult:
-        for image_path, output_json_path in zip(params.input_jpg_paths,params.output_json_paths):
-            image_path = Path(image_path)
-            output_json_path = Path(output_json_path)
+        input_count = len(params.input_jpg_paths)
+        output_count = len(params.output_json_paths)
+
+        if input_count == 0:
+            raise ValueError("At least one input JPEG path is required")
+        if input_count != output_count:
+            raise ValueError(
+                "input_jpg_paths and output_json_paths must have equal lengths: "
+                f"{input_count} != {output_count}"
+            )
+
+        logger(
+            f"[{self.service_name}:{self.controller_name}:detect] inference request started",
+            extra={
+                "input_count": input_count,
+                "output_count": output_count,
+                "size_mode": params.size_mode,
+                "cuda_device": params.cuda_device,
+                "model_name": self.settings.model_name,
+                "tile_batch_size": self._tile_batch_size(),
+            },
+        )
+
+        start_time = time.perf_counter()
+        processed_count = 0
+        result: YoloDetectResult | None = None
+
+        # Prepare once before entering image/tile loops.
+        device = self._device(params.cuda_device)
+        self._prepare_model(device)
+
+        for image_path_value, output_json_path_value in zip(
+            params.input_jpg_paths,
+            params.output_json_paths,
+        ):
+            image_path = Path(image_path_value)
+            output_json_path = Path(output_json_path_value)
+
+            logger(
+                f"[{self.service_name}:{self.controller_name}:detect:image] processing image",
+                extra={
+                    "input_jpg_path": image_path.as_posix(),
+                    "output_json_path": output_json_path.as_posix(),
+                    "size_mode": params.size_mode,
+                    "cuda_device": params.cuda_device,
+                },
+            )
 
             if not image_path.is_file():
-                raise FileNotFoundError(f"Input image does not exist: {image_path}")
+                logger(
+                    f"[{self.service_name}:{self.controller_name}:detect:image] input image is missing",
+                    level="warning",
+                    extra={"input_jpg_path": image_path.as_posix()},
+                )
+                raise FileNotFoundError(
+                    f"Input image does not exist: {image_path}"
+                )
 
             if params.size_mode == "tiling":
-                image_payload = self._detect_tiled(image_path, params.cuda_device)
+                image_payload = self._detect_tiled(
+                    image_path,
+                    params.cuda_device,
+                )
             else:
-                image_payload = self._detect_resized(image_path, params.cuda_device)
+                image_payload = self._detect_resized(
+                    image_path,
+                    params.cuda_device,
+                )
 
             result = YoloDetectResult(
                 input_jpg_path=str(image_path),
@@ -273,116 +498,245 @@ class YoloDetector:
                 **image_payload,
             )
 
-            output_path = Path(result.output_json_path)
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-            output_path.write_text(result.to_json_text(), encoding="utf-8")
+            output_json_path.parent.mkdir(parents=True, exist_ok=True)
+            output_json_path.write_text(
+                result.to_json_text(),
+                encoding="utf-8",
+            )
+            processed_count += 1
 
+            logger(
+                f"[{self.service_name}:{self.controller_name}:detect:image] inference output written",
+                extra={
+                    "input_jpg_path": result.input_jpg_path,
+                    "output_json_path": result.output_json_path,
+                    "task": result.task,
+                    "num_detections": result.num_detections,
+                    "has_masks": result.has_masks,
+                    "tile_count": result.tile_count,
+                },
+            )
+
+        elapsed = time.perf_counter() - start_time
+        # assert result is not None
+        seconds_per_imag = elapsed/processed_count if processed_count else 0
+        logger(
+            f"[{self.service_name}:{self.controller_name}:detect] inference request completed ({seconds_per_imag:.2f} sec/image)",
+            extra={
+                "processed_count": processed_count,
+                "last_output_json_path": result.output_json_path,
+                "seconds_per_image": seconds_per_imag,
+            },
+        )
         return result
 
     def _device(self, cuda_device: int) -> Any:
-        import torch
-
         if cuda_device >= 0 and torch.cuda.is_available():
+            device_count = torch.cuda.device_count()
+            if cuda_device >= device_count:
+                raise ValueError(
+                    f"CUDA device {cuda_device} is unavailable; "
+                    f"device_count={device_count}"
+                )
             return torch.device(f"cuda:{cuda_device}")
         return torch.device("cpu")
 
-    def _predict(self, source: Any, cuda_device: int) -> list[YoloDetection]:
-        """Run one torch forward pass, torch NMS, and optional mask decoding."""
+    def _decode_jpeg(self, image_path: Path, device: Any) -> Any:
+        """Decode a JPEG to a CHW uint8 tensor, using nvJPEG on CUDA.
+
+        ``read_file`` returns the compressed bytes as a CPU tensor, as required
+        by ``decode_jpeg``. When ``device`` is CUDA, torchvision asks nvJPEG to
+        place the decoded pixels directly on that GPU.
+        """
+        encoded = read_file(str(image_path))
+
         try:
-            import numpy as np
-            import torch
-            from PIL import Image
-        except ImportError as exc:
+            image = decode_jpeg(
+                encoded,
+                mode=ImageReadMode.RGB,
+                device=device,
+            )
+        except Exception as exc:
+            if device.type != "cuda":
+                raise
+
+            # Keep the service usable if torchvision was installed without the
+            # CUDA image extension or nvJPEG rejects a particular JPEG.
+            if not self._nvjpeg_fallback_warning_emitted:
+                logger(
+                    f"[{self.service_name}:{self.controller_name}:image:decode] nvJPEG decode failed; using torchvision CPU decode fallback",
+                    level="warning",
+                    extra={
+                        "input_jpg_path": image_path.as_posix(),
+                        "device": str(device),
+                        "error": str(exc),
+                    },
+                )
+                self._nvjpeg_fallback_warning_emitted = True
+
+            image = decode_jpeg(
+                encoded,
+                mode=ImageReadMode.RGB,
+                device="cpu",
+            ).to(device=device, non_blocking=True)
+
+        if image.ndim != 3 or int(image.shape[0]) != 3:
             raise RuntimeError(
-                "Torch YOLO inference requires torch, numpy, and Pillow. "
-                "Install them with: pip install torch torchvision numpy pillow"
-            ) from exc
+                "Expected decoded RGB CHW tensor, got shape "
+                f"{tuple(image.shape)} for {image_path}"
+            )
 
-        image = Image.open(source).convert("RGB") if isinstance(source, (str, Path)) else source.convert("RGB")
-        original_width, original_height = image.size
+        return image.contiguous()
 
-        model = self._load_model()
+    def _predict_batch(
+        self,
+        images: list[Any],
+        cuda_device: int,
+    ) -> list[list[YoloDetection]]:
+        """Run one batched forward pass for CHW uint8 image tensors."""
+
+        if not images:
+            return []
+
         device = self._device(cuda_device)
-        model.to(device)
-        model.eval()
+        model, dtype = self._prepare_model(device)
 
-        use_half = bool(self.settings.half and device.type == "cuda")
-        if use_half:
-            model.half()
-        else:
-            model.float()
+        network_inputs: list[Any] = []
+        metadata: list[tuple[int, int, float, tuple[int, int]]] = []
 
-        input_image, gain, pad = self._letterbox(image)
-        input_width, input_height = input_image.size
-        array = np.asarray(input_image)
-        tensor = torch.from_numpy(array).to(device)
-        tensor = tensor.permute(2, 0, 1).contiguous().unsqueeze(0)
-        tensor = tensor.half() if use_half else tensor.float()
-        tensor = tensor / 255.0
+        for image in images:
+            if image.ndim != 3:
+                raise ValueError(
+                    f"Expected CHW image tensor, got {tuple(image.shape)}"
+                )
+
+            if image.device != device:
+                image = image.to(device=device, non_blocking=True)
+
+            original_height = int(image.shape[-2])
+            original_width = int(image.shape[-1])
+            network_image, gain, pad = self._letterbox_tensor(image, dtype)
+
+            network_inputs.append(network_image)
+            metadata.append(
+                (original_width, original_height, gain, pad)
+            )
+
+        tensor = torch.stack(network_inputs, dim=0).contiguous()
+        input_height = int(tensor.shape[-2])
+        input_width = int(tensor.shape[-1])
 
         with torch.inference_mode():
             output = model(tensor)
 
         predictions, proto = self._unwrap_model_output(output)
-        boxes, scores, class_ids, mask_coefficients = self._decode_predictions(
-            predictions=predictions,
-            original_width=original_width,
-            original_height=original_height,
-            gain=gain,
-            pad=pad,
-            proto=proto,
+        prediction_batch = self._split_prediction_batch(
+            predictions,
+            expected_batch_size=len(images),
         )
-        keep = self._torch_class_aware_nms(boxes, scores, class_ids, self.settings.iou, self.settings.max_detections)
+        proto_batch = self._split_proto_batch(
+            proto,
+            expected_batch_size=len(images),
+        )
 
-        masks: list[YoloInstanceMask | None] = [None] * int(keep.numel())
-        if (
-            self.settings.include_masks
-            and proto is not None
-            and mask_coefficients is not None
-            and keep.numel() > 0
-        ):
-            kept_coefficients = mask_coefficients[keep]
-            kept_boxes = boxes[keep]
-            masks = self._process_instance_masks(
-                proto=proto,
-                mask_coefficients=kept_coefficients,
-                boxes=kept_boxes,
-                original_width=original_width,
-                original_height=original_height,
-                input_width=input_width,
-                input_height=input_height,
-                gain=gain,
-                pad=pad,
-            )
+        batch_results: list[list[YoloDetection]] = []
 
-        detections: list[YoloDetection] = []
-        keep_indices = keep.detach().cpu().tolist()
-        for out_idx, idx in enumerate(keep_indices):
-            class_id = int(class_ids[idx].detach().cpu().item())
-            bbox = boxes[idx].detach().cpu().tolist()
-            detections.append(
-                YoloDetection(
-                    class_id=class_id,
-                    class_name=self._names.get(class_id, str(class_id)),
-                    confidence=float(scores[idx].detach().cpu().item()),
-                    bbox_xyxy=[float(v) for v in bbox],
-                    mask=masks[out_idx] if out_idx < len(masks) else None,
+        for batch_index, prediction in enumerate(prediction_batch):
+            original_width, original_height, gain, pad = metadata[batch_index]
+            image_proto = proto_batch[batch_index]
+
+            boxes, scores, class_ids, mask_coefficients = (
+                self._decode_predictions(
+                    predictions=prediction,
+                    original_width=original_width,
+                    original_height=original_height,
+                    gain=gain,
+                    pad=pad,
+                    proto=image_proto,
                 )
             )
-        return detections
 
-    def _detect_resized(self, image_path: Path, cuda_device: int) -> dict[str, Any]:
-        try:
-            from PIL import Image
-        except ImportError as exc:
-            raise RuntimeError(
-                "The 'Pillow' package is required for YOLO inference. "
-                "Install it with: pip install pillow"
-            ) from exc
+            keep = self._torch_class_aware_nms(
+                boxes,
+                scores,
+                class_ids,
+                self.settings.iou,
+                self.settings.max_detections,
+            )
 
-        with Image.open(image_path) as image:
-            width, height = image.size
-        detections = self._predict(str(image_path), cuda_device)
+            masks: list[YoloInstanceMask | None] = [
+                None
+            ] * int(keep.numel())
+
+            if (
+                self.settings.include_masks
+                and image_proto is not None
+                and mask_coefficients is not None
+                and keep.numel() > 0
+            ):
+                masks = self._process_instance_masks(
+                    proto=image_proto,
+                    mask_coefficients=mask_coefficients[keep],
+                    boxes=boxes[keep],
+                    original_width=original_width,
+                    original_height=original_height,
+                    input_width=input_width,
+                    input_height=input_height,
+                    gain=gain,
+                    pad=pad,
+                )
+
+            if keep.numel() == 0:
+                batch_results.append([])
+                continue
+
+            # Three bulk copies instead of repeated .cpu().item() calls.
+            kept_boxes = boxes[keep].detach().to("cpu")
+            kept_scores = scores[keep].detach().to("cpu")
+            kept_class_ids = class_ids[keep].detach().to("cpu")
+
+            detections: list[YoloDetection] = []
+            detection_count = int(kept_boxes.shape[0])
+
+            for output_index in range(detection_count):
+                class_id = int(kept_class_ids[output_index].item())
+                bbox = kept_boxes[output_index].tolist()
+
+                detections.append(
+                    YoloDetection(
+                        class_id=class_id,
+                        class_name=self._names.get(
+                            class_id,
+                            str(class_id),
+                        ),
+                        confidence=float(
+                            kept_scores[output_index].item()
+                        ),
+                        bbox_xyxy=[float(value) for value in bbox],
+                        mask=(
+                            masks[output_index]
+                            if output_index < len(masks)
+                            else None
+                        ),
+                    )
+                )
+
+            batch_results.append(detections)
+
+        return batch_results
+
+    def _detect_resized(
+        self,
+        image_path: Path,
+        cuda_device: int,
+    ) -> dict[str, Any]:
+        device = self._device(cuda_device)
+        image = self._decode_jpeg(image_path, device)
+
+        height = int(image.shape[-2])
+        width = int(image.shape[-1])
+        detections = self._predict_batch([image], cuda_device)[0]
+
         return {
             "task": "segment" if self._is_segment_model else "detect",
             "image_width": width,
@@ -392,46 +746,124 @@ class YoloDetector:
             "num_detections": len(detections),
         }
 
-    def _detect_tiled(self, image_path: Path, cuda_device: int) -> dict[str, Any]:
-        try:
-            from PIL import Image
-        except ImportError as exc:
-            raise RuntimeError(
-                "The 'Pillow' package is required for tiled YOLO inference. "
-                "Install it with: pip install pillow"
-            ) from exc
+    def _detect_tiled(
+        self,
+        image_path: Path,
+        cuda_device: int,
+    ) -> dict[str, Any]:
+        device = self._device(cuda_device)
+        image = self._decode_jpeg(image_path, device)
 
-        tile_size = self._make_divisible(self.settings.imgsz, self.settings.stride)
-        overlap = min(self.settings.tile_overlap, max(tile_size - 1, 0))
+        height = int(image.shape[-2])
+        width = int(image.shape[-1])
+
+        tile_size = self._make_divisible(
+            self.settings.imgsz,
+            self.settings.stride,
+        )
+        overlap = min(
+            self.settings.tile_overlap,
+            max(tile_size - 1, 0),
+        )
         step = max(tile_size - overlap, 1)
+        tile_batch_size = self._tile_batch_size()
 
-        image = Image.open(image_path).convert("RGB")
-        width, height = image.size
         all_detections: list[YoloDetection] = []
         tile_count = 0
 
-        for top in self._tile_positions(height, tile_size, step):
-            for left in self._tile_positions(width, tile_size, step):
-                right = min(left + tile_size, width)
-                bottom = min(top + tile_size, height)
-                tile = image.crop((left, top, right, bottom))
-                tile_detections = self._predict(tile, cuda_device)
+        logger(
+            f"[{self.service_name}:{self.controller_name}:detect:tiling] tiled inference started",
+            extra={
+                "input_jpg_path": image_path.as_posix(),
+                "image_width": width,
+                "image_height": height,
+                "tile_size": tile_size,
+                "tile_overlap": overlap,
+                "step": step,
+                "tile_batch_size": tile_batch_size,
+            },
+        )
+
+        pending_images: list[Any] = []
+        pending_tiles: list[tuple[int, int, int, int]] = []
+
+        def flush_tile_batch() -> None:
+            nonlocal tile_count
+
+            if not pending_images:
+                return
+
+            batch_detections = self._predict_batch(
+                pending_images,
+                cuda_device,
+            )
+
+            for tile_bounds, tile_detections in zip(
+                pending_tiles,
+                batch_detections,
+            ):
+                left, top, right, bottom = tile_bounds
                 tile_count += 1
 
                 for det in tile_detections:
                     x1, y1, x2, y2 = det.bbox_xyxy
-                    mask = self._shift_mask_origin(det.mask, left, top) if det.mask is not None else None
+                    mask = (
+                        self._shift_mask_origin(det.mask, left, top)
+                        if det.mask is not None
+                        else None
+                    )
+
                     all_detections.append(
                         det.model_copy(
                             update={
-                                "bbox_xyxy": [x1 + left, y1 + top, x2 + left, y2 + top],
-                                "tile": YoloTile(left=left, top=top, right=right, bottom=bottom),
+                                "bbox_xyxy": [
+                                    x1 + left,
+                                    y1 + top,
+                                    x2 + left,
+                                    y2 + top,
+                                ],
+                                "tile": YoloTile(
+                                    left=left,
+                                    top=top,
+                                    right=right,
+                                    bottom=bottom,
+                                ),
                                 "mask": mask,
                             }
                         )
                     )
 
+            pending_images.clear()
+            pending_tiles.clear()
+
+        for top in self._tile_positions(height, tile_size, step):
+            for left in self._tile_positions(width, tile_size, step):
+                right = min(left + tile_size, width)
+                bottom = min(top + tile_size, height)
+
+                # This is a GPU tensor view; the JPEG is not decoded again and
+                # no pixel data is copied until preprocessing creates the batch.
+                tile = image[:, top:bottom, left:right]
+                pending_images.append(tile)
+                pending_tiles.append((left, top, right, bottom))
+
+                if len(pending_images) >= tile_batch_size:
+                    flush_tile_batch()
+
+        flush_tile_batch()
+
         merged = self._nms(all_detections, self.settings.iou)
+
+        logger(
+            f"[{self.service_name}:{self.controller_name}:detect:tiling] tiled inference completed",
+            extra={
+                "input_jpg_path": image_path.as_posix(),
+                "tile_count": tile_count,
+                "raw_detection_count": len(all_detections),
+                "merged_detection_count": len(merged),
+            },
+        )
+
         return {
             "task": "segment" if self._is_segment_model else "detect",
             "image_width": width,
@@ -444,12 +876,33 @@ class YoloDetector:
             "num_detections": len(merged),
         }
 
-    def _letterbox(self, image: Any) -> tuple[Any, float, tuple[int, int]]:
-        from PIL import Image
+    def _letterbox_tensor(
+        self,
+        image: Any,
+        dtype: Any,
+    ) -> tuple[Any, float, tuple[int, int]]:
+        """Letterbox a CHW uint8 tensor entirely with Torch operations.
 
-        img_size = self._make_divisible(self.settings.imgsz, self.settings.stride)
-        width, height = image.size
+        Returns a normalized CHW floating-point tensor with a fixed square
+        spatial size, together with the scale and left/top padding needed for
+        restoring detection coordinates.
+        """
+
+        if image.ndim != 3:
+            raise ValueError(
+                f"Expected CHW image tensor, got shape {tuple(image.shape)}"
+            )
+
+        _, height, width = image.shape
+        height = int(height)
+        width = int(width)
+
+        img_size = self._make_divisible(
+            self.settings.imgsz,
+            self.settings.stride,
+        )
         gain = min(img_size / width, img_size / height)
+
         resized_width = int(round(width * gain))
         resized_height = int(round(height * gain))
 
@@ -457,13 +910,29 @@ class YoloDetector:
         pad_h = img_size - resized_height
         pad_left = int(round(pad_w / 2 - 0.1))
         pad_top = int(round(pad_h / 2 - 0.1))
+        pad_right = pad_w - pad_left
+        pad_bottom = pad_h - pad_top
 
-        if (resized_width, resized_height) != image.size:
-            image = image.resize((resized_width, resized_height), Image.BILINEAR)
+        tensor = image.to(dtype=dtype)
+        tensor.mul_(1.0 / 255.0)
 
-        canvas = Image.new("RGB", (img_size, img_size), (114, 114, 114))
-        canvas.paste(image, (pad_left, pad_top))
-        return canvas, gain, (pad_left, pad_top)
+        if (resized_height, resized_width) != (height, width):
+            tensor = F.interpolate(
+                tensor.unsqueeze(0),
+                size=(resized_height, resized_width),
+                mode="bilinear",
+                align_corners=False,
+            ).squeeze(0)
+
+        if pad_w or pad_h:
+            tensor = F.pad(
+                tensor,
+                (pad_left, pad_right, pad_top, pad_bottom),
+                mode="constant",
+                value=114.0 / 255.0,
+            )
+
+        return tensor.contiguous(), gain, (pad_left, pad_top)
 
     @staticmethod
     def _make_divisible(value: int, divisor: int) -> int:
@@ -471,23 +940,24 @@ class YoloDetector:
         return int(math.ceil(int(value) / divisor) * divisor)
 
     @staticmethod
-    def _tile_positions(length: int, tile_size: int, step: int) -> list[int]:
+    def _tile_positions(
+        length: int,
+        tile_size: int,
+        step: int,
+    ) -> list[int]:
         if length <= tile_size:
             return [0]
 
-        positions = list(range(0, max(length - tile_size + 1, 1), step))
+        positions = list(
+            range(0, max(length - tile_size + 1, 1), step)
+        )
         last = length - tile_size
         if positions[-1] != last:
             positions.append(last)
         return positions
 
     def _unwrap_model_output(self, output: Any) -> tuple[Any, Any | None]:
-        """Return raw prediction tensor and optional segmentation prototypes.
-
-        Ultralytics segment models may return ``(pred, proto)`` when exported,
-        or ``(pred, (features, mask_coefficients, proto))`` from the native
-        PyTorch model. Detection models usually return ``(pred, feature_maps)``.
-        """
+        """Return raw prediction tensor and optional segmentation prototypes."""
         if not isinstance(output, (tuple, list)):
             return output, None
 
@@ -496,27 +966,35 @@ class YoloDetector:
         target_mask_dim = int(self._mask_coeff_count or 0)
 
         def find_proto(value: Any) -> Any | None:
-            # Segmentation prototypes are usually [B, mask_dim, H, W], where
-            # mask_dim is small (for example 32). Prefer the known mask_dim
-            # from the model head, then choose the largest spatial canvas.
             candidates: list[Any] = []
             stack = [value]
+
             while stack:
                 item = stack.pop()
                 if isinstance(item, (tuple, list)):
                     stack.extend(item)
                     continue
+
                 shape = getattr(item, "shape", None)
                 ndim = getattr(item, "ndim", None)
-                if shape is not None and ndim == 4 and len(shape) == 4:
-                    channels = int(shape[1])
-                    if target_mask_dim and channels == target_mask_dim:
-                        candidates.append(item)
-                    elif not target_mask_dim and channels <= 128:
-                        candidates.append(item)
+                if shape is None or ndim != 4 or len(shape) != 4:
+                    continue
+
+                channels = int(shape[1])
+                if target_mask_dim and channels == target_mask_dim:
+                    candidates.append(item)
+                elif not target_mask_dim and channels <= 128:
+                    candidates.append(item)
+
             if not candidates:
                 return None
-            return max(candidates, key=lambda item: int(item.shape[-2]) * int(item.shape[-1]))
+
+            return max(
+                candidates,
+                key=lambda item: (
+                    int(item.shape[-2]) * int(item.shape[-1])
+                ),
+            )
 
         if len(output) >= 2:
             proto = find_proto(output[1])
@@ -524,6 +1002,65 @@ class YoloDetector:
             proto = find_proto(output[1:])
 
         return predictions, proto
+
+    @staticmethod
+    def _split_prediction_batch(
+        predictions: Any,
+        expected_batch_size: int,
+    ) -> list[Any]:
+        """Split raw predictions without guessing channel orientation."""
+        if getattr(predictions, "ndim", None) == 2:
+            if expected_batch_size != 1:
+                raise RuntimeError(
+                    "Model returned unbatched predictions for batch size "
+                    f"{expected_batch_size}: {tuple(predictions.shape)}"
+                )
+            return [predictions]
+
+        if getattr(predictions, "ndim", None) != 3:
+            raise RuntimeError(
+                "Unexpected YOLO prediction shape: "
+                f"{tuple(getattr(predictions, 'shape', ())) }"
+            )
+
+        if int(predictions.shape[0]) != expected_batch_size:
+            raise RuntimeError(
+                "YOLO output batch mismatch: "
+                f"expected={expected_batch_size}, "
+                f"actual={int(predictions.shape[0])}, "
+                f"shape={tuple(predictions.shape)}"
+            )
+
+        return [predictions[index] for index in range(expected_batch_size)]
+
+    @staticmethod
+    def _split_proto_batch(
+        proto: Any | None,
+        expected_batch_size: int,
+    ) -> list[Any | None]:
+        if proto is None:
+            return [None] * expected_batch_size
+
+        if getattr(proto, "ndim", None) == 3:
+            if expected_batch_size != 1:
+                raise RuntimeError(
+                    "Model returned unbatched mask prototypes for batch size "
+                    f"{expected_batch_size}: {tuple(proto.shape)}"
+                )
+            return [proto]
+
+        if getattr(proto, "ndim", None) != 4:
+            return [None] * expected_batch_size
+
+        if int(proto.shape[0]) != expected_batch_size:
+            raise RuntimeError(
+                "YOLO prototype batch mismatch: "
+                f"expected={expected_batch_size}, "
+                f"actual={int(proto.shape[0])}, "
+                f"shape={tuple(proto.shape)}"
+            )
+
+        return [proto[index] for index in range(expected_batch_size)]
 
     def _decode_predictions(
         self,
@@ -534,37 +1071,56 @@ class YoloDetector:
         pad: tuple[int, int],
         proto: Any | None = None,
     ) -> tuple[Any, Any, Any, Any | None]:
-        import torch
 
         pred = predictions[0] if predictions.ndim == 3 else predictions
 
-        # Ultralytics raw detection/segmentation output is usually
-        # [B, 4 + nc (+ mask_dim), N]. Convert it to [N, C]. If a model/export
-        # already returns [B, N, C], this leaves it alone.
         if pred.ndim != 2:
-            raise RuntimeError(f"Unexpected YOLO output shape: {tuple(predictions.shape)}")
+            raise RuntimeError(
+                f"Unexpected YOLO output shape: {tuple(predictions.shape)}"
+            )
 
         nc = int(self._nc or len(self._names) or 0)
-        proto_mask_dim = int(proto.shape[1]) if proto is not None and getattr(proto, "ndim", 0) == 4 else 0
+        proto_mask_dim = (
+            int(proto.shape[0])
+            if proto is not None and getattr(proto, "ndim", 0) == 3
+            else int(proto.shape[1])
+            if proto is not None and getattr(proto, "ndim", 0) == 4
+            else 0
+        )
         mask_dim = int(self._mask_coeff_count or proto_mask_dim or 0)
 
         possible_channels = {6}
         if nc:
             possible_channels.update({4 + nc, 5 + nc})
             if mask_dim:
-                possible_channels.update({4 + nc + mask_dim, 5 + nc + mask_dim})
+                possible_channels.update(
+                    {
+                        4 + nc + mask_dim,
+                        5 + nc + mask_dim,
+                    }
+                )
 
-        channels_first_raw = pred.shape[0] in possible_channels and pred.shape[1] not in possible_channels
+        channels_first_raw = (
+            pred.shape[0] in possible_channels
+            and pred.shape[1] not in possible_channels
+        )
         unknown_names_channels_first = (
-            nc == 0 and pred.shape[0] < pred.shape[1] and pred.shape[0] <= 512
+            nc == 0
+            and pred.shape[0] < pred.shape[1]
+            and pred.shape[0] <= 512
         )
         if channels_first_raw or unknown_names_channels_first:
             pred = pred.transpose(0, 1).contiguous()
 
-        channels = pred.shape[-1]
+        channels = int(pred.shape[-1])
         if channels < 6:
             empty = torch.empty((0,), device=pred.device)
-            return torch.empty((0, 4), device=pred.device), empty, empty.long(), None
+            return (
+                torch.empty((0, 4), device=pred.device),
+                empty,
+                empty.long(),
+                None,
+            )
 
         boxes: Any
         scores: Any
@@ -572,38 +1128,39 @@ class YoloDetector:
         mask_coefficients = None
 
         if nc and mask_dim and channels == 4 + nc + mask_dim:
-            # YOLOv8/YOLO11 segment style: cx, cy, w, h, class scores..., mask coeffs...
             boxes = self._xywh_to_xyxy(pred[:, :4])
             scores, class_ids = pred[:, 4 : 4 + nc].max(dim=1)
-            mask_coefficients = pred[:, 4 + nc : 4 + nc + mask_dim]
+            mask_coefficients = pred[
+                :, 4 + nc : 4 + nc + mask_dim
+            ]
         elif nc and mask_dim and channels == 5 + nc + mask_dim:
-            # YOLOv5-like segment: cx, cy, w, h, objectness, class scores..., mask coeffs...
             boxes = self._xywh_to_xyxy(pred[:, :4])
             class_scores, class_ids = pred[:, 5 : 5 + nc].max(dim=1)
             scores = pred[:, 4] * class_scores
-            mask_coefficients = pred[:, 5 + nc : 5 + nc + mask_dim]
+            mask_coefficients = pred[
+                :, 5 + nc : 5 + nc + mask_dim
+            ]
         elif nc and channels == 4 + nc:
-            # YOLOv8/YOLO11 detect style: cx, cy, w, h, class scores...
             boxes = self._xywh_to_xyxy(pred[:, :4])
             scores, class_ids = pred[:, 4:].max(dim=1)
         elif nc and channels == 5 + nc:
-            # YOLOv5-like detect: cx, cy, w, h, objectness, class scores...
             boxes = self._xywh_to_xyxy(pred[:, :4])
             class_scores, class_ids = pred[:, 5:].max(dim=1)
             scores = pred[:, 4] * class_scores
         elif channels == 6:
-            # Already post-processed-like: x1, y1, x2, y2, confidence, class.
-            boxes = pred[:, :4]
+            boxes = pred[:, :4].clone()
             scores = pred[:, 4]
             class_ids = pred[:, 5].long()
         elif mask_dim and channels > 4 + mask_dim:
-            # Fallback for segment models when class-name metadata is missing.
             inferred_nc = channels - 4 - mask_dim
             boxes = self._xywh_to_xyxy(pred[:, :4])
-            scores, class_ids = pred[:, 4 : 4 + inferred_nc].max(dim=1)
-            mask_coefficients = pred[:, 4 + inferred_nc : 4 + inferred_nc + mask_dim]
+            scores, class_ids = pred[
+                :, 4 : 4 + inferred_nc
+            ].max(dim=1)
+            mask_coefficients = pred[
+                :, 4 + inferred_nc : 4 + inferred_nc + mask_dim
+            ]
         else:
-            # Fallback for raw detect models when names are unavailable.
             boxes = self._xywh_to_xyxy(pred[:, :4])
             scores, class_ids = pred[:, 4:].max(dim=1)
 
@@ -615,9 +1172,20 @@ class YoloDetector:
             mask_coefficients = mask_coefficients[keep]
 
         if boxes.numel() == 0:
-            return boxes.reshape(0, 4), scores, class_ids, mask_coefficients
+            return (
+                boxes.reshape(0, 4),
+                scores,
+                class_ids,
+                mask_coefficients,
+            )
 
-        boxes = self._scale_boxes_from_letterbox(boxes, original_width, original_height, gain, pad)
+        boxes = self._scale_boxes_from_letterbox(
+            boxes,
+            original_width,
+            original_height,
+            gain,
+            pad,
+        )
         return boxes, scores, class_ids, mask_coefficients
 
     @staticmethod
@@ -641,8 +1209,14 @@ class YoloDetector:
         boxes[:, [0, 2]] -= pad_left
         boxes[:, [1, 3]] -= pad_top
         boxes[:, :4] /= gain
-        boxes[:, [0, 2]] = boxes[:, [0, 2]].clamp(0, original_width)
-        boxes[:, [1, 3]] = boxes[:, [1, 3]].clamp(0, original_height)
+        boxes[:, [0, 2]] = boxes[:, [0, 2]].clamp(
+            0,
+            original_width,
+        )
+        boxes[:, [1, 3]] = boxes[:, [1, 3]].clamp(
+            0,
+            original_height,
+        )
         return boxes
 
     def _process_instance_masks(
@@ -657,9 +1231,7 @@ class YoloDetector:
         gain: float,
         pad: tuple[int, int],
     ) -> list[YoloInstanceMask | None]:
-        """Convert YOLO segment prototypes and coefficients into RLE masks."""
-        import torch
-        import torch.nn.functional as F
+        """Convert YOLO segmentation prototypes and coefficients to RLE."""
 
         if mask_coefficients.numel() == 0:
             return []
@@ -667,25 +1239,35 @@ class YoloDetector:
         if proto.ndim == 4:
             proto = proto[0]
         if proto.ndim != 3:
-            logger.warning("Unexpected YOLO segmentation proto shape: %s", tuple(proto.shape))
+            logger(
+                f"[{self.service_name}:{self.controller_name}:mask:decode] unexpected prototype shape",
+                level="warning",
+                extra={"proto_shape": tuple(proto.shape)},
+            )
             return [None] * int(mask_coefficients.shape[0])
 
         proto = proto.float()
         mask_coefficients = mask_coefficients.float()
         mask_dim, proto_height, proto_width = proto.shape
-        if mask_coefficients.shape[1] != mask_dim:
-            logger.warning(
-                "Mask coefficient/prototype mismatch: coeff=%s proto=%s",
-                tuple(mask_coefficients.shape),
-                tuple(proto.shape),
+
+        if int(mask_coefficients.shape[1]) != int(mask_dim):
+            logger(
+                f"[{self.service_name}:{self.controller_name}:mask:decode] mask coefficient mismatch",
+                level="warning",
+                extra={
+                    "coefficient_shape": tuple(mask_coefficients.shape),
+                    "proto_shape": tuple(proto.shape),
+                },
             )
             return [None] * int(mask_coefficients.shape[0])
 
         masks = mask_coefficients @ proto.reshape(mask_dim, -1)
-        masks = masks.reshape(-1, proto_height, proto_width).sigmoid()
+        masks = masks.reshape(
+            -1,
+            proto_height,
+            proto_width,
+        ).sigmoid()
 
-        # Upscale from prototype resolution to the letterboxed network input,
-        # remove letterbox padding, then resize to original image/tile size.
         masks = F.interpolate(
             masks[:, None],
             size=(input_height, input_width),
@@ -700,10 +1282,16 @@ class YoloDetector:
         crop_top = max(pad_top, 0)
         crop_right = min(crop_left + resized_width, input_width)
         crop_bottom = min(crop_top + resized_height, input_height)
+
         if crop_right <= crop_left or crop_bottom <= crop_top:
             return [None] * int(mask_coefficients.shape[0])
 
-        masks = masks[:, crop_top:crop_bottom, crop_left:crop_right]
+        masks = masks[
+            :,
+            crop_top:crop_bottom,
+            crop_left:crop_right,
+        ]
+
         if masks.shape[-2:] != (original_height, original_width):
             masks = F.interpolate(
                 masks[:, None],
@@ -715,63 +1303,93 @@ class YoloDetector:
         binary_masks = masks >= self.settings.mask_threshold
         binary_masks = self._crop_masks_to_boxes(binary_masks, boxes)
 
-        results: list[YoloInstanceMask | None] = []
-        for mask in binary_masks.detach().cpu():
-            results.append(self._binary_mask_to_rle(mask))
-        return results
+        # Transfer the complete mask batch once.
+        cpu_masks = binary_masks.detach().to("cpu")
+        return [self._binary_mask_to_rle(mask) for mask in cpu_masks]
 
     @staticmethod
     def _crop_masks_to_boxes(masks: Any, boxes: Any) -> Any:
         """Zero out mask pixels outside each detection box."""
-        import torch
 
         if masks.numel() == 0:
             return masks
 
         n, height, width = masks.shape
-        x = torch.arange(width, device=masks.device).view(1, 1, width)
-        y = torch.arange(height, device=masks.device).view(1, height, 1)
+        x = torch.arange(
+            width,
+            device=masks.device,
+        ).view(1, 1, width)
+        y = torch.arange(
+            height,
+            device=masks.device,
+        ).view(1, height, 1)
+
         x1 = boxes[:, 0].floor().view(n, 1, 1)
         y1 = boxes[:, 1].floor().view(n, 1, 1)
         x2 = boxes[:, 2].ceil().view(n, 1, 1)
         y2 = boxes[:, 3].ceil().view(n, 1, 1)
-        inside = (x >= x1) & (x < x2) & (y >= y1) & (y < y2)
+
+        inside = (
+            (x >= x1)
+            & (x < x2)
+            & (y >= y1)
+            & (y < y2)
+        )
         return masks & inside
 
     def _binary_mask_to_rle(self, mask: Any) -> YoloInstanceMask:
-        """Encode a boolean mask as row-major uncompressed RLE."""
-        flat = mask.reshape(-1)
-        # Convert to Python ints. This keeps the output dependency-free and
-        # easy to decode in C++, Python, Rust, or JavaScript.
-        values = [1 if bool(v) else 0 for v in flat.tolist()]
+        """Encode a boolean CPU mask as row-major uncompressed RLE."""
 
-        counts: list[int] = []
-        current_value = 0
-        run_length = 0
-        for value in values:
-            if value == current_value:
-                run_length += 1
-            else:
-                counts.append(run_length)
-                current_value = value
-                run_length = 1
-        counts.append(run_length)
+        flat = mask.reshape(-1).to(dtype=torch.uint8)
+        pixel_count = int(flat.numel())
 
-        height, width = int(mask.shape[0]), int(mask.shape[1])
-        area = int(mask.sum().item())
+        if pixel_count == 0:
+            counts = [0]
+            area = 0
+        else:
+            changes = torch.nonzero(
+                flat[1:] != flat[:-1],
+                as_tuple=False,
+            ).flatten() + 1
+
+            boundaries = torch.cat(
+                (
+                    torch.zeros(1, dtype=torch.long),
+                    changes.to(dtype=torch.long),
+                    torch.tensor([pixel_count], dtype=torch.long),
+                )
+            )
+            counts = (boundaries[1:] - boundaries[:-1]).tolist()
+
+            # Uncompressed COCO-style RLE starts with a zero run. If the first
+            # pixel is foreground, prepend an empty background run.
+            if int(flat[0].item()) == 1:
+                counts.insert(0, 0)
+
+            area = int(flat.sum().item())
+
+        height = int(mask.shape[0])
+        width = int(mask.shape[1])
+
         return YoloInstanceMask(
             size=[height, width],
             origin_xy=[0, 0],
-            counts=counts,
+            counts=[int(value) for value in counts],
             area=area,
             threshold=float(self.settings.mask_threshold),
         )
 
     @staticmethod
-    def _shift_mask_origin(mask: YoloInstanceMask, dx: int, dy: int) -> YoloInstanceMask:
+    def _shift_mask_origin(
+        mask: YoloInstanceMask,
+        dx: int,
+        dy: int,
+    ) -> YoloInstanceMask:
         """Shift a tile-local mask origin into original-image coordinates."""
         ox, oy = mask.origin_xy
-        return mask.model_copy(update={"origin_xy": [int(ox + dx), int(oy + dy)]})
+        return mask.model_copy(
+            update={"origin_xy": [int(ox + dx), int(oy + dy)]}
+        )
 
     @staticmethod
     def _torch_class_aware_nms(
@@ -781,42 +1399,65 @@ class YoloDetector:
         iou_threshold: float,
         max_detections: int,
     ) -> Any:
-        import torch
 
         if boxes.numel() == 0:
-            return torch.empty((0,), dtype=torch.long, device=boxes.device)
+            return torch.empty(
+                (0,),
+                dtype=torch.long,
+                device=boxes.device,
+            )
 
         try:
             from torchvision.ops import batched_nms
 
-            keep = batched_nms(boxes, scores, class_ids, iou_threshold)
+            keep = batched_nms(
+                boxes,
+                scores,
+                class_ids,
+                iou_threshold,
+            )
         except Exception:
-            # Torch-only fallback for deployments where torchvision.ops was not
-            # compiled with NMS support. The inner loop still works on tensors.
             keep_parts = []
             for cls in class_ids.unique():
                 cls_indices = torch.where(class_ids == cls)[0]
                 cls_keep_local = YoloDetector._torch_nms_single_class(
-                    boxes[cls_indices], scores[cls_indices], iou_threshold
+                    boxes[cls_indices],
+                    scores[cls_indices],
+                    iou_threshold,
                 )
                 keep_parts.append(cls_indices[cls_keep_local])
 
             if not keep_parts:
-                return torch.empty((0,), dtype=torch.long, device=boxes.device)
+                return torch.empty(
+                    (0,),
+                    dtype=torch.long,
+                    device=boxes.device,
+                )
+
             keep = torch.cat(keep_parts)
             keep = keep[scores[keep].argsort(descending=True)]
 
         return keep[:max_detections]
 
     @staticmethod
-    def _torch_nms_single_class(boxes: Any, scores: Any, iou_threshold: float) -> Any:
-        import torch
+    def _torch_nms_single_class(
+        boxes: Any,
+        scores: Any,
+        iou_threshold: float,
+    ) -> Any:
 
         if boxes.numel() == 0:
-            return torch.empty((0,), dtype=torch.long, device=boxes.device)
+            return torch.empty(
+                (0,),
+                dtype=torch.long,
+                device=boxes.device,
+            )
 
         x1, y1, x2, y2 = boxes.unbind(dim=1)
-        areas = (x2 - x1).clamp(min=0) * (y2 - y1).clamp(min=0)
+        areas = (
+            (x2 - x1).clamp(min=0)
+            * (y2 - y1).clamp(min=0)
+        )
         order = scores.argsort(descending=True)
         keep = []
 
@@ -839,23 +1480,45 @@ class YoloDetector:
             iou = intersection / union.clamp(min=1e-7)
             order = rest[iou <= iou_threshold]
 
-        return torch.stack(keep) if keep else torch.empty((0,), dtype=torch.long, device=boxes.device)
+        if keep:
+            return torch.stack(keep)
+        return torch.empty(
+            (0,),
+            dtype=torch.long,
+            device=boxes.device,
+        )
 
     @staticmethod
-    def _nms(detections: list[YoloDetection], iou_threshold: float) -> list[YoloDetection]:
-        """Class-aware torch NMS for merged tiled detections."""
+    def _nms(
+        detections: list[YoloDetection],
+        iou_threshold: float,
+    ) -> list[YoloDetection]:
+        """Class-aware NMS for detections merged across overlapping tiles."""
         if not detections:
             return []
 
-        import torch
 
-        boxes = torch.tensor([det.bbox_xyxy for det in detections], dtype=torch.float32)
-        scores = torch.tensor([det.confidence for det in detections], dtype=torch.float32)
-        class_ids = torch.tensor([det.class_id for det in detections], dtype=torch.long)
-        keep = YoloDetector._torch_class_aware_nms(
-            boxes, scores, class_ids, iou_threshold, max_detections=len(detections)
+        boxes = torch.tensor(
+            [det.bbox_xyxy for det in detections],
+            dtype=torch.float32,
         )
-        return [detections[idx] for idx in keep.cpu().tolist()]
+        scores = torch.tensor(
+            [det.confidence for det in detections],
+            dtype=torch.float32,
+        )
+        class_ids = torch.tensor(
+            [det.class_id for det in detections],
+            dtype=torch.long,
+        )
+
+        keep = YoloDetector._torch_class_aware_nms(
+            boxes,
+            scores,
+            class_ids,
+            iou_threshold,
+            max_detections=len(detections),
+        )
+        return [detections[index] for index in keep.tolist()]
 
 
 class YoloRunner:
@@ -865,15 +1528,29 @@ class YoloRunner:
         self,
         input_queue: Queue[StartYoloParams] | None = None,
         detector: YoloDetector | None = None,
+        service_name: str = DEFAULT_SERVICE_NAME,
+        controller_name: str = DEFAULT_CONTROLLER_NAME,
     ) -> None:
+        self.service_name = service_name
+        self.controller_name = controller_name
         self.input_queue: Queue[StartYoloParams] = input_queue or Queue()
-        self.detector = detector or YoloDetector()
+        self.detector = detector or YoloDetector(
+            service_name=self.service_name,
+            controller_name=self.controller_name,
+        )
         self.exception: Exception | None = None
         self.last_output_json_path: str | None = None
         self._stop_event = Event()
         self._thread: Thread | None = None
         self._lock = Lock()
         self._hooks: HookDispatcher = HookDispatcher()
+        logger(
+            f"[{self.service_name}:{self.controller_name}:runner:init] runner initialized",
+            extra={
+                "queue_size": self.input_queue.qsize(),
+                "model_name": self.detector.settings.model_name,
+            },
+        )
 
     @property
     def is_running(self) -> bool:
@@ -882,46 +1559,120 @@ class YoloRunner:
     def start(self) -> None:
         with self._lock:
             if self.is_running:
+                logger(
+                    f"[{self.service_name}:{self.controller_name}:runner:start] runner already active",
+                    extra={"queue_size": self.input_queue.qsize()},
+                )
                 return
+
+            logger(
+                f"[{self.service_name}:{self.controller_name}:runner:start] starting runner",
+                extra={"queue_size": self.input_queue.qsize()},
+            )
             self._stop_event.clear()
             self._thread = Thread(target=self._run, name="YoloRunner", daemon=True)
             self._thread.start()
+            logger(
+                f"[{self.service_name}:{self.controller_name}:runner:start] runner thread started",
+                extra={"thread_name": self._thread.name},
+            )
 
     def stop(self, timeout: float = 5.0) -> None:
+        logger(
+            f"[{self.service_name}:{self.controller_name}:runner:stop] stopping runner",
+            extra={"timeout_s": timeout, "queue_size": self.input_queue.qsize()},
+        )
         self._stop_event.set()
         thread = self._thread
         if thread and thread.is_alive():
             thread.join(timeout=timeout)
 
+        if thread and thread.is_alive():
+            logger(
+                f"[{self.service_name}:{self.controller_name}:runner:stop] runner did not stop before timeout",
+                level="warning",
+                extra={"timeout_s": timeout, "queue_size": self.input_queue.qsize()},
+            )
+        else:
+            logger(
+                f"[{self.service_name}:{self.controller_name}:runner:stop] runner stopped",
+                extra={"queue_size": self.input_queue.qsize()},
+            )
+
     def change_detector(self, settings: YoloSettings) -> None:
         self.detector.change_settings(settings)
 
     def _run(self) -> None:
-        logger.info("YOLO runner started")
+        logger(
+            f"[{self.service_name}:{self.controller_name}:runner:loop] worker loop started",
+            extra={"thread_name": self._thread.name if self._thread is not None else "YoloRunner"},
+        )
         while not self._stop_event.is_set():
             try:
                 params = self.input_queue.get(timeout=0.2)
             except Empty:
                 continue
 
+            logger(
+                f"[{self.service_name}:{self.controller_name}:runner:request] inference request dequeued",
+                extra={
+                    "queue_size": self.input_queue.qsize(),
+                    "input_count": len(params.input_jpg_paths),
+                    "output_count": len(params.output_json_paths),
+                    "size_mode": params.size_mode,
+                    "cuda_device": params.cuda_device,
+                },
+            )
+
             try:
                 result = self.detector.detect(params)
                 if params.hook_urls and params.hook_urls[0]:
-                    print(params.hook_urls)
+                    logger(
+                        f"[{self.service_name}:{self.controller_name}:runner:hooks] dispatching hooks",
+                        extra={
+                            "output_json_path": result.output_json_path,
+                            "hook_chains": params.hook_urls,
+                        },
+                    )
                     self._hooks.dispatch(
                         db_record=params.db_record,
                         hook_chains=params.hook_urls,
                     )
+                    logger(
+                        f"[{self.service_name}:{self.controller_name}:runner:hooks] hooks dispatched",
+                        extra={"output_json_path": result.output_json_path},
+                    )
 
                 self.last_output_json_path = result.output_json_path
                 self.exception = None
+                logger(
+                    f"[{self.service_name}:{self.controller_name}:runner:request] inference request completed",
+                    extra={
+                        "output_json_path": result.output_json_path,
+                        "num_detections": result.num_detections,
+                        "task": result.task,
+                        "queue_size": self.input_queue.qsize(),
+                    },
+                )
             except Exception as exc:  # Keep the worker alive after bad requests.
                 self.exception = exc
-                logger.error("YOLO inference failed: %s\n%s", exc, traceback.format_exc())
+                logger(f"[{self.service_name}:{self.controller_name}:runner:request:error] inference request failed",level="error",
+                    extra={
+                        "error_type": exc.__class__.__name__,
+                        "error": str(exc),
+                        "input_jpg_paths": params.input_jpg_paths,
+                        "output_json_paths": params.output_json_paths,
+                        "size_mode": params.size_mode,
+                        "cuda_device": params.cuda_device,
+                    },
+                )
             finally:
                 self.input_queue.task_done()
 
-        logger.info("YOLO runner stopped")
+        logger(
+            f"[{self.service_name}:{self.controller_name}:runner:loop] worker loop stopped",
+            extra={"queue_size": self.input_queue.qsize()},
+        )
 
 
 @dataclass
@@ -929,14 +1680,27 @@ class YoloController:
     running: bool = False
     yolo_runner: YoloRunner | None = None
     yolo_input_queue: Queue[StartYoloParams] = field(default_factory=Queue)
-    service_name: str = "jsonrpc"
-    controller_name: str = "yolo"
+    service_name: str = DEFAULT_SERVICE_NAME
+    controller_name: str = DEFAULT_CONTROLLER_NAME
 
     def __post_init__(self) -> None:
         if self.yolo_runner is None:
-            self.yolo_runner = YoloRunner(input_queue=self.yolo_input_queue)
+            self.yolo_runner = YoloRunner(
+                input_queue=self.yolo_input_queue,
+                service_name=self.service_name,
+                controller_name=self.controller_name,
+            )
         else:
             self.yolo_input_queue = self.yolo_runner.input_queue
+
+        logger(
+            f"[{self.service_name}:{self.controller_name}:init] controller initialized",
+            extra={
+                "queue_size": self.yolo_input_queue.qsize(),
+                "runner_active": self.yolo_runner.is_running,
+                "model_name": self.yolo_runner.detector.settings.model_name,
+            },
+        )
 
     @staticmethod
     def openapi_examples() -> dict[str, Any]:
@@ -970,8 +1734,23 @@ class YoloController:
         )
 
     def start(self, params: StartYoloParams) -> YoloResult:
+        logger(
+            f"[{self.service_name}:{self.controller_name}:start] inference requested",
+            extra={
+                "input_jpg_paths": params.input_jpg_paths,
+                "output_json_paths": params.output_json_paths,
+                "size_mode": params.size_mode,
+                "cuda_device": params.cuda_device,
+                "queue_size": self.yolo_input_queue.qsize(),
+            },
+        )
+
         if self.yolo_runner is None:
-            self.yolo_runner = YoloRunner(input_queue=self.yolo_input_queue)
+            self.yolo_runner = YoloRunner(
+                input_queue=self.yolo_input_queue,
+                service_name=self.service_name,
+                controller_name=self.controller_name,
+            )
 
         if not self.yolo_runner.is_running:
             self.yolo_runner.start()
@@ -981,37 +1760,125 @@ class YoloController:
 
         result = self._result(params=params)
         result.queued = True
+        logger(
+            f"[{self.service_name}:{self.controller_name}:start] inference queued",
+            extra={
+                "running": result.running,
+                "queue_size": result.queue_size,
+                "input_count": len(params.input_jpg_paths),
+            },
+        )
         return result
 
     def stop(self, params: EmptyParams) -> YoloResult:
+        logger(
+            f"[{self.service_name}:{self.controller_name}:stop] stop requested",
+            extra={"queue_size": self.yolo_input_queue.qsize()},
+        )
         if self.yolo_runner is not None:
             self.yolo_runner.stop()
 
         self.running = False
-        return self._result()
+        result = self._result()
+        logger(
+            f"[{self.service_name}:{self.controller_name}:stop] controller stopped",
+            extra={
+                "running": result.running,
+                "queue_size": result.queue_size,
+            },
+        )
+        return result
 
     def status(self, params: EmptyParams) -> YoloResult:
-        return self._result()
+        result = self._result()
+        logger(
+            f"[{self.service_name}:{self.controller_name}:status] status requested",
+            extra={
+                "running": result.running,
+                "queue_size": result.queue_size,
+                "model_name": result.model.model_name if result.model is not None else None,
+                "has_error": result.error is not None,
+                "last_output_json_path": result.last_output_json_path,
+            },
+        )
+        return result
 
     def set_model(self, params: YoloSettings) -> YoloResult:
+        logger(
+            f"[{self.service_name}:{self.controller_name}:set_model] model settings requested",
+            extra={
+                "model_name": params.model_name,
+                "imgsz": params.imgsz,
+                "confidence": params.confidence,
+                "iou": params.iou,
+                "max_detections": params.max_detections,
+                "include_masks": params.include_masks,
+            },
+        )
+
         if self.yolo_runner is None:
-            self.yolo_runner = YoloRunner(input_queue=self.yolo_input_queue)
+            self.yolo_runner = YoloRunner(
+                input_queue=self.yolo_input_queue,
+                service_name=self.service_name,
+                controller_name=self.controller_name,
+            )
 
         try:
             self.yolo_runner.change_detector(settings=params)
         except Exception as exc:
+            logger(f"[{self.service_name}:{self.controller_name}:set_model:error] failed to apply model settings",level="error",
+                extra={
+                    "model_name": params.model_name,
+                    "error_type": exc.__class__.__name__,
+                    "error": str(exc),
+                },
+            )
             return self._result(err=str(exc))
 
-        return self._result()
+        result = self._result()
+        logger(
+            f"[{self.service_name}:{self.controller_name}:set_model] model settings applied",
+            extra={"model_name": params.model_name},
+        )
+        return result
 
 
 def main() -> None:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-
     from iox2_jsonrpc.iceoryx import Iox2JsonRpcServer
 
-    server = Iox2JsonRpcServer(YoloController())
-    server.run_forever()
+    logger(
+        f"[{DEFAULT_SERVICE_NAME}:{DEFAULT_CONTROLLER_NAME}:run_server] starting RPC server",
+        extra={
+            "service_name": DEFAULT_SERVICE_NAME,
+            "controller_name": DEFAULT_CONTROLLER_NAME,
+        },
+    )
+    try:
+        server = Iox2JsonRpcServer(
+            YoloController(
+                service_name=DEFAULT_SERVICE_NAME,
+                controller_name=DEFAULT_CONTROLLER_NAME,
+            )
+        )
+        server.run_forever()
+    except KeyboardInterrupt:
+        logger(
+            f"[{DEFAULT_SERVICE_NAME}:{DEFAULT_CONTROLLER_NAME}:run_server] server interrupted",
+            level="warning",
+        )
+        raise
+    except Exception:
+        logger(f"[{DEFAULT_SERVICE_NAME}:{DEFAULT_CONTROLLER_NAME}:run_server:error] server stopped with an error",level="error",
+            extra={
+                "service_name": DEFAULT_SERVICE_NAME,
+                "controller_name": DEFAULT_CONTROLLER_NAME,
+            },
+        )
+        raise
+    finally:
+        logger(
+            f"[{DEFAULT_SERVICE_NAME}:{DEFAULT_CONTROLLER_NAME}:run_server] server stopped"
+        )
 
 
 if __name__ == "__main__":
