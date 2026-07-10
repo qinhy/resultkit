@@ -957,12 +957,21 @@ class YoloDetector:
         return positions
 
     def _unwrap_model_output(self, output: Any) -> tuple[Any, Any | None]:
-        """Return raw prediction tensor and optional segmentation prototypes."""
+        """Return the inference prediction tensor and optional mask prototypes.
+
+        Ultralytics has used more than one segmentation return layout:
+
+        * older YOLOv8: ``(pred, (features, mask_coefficients, proto))``
+        * newer releases: ``((pred, proto), raw_predictions)``
+        * exported models: commonly ``(pred, proto)``
+
+        Detection models usually return ``(pred, raw_predictions)``.  The old
+        implementation assumed that ``output[0]`` was always a tensor, which is
+        not true for the newer segmentation layout.
+        """
         if not isinstance(output, (tuple, list)):
             return output, None
 
-        predictions = output[0]
-        proto = None
         target_mask_dim = int(self._mask_coeff_count or 0)
 
         def find_proto(value: Any) -> Any | None:
@@ -971,6 +980,9 @@ class YoloDetector:
 
             while stack:
                 item = stack.pop()
+                if isinstance(item, dict):
+                    stack.extend(item.values())
+                    continue
                 if isinstance(item, (tuple, list)):
                     stack.extend(item)
                     continue
@@ -989,17 +1001,39 @@ class YoloDetector:
             if not candidates:
                 return None
 
+            # The prototype tensor is normally the largest HxW 4-D tensor with
+            # exactly ``nm`` channels.
             return max(
                 candidates,
-                key=lambda item: (
-                    int(item.shape[-2]) * int(item.shape[-1])
-                ),
+                key=lambda item: int(item.shape[-2]) * int(item.shape[-1]),
             )
 
-        if len(output) >= 2:
-            proto = find_proto(output[1])
-        if proto is None:
+        first = output[0]
+        proto = None
+
+        # Newer segmentation layout: ((predictions, proto), raw_predictions)
+        if isinstance(first, (tuple, list)):
+            if not first:
+                raise RuntimeError("YOLO returned an empty primary output")
+            predictions = first[0]
+            if len(first) > 1:
+                proto = find_proto(first[1:])
+        else:
+            # Detection and older YOLOv8 segmentation layouts.
+            predictions = first
+
+        # Older segmentation layout and exported-model fallbacks.
+        if proto is None and len(output) > 1:
             proto = find_proto(output[1:])
+        if proto is None:
+            proto = find_proto(output)
+
+        if getattr(predictions, "ndim", None) not in (2, 3):
+            raise RuntimeError(
+                "Unable to locate YOLO prediction tensor in model output; "
+                f"primary_type={type(first).__name__}, "
+                f"prediction_type={type(predictions).__name__}"
+            )
 
         return predictions, proto
 

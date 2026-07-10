@@ -1410,7 +1410,6 @@ class DepthController:
         
         res = PcdAsyncResult()
         for params in ToPcdParams.from_db_record(db_record):
-            print(params)
             res = self.runner.submit_to_pcd(params)
         return res
 
@@ -1441,20 +1440,6 @@ def run_server(controller_name: str = "pcd") -> None:
     from iox2_jsonrpc.iceoryx import Iox2JsonRpcServer
 
     Iox2JsonRpcServer(DepthController(controller_name=controller_name)).run_forever()
-
-def test():
-    # cl = DepthController(controller_name="pcd")
-    cl = PcdRunner()
-    ps = ToPcdParams.from_db_record(
-            CustomRecord(**{'root_path': 'recording', 'mode': 'rgb_stereo', 'field_id': 'field_01', 
-                            'record_id': '150256.586650200JST', 
-                   'timestamp_ns_utc': 1783660851835039500, 'date_utc': '2026-07-10', 
-        'path': 'recording\\rgb_stereo\\2026-07-10\\field_01\\150256.586650200JST', 'datetime_utc': '2026-07-10T05:20:51.835039500Z'}
-        ))
-    for p in ps:
-        print(p)
-        cl._convert_to_pcd(p)
         
 if __name__ == "__main__":
     run_server()
-    # test()
