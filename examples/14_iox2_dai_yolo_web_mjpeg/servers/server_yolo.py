@@ -34,6 +34,7 @@ SizeMode = Literal["resize", "tiling"]
 YoloTask = Literal["detect", "segment"]
 MaskEncoding = Literal["rle"]
 MaskOrder = Literal["row_major"]
+TiledMaskOutput = Literal["tile", "full_image"]
 
 
 class YoloBaseModel(RpcModel):
@@ -89,6 +90,14 @@ class YoloSettings(YoloBaseModel):
     half: bool = True
     include_masks: bool = True
     mask_threshold: float = Field(default=0.5, ge=0.0, le=1.0)
+    # In tiling mode, "full_image" writes every final mask on the original
+    # image canvas: size=[image_height, image_width], origin_xy=[0, 0].
+    tiled_mask_output: TiledMaskOutput = "full_image"
+    # Union duplicate instances detected in overlapping tiles before RLE.
+    merge_tiled_masks: bool = True
+    # Intersection-over-smaller-box threshold used in addition to IoU.
+    # This helps join two clipped halves of an object at a tile boundary.
+    tile_merge_iom: float = Field(default=0.15, ge=0.0, le=1.0)
 
     @property
     def imgsz(self) -> int:
@@ -852,7 +861,40 @@ class YoloDetector:
 
         flush_tile_batch()
 
-        merged = self._nms(all_detections, self.settings.iou)
+        if (
+            self.settings.include_masks
+            and self._is_segment_model
+            and self.settings.tiled_mask_output == "full_image"
+        ):
+            if self.settings.merge_tiled_masks:
+                merged = self._merge_tiled_instances(
+                    all_detections,
+                    image_width=width,
+                    image_height=height,
+                    iou_threshold=self.settings.iou,
+                    iom_threshold=self.settings.tile_merge_iom,
+                )
+            else:
+                merged = self._nms(all_detections, self.settings.iou)
+                merged = [
+                    det.model_copy(
+                        update={
+                            "tile": None,
+                            "mask": self._mask_to_full_image_rle(
+                                det.mask,
+                                image_width=width,
+                                image_height=height,
+                            )
+                            if det.mask is not None
+                            else None,
+                        }
+                    )
+                    for det in merged
+                ]
+        else:
+            # Detection models, or callers that explicitly request compact
+            # tile-local masks, keep the original fast NMS behavior.
+            merged = self._nms(all_detections, self.settings.iou)
 
         logger(
             f"[{self.service_name}:{self.controller_name}:detect:tiling] tiled inference completed",
@@ -1424,6 +1466,184 @@ class YoloDetector:
         return mask.model_copy(
             update={"origin_xy": [int(ox + dx), int(oy + dy)]}
         )
+
+    @staticmethod
+    def _rle_to_binary_mask(mask: YoloInstanceMask) -> Any:
+        """Decode this service's row-major uncompressed RLE on CPU."""
+        height, width = (int(mask.size[0]), int(mask.size[1]))
+        pixel_count = height * width
+        counts = torch.as_tensor(mask.counts, dtype=torch.long)
+
+        if counts.numel() == 0:
+            return torch.zeros((height, width), dtype=torch.bool)
+        if bool((counts < 0).any()):
+            raise ValueError("RLE counts must be non-negative")
+        if int(counts.sum().item()) != pixel_count:
+            raise ValueError(
+                "RLE count total does not match mask size: "
+                f"sum={int(counts.sum().item())}, expected={pixel_count}"
+            )
+
+        # Runs alternate background/foreground and always begin with
+        # background. repeat_interleave avoids looping over every pixel.
+        values = torch.arange(counts.numel(), dtype=torch.long).remainder(2)
+        flat = torch.repeat_interleave(values, counts).to(torch.bool)
+        return flat.reshape(height, width)
+
+    @classmethod
+    def _paste_instance_mask(
+        cls,
+        canvas: Any,
+        mask: YoloInstanceMask,
+    ) -> None:
+        """OR a compact mask into its original-image position."""
+        local = cls._rle_to_binary_mask(mask)
+        canvas_height, canvas_width = canvas.shape
+        origin_x, origin_y = (int(mask.origin_xy[0]), int(mask.origin_xy[1]))
+        mask_height, mask_width = local.shape
+
+        dst_left = max(origin_x, 0)
+        dst_top = max(origin_y, 0)
+        dst_right = min(origin_x + mask_width, canvas_width)
+        dst_bottom = min(origin_y + mask_height, canvas_height)
+        if dst_right <= dst_left or dst_bottom <= dst_top:
+            return
+
+        src_left = dst_left - origin_x
+        src_top = dst_top - origin_y
+        src_right = src_left + (dst_right - dst_left)
+        src_bottom = src_top + (dst_bottom - dst_top)
+        canvas[dst_top:dst_bottom, dst_left:dst_right] |= local[
+            src_top:src_bottom, src_left:src_right
+        ]
+
+    def _mask_to_full_image_rle(
+        self,
+        mask: YoloInstanceMask,
+        image_width: int,
+        image_height: int,
+    ) -> YoloInstanceMask:
+        """Place one tile-local mask on a full original-image canvas."""
+        canvas = torch.zeros(
+            (int(image_height), int(image_width)),
+            dtype=torch.bool,
+        )
+        self._paste_instance_mask(canvas, mask)
+        return self._binary_mask_to_rle(canvas)
+
+    @staticmethod
+    def _box_iou_and_iom(
+        box: Any,
+        boxes: Any,
+    ) -> tuple[Any, Any]:
+        """Return IoU and intersection-over-smaller-area for one vs many."""
+        xx1 = torch.maximum(box[0], boxes[:, 0])
+        yy1 = torch.maximum(box[1], boxes[:, 1])
+        xx2 = torch.minimum(box[2], boxes[:, 2])
+        yy2 = torch.minimum(box[3], boxes[:, 3])
+        intersection = (xx2 - xx1).clamp(min=0) * (yy2 - yy1).clamp(min=0)
+
+        box_area = (box[2] - box[0]).clamp(min=0) * (
+            box[3] - box[1]
+        ).clamp(min=0)
+        boxes_area = (boxes[:, 2] - boxes[:, 0]).clamp(min=0) * (
+            boxes[:, 3] - boxes[:, 1]
+        ).clamp(min=0)
+        union = box_area + boxes_area - intersection
+        smaller = torch.minimum(box_area.expand_as(boxes_area), boxes_area)
+        iou = intersection / union.clamp(min=1e-7)
+        iom = intersection / smaller.clamp(min=1e-7)
+        return iou, iom
+
+    def _merge_tiled_instances(
+        self,
+        detections: list[YoloDetection],
+        image_width: int,
+        image_height: int,
+        iou_threshold: float,
+        iom_threshold: float,
+    ) -> list[YoloDetection]:
+        """Merge duplicate tiled instances and emit full-image-coordinate masks.
+
+        Detections are clustered class-aware, beginning with the highest
+        confidence item. Normal IoU catches standard duplicates; IoM also
+        catches clipped halves whose overlap is only the tile-overlap strip.
+        Every cluster's masks are OR'ed on one original-image canvas.
+        """
+        if not detections:
+            return []
+
+        boxes = torch.tensor(
+            [det.bbox_xyxy for det in detections], dtype=torch.float32
+        )
+        scores = torch.tensor(
+            [det.confidence for det in detections], dtype=torch.float32
+        )
+        class_ids = torch.tensor(
+            [det.class_id for det in detections], dtype=torch.long
+        )
+        remaining = scores.argsort(descending=True)
+        merged: list[YoloDetection] = []
+
+        while remaining.numel() > 0:
+            seed_index = int(remaining[0].item())
+            candidate_indices = remaining
+            candidate_boxes = boxes[candidate_indices]
+            iou, iom = self._box_iou_and_iom(
+                boxes[seed_index], candidate_boxes
+            )
+            same_class = (
+                class_ids[candidate_indices] == class_ids[seed_index]
+            )
+            belongs = same_class & (
+                (iou >= float(iou_threshold))
+                | (iom >= float(iom_threshold))
+            )
+            # The seed always belongs, including degenerate-box edge cases.
+            belongs[0] = True
+            cluster_indices = candidate_indices[belongs]
+            remaining = candidate_indices[~belongs]
+
+            representative = detections[seed_index]
+            canvas = torch.zeros(
+                (int(image_height), int(image_width)),
+                dtype=torch.bool,
+            )
+            cluster_boxes = []
+            mask_found = False
+
+            for index_tensor in cluster_indices:
+                index = int(index_tensor.item())
+                det = detections[index]
+                cluster_boxes.append(det.bbox_xyxy)
+                if det.mask is not None:
+                    self._paste_instance_mask(canvas, det.mask)
+                    mask_found = True
+
+            cluster_box_tensor = torch.tensor(
+                cluster_boxes, dtype=torch.float32
+            )
+            union_box = [
+                float(cluster_box_tensor[:, 0].min().clamp(0, image_width).item()),
+                float(cluster_box_tensor[:, 1].min().clamp(0, image_height).item()),
+                float(cluster_box_tensor[:, 2].max().clamp(0, image_width).item()),
+                float(cluster_box_tensor[:, 3].max().clamp(0, image_height).item()),
+            ]
+
+            full_mask = (
+                self._binary_mask_to_rle(canvas) if mask_found else None
+            )
+            merged.append(
+                representative.model_copy(
+                    update={
+                        "bbox_xyxy": union_box,
+                        "tile": None,
+                        "mask": full_mask,
+                    }
+                )
+            )
+
+        return merged
 
     @staticmethod
     def _torch_class_aware_nms(

@@ -1,14 +1,13 @@
 from __future__ import annotations
 
 import json
-import logging
 import os
 import sys
-import traceback
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from queue import Empty, Full, Queue
 from threading import Event, Lock, RLock, Thread
+import time
 from typing import Any, Literal
 
 import numpy as np
@@ -19,8 +18,10 @@ from common import HookDispatcher
 from iox2_jsonrpc import EmptyParams, RpcModel
 from store.custom_record_store import CustomRecord
 from server_yolo import YoloDetectResult
+from resultkit.logger import logger
 
-logger = logging.getLogger(__name__)
+LOG_SERVICE = "jrpc"
+LOG_CONTROLLER = "pcd"
 
 _THIS_DIR = Path(__file__).absolute().parent
 for path in (
@@ -56,6 +57,15 @@ except ImportError as exc:  # noqa: E402
     FastFoundationStereoDisparity = Any  # type: ignore[misc,assignment]
     stereo_rgb_to_colored_point_cloud_dnn = None  # type: ignore[assignment]
     _DNN_IMPORT_ERROR = exc
+
+logger(
+    f"[{LOG_SERVICE}:{LOG_CONTROLLER}:init] module loaded",
+    extra={
+        "module_dir": str(_THIS_DIR),
+        "dnn_available": _DNN_IMPORT_ERROR is None,
+        "dnn_error": None if _DNN_IMPORT_ERROR is None else str(_DNN_IMPORT_ERROR),
+    },
+)
 
 Resolution = tuple[int, int]
 ColorOrder = Literal["RGB", "BGR"]
@@ -161,6 +171,14 @@ def _save_cloud_npz(path: str | Path, cloud: Any) -> Path:
         arrays["disparity"] = np.asarray(cloud.disparity)
 
     np.savez(output_path, **arrays)
+    logger(
+        f"[{LOG_SERVICE}:{LOG_CONTROLLER}:save_cloud_npz] point cloud archive saved",
+        extra={
+            "output_path": str(output_path),
+            "point_count": int(arrays["points_m"].shape[0]),
+            "has_disparity": "disparity" in arrays,
+        },
+    )
     return output_path
 
 
@@ -237,6 +255,14 @@ def _save_segments_npz(path: str | Path, result: "DetectSegments3D") -> Path:
         arrays["disparity"] = np.asarray(result.disparity)
 
     np.savez(output_path, **arrays)
+    logger(
+        f"[{LOG_SERVICE}:{LOG_CONTROLLER}:save_segments_npz] segment archive saved",
+        extra={
+            "output_path": str(output_path),
+            "point_count": int(arrays["points_m"].shape[0]),
+            "segment_count": len(result.segments),
+        },
+    )
     return output_path
 
 
@@ -418,7 +444,7 @@ class ToPcdParams(BackendOverrides):
 
 class ToPcdResult(DepthBaseModel):
     backend: DepthBackend
-    output_path: str
+    output_path: str = ""
     point_count: int
     color_count: int
     size_bytes: int
@@ -428,7 +454,7 @@ class ToPcdResult(DepthBaseModel):
     disparity_width: int | None = None
     disparity_height: int | None = None
     calibration: str | None = None
-
+    error: str | None = None
 
 class PcdAsyncResult(DepthBaseModel):
     running: bool = False
@@ -558,6 +584,17 @@ class PcdRunner:
     _last_result: ToPcdResult | None = field(default=None, init=False, repr=False)
     _current_output_path: str | None = field(default=None, init=False, repr=False)
 
+    def __post_init__(self) -> None:
+        logger(
+            f"[{LOG_SERVICE}:{LOG_CONTROLLER}:PcdRunner:init] runner initialized",
+            extra={
+                "queue_capacity": self.input_queue.maxsize,
+                "backend": self.backend_params.backend,
+                "device": self.backend_params.device,
+                "dnn_available": _DNN_IMPORT_ERROR is None,
+            },
+        )
+
     @property
     def is_running(self) -> bool:
         thread = self._thread
@@ -566,24 +603,44 @@ class PcdRunner:
     def start(self) -> None:
         with self._lifecycle_lock:
             if self.is_running:
+                logger(
+                    f"[{LOG_SERVICE}:{LOG_CONTROLLER}:PcdRunner:start] runner already running",
+                    extra={"queue_size": self.input_queue.qsize()},
+                )
                 return
+            logger(
+                f"[{LOG_SERVICE}:{LOG_CONTROLLER}:PcdRunner:start] starting runner",
+                extra={"queue_size": self.input_queue.qsize()},
+            )
             self._stop_event.clear()
             self._thread = Thread(target=self._run, name="PcdRunner", daemon=True)
             self._thread.start()
 
     def stop(self, timeout: float = 5.0) -> None:
         """Stop accepting queued work after the current conversion returns."""
+        logger(
+            f"[{LOG_SERVICE}:{LOG_CONTROLLER}:PcdRunner:stop] stopping runner",
+            extra={"timeout_s": timeout, "queue_size": self.input_queue.qsize()},
+        )
         self._stop_event.set()
         thread = self._thread
         if thread is not None and thread.is_alive():
             thread.join(timeout=timeout)
+        logger(
+            f"[{LOG_SERVICE}:{LOG_CONTROLLER}:PcdRunner:stop] runner stop completed",
+            level="info" if not self.is_running else "warning",
+            extra={"running": self.is_running, "queue_size": self.input_queue.qsize()},
+        )
 
     def snapshot(self) -> tuple[str | None, ToPcdResult | None, Exception | None]:
         with self._state_lock:
             return self._current_output_path, self._last_result, self._exception
 
     def _run(self) -> None:
-        logger.info("PCD runner started")
+        logger(
+            f"[{LOG_SERVICE}:{LOG_CONTROLLER}:PcdRunner:run] runner started",
+            extra={"queue_capacity": self.input_queue.maxsize},
+        )
 
         while not self._stop_event.is_set():
             try:
@@ -594,8 +651,16 @@ class PcdRunner:
             with self._state_lock:
                 self._current_output_path = params.output_pcd_path
 
+            logger(
+                f"[{LOG_SERVICE}:{LOG_CONTROLLER}:PcdRunner:run] conversion dequeued",
+                extra={
+                    "output_path": params.output_pcd_path,
+                    "queue_size": self.input_queue.qsize(),
+                    "backend_override": params.backend,
+                },
+            )
+
             try:
-                # All heavy processing is owned and serialized by this runner.
                 with self._process_lock:
                     result = self._convert_to_pcd(params)
 
@@ -603,31 +668,60 @@ class PcdRunner:
                     self._last_result = result
                     self._exception = None
 
-                logger.info(
-                    "PCD conversion completed: output=%s points=%s",
-                    result.output_path,
-                    result.point_count,
+                logger(
+                    f"[{LOG_SERVICE}:{LOG_CONTROLLER}:PcdRunner:run] conversion completed",
+                    extra={
+                        "output_path": result.output_path,
+                        "backend": result.backend,
+                        "point_count": result.point_count,
+                        "size_bytes": result.size_bytes,
+                    },
                 )
 
                 if params.hook_urls:
                     try:
+                        logger(
+                            f"[{LOG_SERVICE}:{LOG_CONTROLLER}:PcdRunner:hooks] dispatching completion hooks",
+                            extra={
+                                "output_path": result.output_path,
+                                "hook_chains": params.hook_urls,
+                            },
+                        )
                         self.hook_dispatcher.dispatch(
                             db_record=params.db_record,
                             hook_chains=params.hook_urls,
                         )
+                        logger(
+                            f"[{LOG_SERVICE}:{LOG_CONTROLLER}:PcdRunner:hooks] completion hooks dispatched",
+                            extra={"output_path": result.output_path},
+                        )
                     except Exception:
-                        logger.exception("Could not dispatch PCD completion hooks")
+                        logger(
+                            f"[{LOG_SERVICE}:{LOG_CONTROLLER}:PcdRunner:hooks:error] completion hook dispatch failed",level="error",
+                            extra={"output_path": result.output_path},
+                        )
 
             except Exception as exc:
                 with self._state_lock:
                     self._exception = exc
-                logger.error("PCD conversion failed: %s\n%s", exc, traceback.format_exc())
+                logger(
+                    f"[{LOG_SERVICE}:{LOG_CONTROLLER}:PcdRunner:run:error] conversion failed",level="error",
+                    extra={
+                        "output_path": params.output_pcd_path,
+                        "backend_override": params.backend,
+                        "error_type": exc.__class__.__name__,
+                        "error": str(exc),
+                    },
+                )
             finally:
                 with self._state_lock:
                     self._current_output_path = None
                 self.input_queue.task_done()
 
-        logger.info("PCD runner stopped")
+        logger(
+            f"[{LOG_SERVICE}:{LOG_CONTROLLER}:PcdRunner:run] runner stopped",
+            extra={"queue_size": self.input_queue.qsize()},
+        )
 
     def _build_calibration(self, params: DepthCalibrationParams | None = None) -> StereoRgbCalibration:
         if params is None:
@@ -636,7 +730,21 @@ class PcdRunner:
         calibration_data = _model_to_dict(params)
         calibration_data.pop("service", None)
         translation_unit = calibration_data.pop("source_translation_unit", "cm")
-        return StereoRgbCalibration.from_dict(calibration_data, source_translation_unit=translation_unit)
+        calibration = StereoRgbCalibration.from_dict(
+            calibration_data,
+            source_translation_unit=translation_unit,
+        )
+        logger(
+            f"[{LOG_SERVICE}:{LOG_CONTROLLER}:calibration:build] calibration built",
+            extra={
+                "source_translation_unit": translation_unit,
+                "rgb_resolution": calibration.rgb_resolution,
+                "left_resolution": calibration.left_resolution,
+                "right_resolution": calibration.right_resolution,
+                "stereo_baseline_m": calibration.stereo_baseline_m,
+            },
+        )
+        return calibration
 
     def _calibration_result(self, calibration: StereoRgbCalibration) -> SetDepthCalibrationResult:
         result_fields = (
@@ -677,16 +785,44 @@ class PcdRunner:
 
         cache_key = self._dnn_cache_key(backend)
         if self._dnn_predictor is None or self._dnn_predictor_key != cache_key:
-            self._dnn_predictor = FastFoundationStereoDisparity(
-                repo_dir=backend.repo_dir,
-                model_path=backend.model_path,
-                model_dir=backend.model_dir,
-                device=backend.device,
-                valid_iters=int(backend.valid_iters),
-                max_disp=int(backend.max_disp),
-                hiera=bool(backend.hiera),
+            logger(
+                f"[{LOG_SERVICE}:{LOG_CONTROLLER}:dnn:load] loading disparity predictor",
+                extra={
+                    "repo_dir": backend.repo_dir,
+                    "model_path": backend.model_path,
+                    "model_dir": backend.model_dir,
+                    "device": backend.device,
+                    "valid_iters": backend.valid_iters,
+                    "max_disp": backend.max_disp,
+                    "hiera": backend.hiera,
+                },
             )
-            self._dnn_predictor_key = cache_key
+            try:
+                self._dnn_predictor = FastFoundationStereoDisparity(
+                    repo_dir=backend.repo_dir,
+                    model_path=backend.model_path,
+                    model_dir=backend.model_dir,
+                    device=backend.device,
+                    valid_iters=int(backend.valid_iters),
+                    max_disp=int(backend.max_disp),
+                    hiera=bool(backend.hiera),
+                )
+                self._dnn_predictor_key = cache_key
+                logger(
+                    f"[{LOG_SERVICE}:{LOG_CONTROLLER}:dnn:load] disparity predictor loaded",
+                    extra={"model_path": backend.model_path, "device": backend.device},
+                )
+            except Exception:
+                logger(
+                    f"[{LOG_SERVICE}:{LOG_CONTROLLER}:dnn:load:error] disparity predictor load failed",level="error",
+                    extra={"model_path": backend.model_path, "device": backend.device},
+                )
+                raise
+        else:
+            logger(
+                f"[{LOG_SERVICE}:{LOG_CONTROLLER}:dnn:cache] using cached disparity predictor",
+                extra={"model_path": backend.model_path, "device": backend.device},
+            )
 
         return self._dnn_predictor
 
@@ -714,6 +850,17 @@ class PcdRunner:
         max_depth_m: float | None,
         splat_px: int,
     ) -> tuple[np.ndarray, np.ndarray, Any]:
+        logger(
+            f"[{LOG_SERVICE}:{LOG_CONTROLLER}:depth:compute] computing RGB-aligned depth",
+            extra={
+                "backend": backend.backend,
+                "left_shape": tuple(np.asarray(left_image).shape),
+                "right_shape": tuple(np.asarray(right_image).shape),
+                "rgb_shape": tuple(np.asarray(rgb_image).shape),
+                "max_depth_m": max_depth_m,
+                "splat_px": splat_px,
+            },
+        )
         if backend.backend == "sgbm":
             left_rect, right_rect, rect = rectify_stereo_pair(
                 left_image,
@@ -776,6 +923,14 @@ class PcdRunner:
             calibration,
             rgb_image_is_undistorted=rgb_image_is_undistorted,
             splat_px=splat_px,
+        )
+        logger(
+            f"[{LOG_SERVICE}:{LOG_CONTROLLER}:depth:compute] RGB-aligned depth computed",
+            extra={
+                "backend": backend.backend,
+                "valid_depth_pixels": int(np.isfinite(depth_rgb_m).sum()),
+                "disparity_shape": tuple(np.asarray(disparity).shape),
+            },
         )
         return depth_rgb_m, disparity, rect
 
@@ -1047,6 +1202,15 @@ class PcdRunner:
         return self._ros2_publishers
 
     def _publish_segments_ros2(self, result: DetectSegments3D, params: Ros2PublishParams) -> Ros2PublishResult:
+        logger(
+            f"[{LOG_SERVICE}:{LOG_CONTROLLER}:ros2:publish] publishing segment result",
+            extra={
+                "point_count": int(len(result.points_m)),
+                "segment_count": int(len(result.segments)),
+                "frame_id": params.ros2_frame_id,
+                "topic_prefix": params.ros2_topic_prefix,
+            },
+        )
         try:
             import rclpy
             from ros2_utils import build_segment_ros_messages
@@ -1084,7 +1248,7 @@ class PcdRunner:
             if params.ros2_include_markers:
                 topics["markers"] = f"{prefix}/markers"
 
-            return Ros2PublishResult(
+            publish_result = Ros2PublishResult(
                 published=True,
                 point_count=int(len(result.points_m)),
                 segment_count=int(len(result.segments)),
@@ -1092,7 +1256,26 @@ class PcdRunner:
                 topics=topics,
                 error=None,
             )
+            logger(
+                f"[{LOG_SERVICE}:{LOG_CONTROLLER}:ros2:publish] segment result published",
+                extra={
+                    "point_count": publish_result.point_count,
+                    "segment_count": publish_result.segment_count,
+                    "topics": publish_result.topics,
+                },
+            )
+            return publish_result
         except Exception as exc:
+            logger(
+                f"[{LOG_SERVICE}:{LOG_CONTROLLER}:ros2:publish:error] segment publish failed",level="error",
+                extra={
+                    "point_count": int(len(result.points_m)),
+                    "segment_count": int(len(result.segments)),
+                    "frame_id": params.ros2_frame_id,
+                    "error_type": exc.__class__.__name__,
+                    "error": str(exc),
+                },
+            )
             return Ros2PublishResult(
                 published=False,
                 point_count=int(len(result.points_m)),
@@ -1103,34 +1286,113 @@ class PcdRunner:
             )
 
     def set_calibration(self, params: DepthCalibrationParams) -> SetDepthCalibrationResult:
+        logger(
+            f"[{LOG_SERVICE}:{LOG_CONTROLLER}:calibration:set] applying calibration",
+            extra={
+                "source_translation_unit": params.source_translation_unit,
+                "rgb_resolution": params.rgb_resolution,
+                "left_resolution": params.left_resolution,
+                "right_resolution": params.right_resolution,
+            },
+        )
         with self._config_lock:
             self.calibration_params = params
-        return self._calibration_result(self._build_calibration(params))
+        result = self._calibration_result(self._build_calibration(params))
+        logger(
+            f"[{LOG_SERVICE}:{LOG_CONTROLLER}:calibration:set] calibration applied",
+            extra={
+                "stereo_baseline_m": result.stereo_baseline_m,
+                "rgb_resolution": result.rgb_resolution,
+            },
+        )
+        return result
 
     def calibration(self, params: EmptyParams) -> SetDepthCalibrationResult:
         del params
         with self._config_lock:
             configured = self.calibration_params
-        return self._calibration_result(self._build_calibration(configured))
+        result = self._calibration_result(self._build_calibration(configured))
+        logger(
+            f"[{LOG_SERVICE}:{LOG_CONTROLLER}:calibration:get] calibration requested",
+            extra={
+                "configured": result.configured,
+                "stereo_baseline_m": result.stereo_baseline_m,
+            },
+        )
+        return result
 
     def set_backend(self, params: BackendParams) -> BackendStatusResult:
-        # Serialize cache replacement with any active DNN conversion.
+        logger(
+            f"[{LOG_SERVICE}:{LOG_CONTROLLER}:backend:set] applying backend settings",
+            extra={
+                "backend": params.backend,
+                "device": params.device,
+                "model_path": params.model_path,
+                "valid_iters": params.valid_iters,
+                "max_disp": params.max_disp,
+            },
+        )
         with self._process_lock:
             with self._config_lock:
                 old_cache_key = self._dnn_cache_key(self.backend_params)
                 self.backend_params = params
-                if old_cache_key != self._dnn_cache_key(params):
+                cache_reset = old_cache_key != self._dnn_cache_key(params)
+                if cache_reset:
                     self._dnn_predictor = None
                     self._dnn_predictor_key = None
-        return self._backend_result()
+        result = self._backend_result()
+        logger(
+            f"[{LOG_SERVICE}:{LOG_CONTROLLER}:backend:set] backend settings applied",
+            extra={
+                "backend": result.backend,
+                "device": result.device,
+                "predictor_loaded": result.predictor_loaded,
+                "cache_reset": cache_reset,
+            },
+        )
+        return result
 
     def backend(self, params: EmptyParams) -> BackendStatusResult:
         del params
-        return self._backend_result()
+        result = self._backend_result()
+        logger(
+            f"[{LOG_SERVICE}:{LOG_CONTROLLER}:backend:get] backend status requested",
+            extra={
+                "backend": result.backend,
+                "device": result.device,
+                "predictor_loaded": result.predictor_loaded,
+                "dnn_available": result.dnn_available,
+            },
+        )
+        return result
 
     def _convert_to_pcd(self, params: ToPcdParams) -> ToPcdResult:
+        if Path(params.output_pcd_path).exists():
+            return ToPcdResult(
+                backend=self.backend_params.backend,
+                output_path=str(params.output_pcd_path),
+                point_count=-1,
+                color_count=-1,
+                size_bytes=-1,
+                error=f"output path already exists: {params.output_pcd_path}",
+            )
 
-        calibration=self._build_calibration(params.calibration)
+        logger(
+            f"[{LOG_SERVICE}:{LOG_CONTROLLER}:convert] conversion started",
+            extra={
+                "left_path": params.left_path,
+                "right_path": params.right_path,
+                "rgb_path": params.rgb_path,
+                "output_path": params.output_pcd_path,
+                "backend_override": params.backend,
+                "output_frame": params.output_frame,
+                "stride": params.stride,
+                "max_depth_m": params.max_depth_m,
+            },
+        )
+        start_time = time.perf_counter()
+
+        calibration = self._build_calibration(params.calibration)
         output_path = Path(params.output_pcd_path).expanduser()
         output_suffix = output_path.suffix.lower()
 
@@ -1179,7 +1441,7 @@ class PcdRunner:
         depth_min_m, depth_max_m, depth_mean_m = _depth_statistics(cloud.points_m)
         disparity_height, disparity_width = (None, None) if cloud.disparity is None else cloud.disparity.shape[:2]
 
-        return ToPcdResult(
+        result = ToPcdResult(
             backend=backend.backend,
             output_path=str(output_path),
             point_count=int(cloud.points_m.shape[0]),
@@ -1192,6 +1454,23 @@ class PcdRunner:
             disparity_height=disparity_height,
             calibration=str(calibration),
         )
+        
+        seconds_per_imag = elapsed = time.perf_counter() - start_time
+        logger(
+            f"[{LOG_SERVICE}:{LOG_CONTROLLER}:convert] conversion completed ({seconds_per_imag:.2f} sec/image)",
+            extra={
+                "output_path": result.output_path,
+                "backend": result.backend,
+                "point_count": result.point_count,
+                "color_count": result.color_count,
+                "size_bytes": result.size_bytes,
+                "depth_min_m": result.depth_min_m,
+                "depth_max_m": result.depth_max_m,
+                "depth_mean_m": result.depth_mean_m,
+                "seconds_per_image": seconds_per_imag,
+            },
+        )
+        return result
 
     def _pcd_async_result(
         self,
@@ -1223,31 +1502,67 @@ class PcdRunner:
         try:
             self.input_queue.put_nowait(params)
         except Full:
+            logger(
+                f"[{LOG_SERVICE}:{LOG_CONTROLLER}:queue:full] conversion queue is full",
+                level="warning",
+                extra={
+                    "output_path": params.output_pcd_path,
+                    "queue_size": self.input_queue.qsize(),
+                    "queue_capacity": self.input_queue.maxsize,
+                },
+            )
             return self._pcd_async_result(
                 params,
                 error=f"PCD queue is full (capacity={self.input_queue.maxsize})",
             )
 
-        logger.info(
-            "Queued PCD conversion: output=%s queue_size=%s",
-            params.output_pcd_path,
-            self.input_queue.qsize(),
+        qs = self.input_queue.qsize()
+        logger(
+            f"[{LOG_SERVICE}:{LOG_CONTROLLER}:queue:submit] conversion queued(size={qs})",
+            extra={
+                "output_path": params.output_pcd_path,
+                "queue_size": qs,
+                "queue_capacity": self.input_queue.maxsize,
+                "backend_override": params.backend,
+            },
         )
         return self._pcd_async_result(params, queued=True)
 
     def to_pcd_status(self, params: EmptyParams) -> PcdAsyncResult:
         del params
-        return self._pcd_async_result()
+        result = self._pcd_async_result()
+        logger(
+            f"[{LOG_SERVICE}:{LOG_CONTROLLER}:queue:status] conversion status requested",
+            extra={
+                "running": result.running,
+                "queue_size": result.queue_size,
+                "current_output_path": result.current_output_path,
+                "has_error": result.error is not None,
+            },
+        )
+        return result
 
     def to_pcd_stop(self, params: EmptyParams) -> PcdAsyncResult:
         del params
+        logger(f"[{LOG_SERVICE}:{LOG_CONTROLLER}:queue:stop] stop requested")
         self.stop()
         return self._pcd_async_result()
 
     def convert_to_pcd_sync(self, params: ToPcdParams) -> ToPcdResult:
         """Run through the same complete processor without the queue."""
-        with self._process_lock:
-            return self._convert_to_pcd(params)
+        logger(
+            f"[{LOG_SERVICE}:{LOG_CONTROLLER}:convert_sync] synchronous conversion requested",
+            extra={"output_path": params.output_pcd_path},
+        )
+        try:
+            with self._process_lock:
+                return self._convert_to_pcd(params)
+        except Exception:
+            logger(
+                f"[{LOG_SERVICE}:{LOG_CONTROLLER}:convert_sync:error] synchronous conversion failed",level="error",
+                extra={"output_path": params.output_pcd_path},
+            )
+            raise
 
     def _detect_segments_to_pcd(self, params: ToYoloSegmentsParams) -> ToDetectSegmentsResult:
         output_dir = Path(params.output_dir).expanduser()
@@ -1353,11 +1668,48 @@ class PcdRunner:
         )
 
     def detect_segments_to_pcd(self, params: ToYoloSegmentsParams) -> ToDetectSegmentsResult:
-        with self._process_lock:
-            return self._detect_segments_to_pcd(params)
+        logger(
+            f"[{LOG_SERVICE}:{LOG_CONTROLLER}:segments:convert] segment conversion requested",
+            extra={
+                "left_path": params.left_path,
+                "right_path": params.right_path,
+                "rgb_path": params.rgb_path,
+                "output_dir": params.output_dir,
+                "frame_name": params.frame_name,
+                "backend_override": params.backend,
+            },
+        )
+        try:
+            with self._process_lock:
+                result = self._detect_segments_to_pcd(params)
+            logger(
+                f"[{LOG_SERVICE}:{LOG_CONTROLLER}:segments:convert] segment conversion completed",
+                extra={
+                    "output_dir": result.output_dir,
+                    "frame_name": result.frame_name,
+                    "backend": result.backend,
+                    "point_count": result.point_count,
+                    "segment_count": result.segment_count,
+                },
+            )
+            return result
+        except Exception:
+            logger(
+                f"[{LOG_SERVICE}:{LOG_CONTROLLER}:segments:convert:error] segment conversion failed",level="error",
+                extra={
+                    "output_dir": params.output_dir,
+                    "frame_name": params.frame_name,
+                    "backend_override": params.backend,
+                },
+            )
+            raise
 
     def publish_last_yolo_segments(self, params: Ros2PublishParams) -> Ros2PublishResult:
         if self._last_yolo_segments is None:
+            logger(
+                f"[{LOG_SERVICE}:{LOG_CONTROLLER}:ros2:publish_last] no cached segment result",
+                level="warning",
+            )
             raise ValueError("No YOLO segment result is cached. Call yolo_segments_to_pcd first.")
         return self._publish_segments_ros2(self._last_yolo_segments, params)
 
@@ -1391,6 +1743,17 @@ class DepthController:
     controller_name: str = "pcd"
     runner: PcdRunner = field(default_factory=PcdRunner, repr=False)
 
+    def __post_init__(self) -> None:
+        logger(
+            f"[{self.service_name}:{self.controller_name}:init] controller initialized",
+            extra={
+                "service_name": self.service_name,
+                "controller_name": self.controller_name,
+                "backend": self.runner.backend_params.backend,
+                "queue_capacity": self.runner.input_queue.maxsize,
+            },
+        )
+
     def set_calibration(self, params: DepthCalibrationParams) -> SetDepthCalibrationResult:
         return self.runner.set_calibration(params)
 
@@ -1404,14 +1767,42 @@ class DepthController:
         return self.runner.backend(params)
 
     def to_pcd(self, params: ToPcdParams) -> PcdAsyncResult:
-        db_record = CustomRecord(**params.db_record)
-        if db_record.is_empty():
-            return self.runner.submit_to_pcd(params)
-        
-        res = PcdAsyncResult()
-        for params in ToPcdParams.from_db_record(db_record):
-            res = self.runner.submit_to_pcd(params)
-        return res
+        logger(
+            f"[{self.service_name}:{self.controller_name}:to_pcd] conversion requested",
+            extra={
+                "output_path": params.output_pcd_path,
+                "left_path": params.left_path,
+                "right_path": params.right_path,
+                "rgb_path": params.rgb_path,
+                "has_db_record": bool(params.db_record),
+            },
+        )
+        try:
+            db_record = CustomRecord(**params.db_record)
+            if db_record.is_empty():
+                return self.runner.submit_to_pcd(params)
+
+            derived_params = ToPcdParams.from_db_record(db_record)
+
+            logger(
+                f"[{self.service_name}:{self.controller_name}:to_pcd] derived jobs({len(derived_params)})",
+                extra={
+                    "conversion_count": len(derived_params),
+                    "output_paths": [
+                        item.output_pcd_path for item in derived_params
+                    ],
+                },
+            )
+            result = PcdAsyncResult()
+            for conversion_params in derived_params:
+                result = self.runner.submit_to_pcd(conversion_params)
+            return result
+        except Exception:
+            logger(
+                f"[{self.service_name}:{self.controller_name}:to_pcd:error] conversion request failed",level="error",
+                extra={"output_path": params.output_pcd_path},
+            )
+            raise
 
     def to_pcd_status(self, params: EmptyParams) -> PcdAsyncResult:
         return self.runner.to_pcd_status(params)
@@ -1431,15 +1822,36 @@ class DepthController:
     def ros2_status(self, params: EmptyParams) -> Ros2PublishResult:
         return self.runner.ros2_status(params)
 
-def run_server(controller_name: str = "pcd") -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
 
+def run_server(controller_name: str = "pcd") -> None:
     from iox2_jsonrpc.iceoryx import Iox2JsonRpcServer
 
-    Iox2JsonRpcServer(DepthController(controller_name=controller_name)).run_forever()
-        
+    logger(
+        f"[{LOG_SERVICE}:{controller_name}:run_server] starting RPC server",
+        extra={"service_name": LOG_SERVICE, "controller_name": controller_name},
+    )
+    try:
+        Iox2JsonRpcServer(
+            DepthController(
+                service_name=LOG_SERVICE,
+                controller_name=controller_name,
+            )
+        ).run_forever()
+    except KeyboardInterrupt:
+        logger(
+            f"[{LOG_SERVICE}:{controller_name}:run_server] server interrupted",
+            level="warning",
+        )
+        raise
+    except Exception:
+        logger(
+            f"[{LOG_SERVICE}:{controller_name}:run_server:error] server stopped with an error",level="error",
+            extra={"service_name": LOG_SERVICE, "controller_name": controller_name},
+        )
+        raise
+    finally:
+        logger(f"[{LOG_SERVICE}:{controller_name}:run_server] server stopped")
+
+
 if __name__ == "__main__":
     run_server()

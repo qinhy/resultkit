@@ -69,6 +69,32 @@ def store_capture(sts=[
     logging.info(store_capture)
 
 
+def set_dnn_pcd():
+    logging.info(call_method("pcd", "set_backend",{
+        "backend": "dnn",
+        "repo_dir": "./examples/14_iox2_dai_yolo_web_mjpeg/fast-foundationstereo",
+        "model_path": "weights/23-36-37/model_best_bp2_serialize.pth",
+        "model_dir": None,
+        "device": "cuda",
+        "valid_iters": 8,
+        "max_disp": 192,
+        "hiera": False,
+        "model_scale": 1,
+        "stereo_input_color_order": "RGB",
+        "remove_invisible": True
+    }))
+    
+def set_sgbm_pcd():
+    logging.info(call_method("pcd", "set_backend",{
+        "backend": "sgbm",
+        "valid_iters": 8,
+        "max_disp": 192,
+        "hiera": False,
+        "model_scale": 1,
+        "stereo_input_color_order": "RGB",
+        "remove_invisible": True
+    }))
+
 def main() -> None:
     logging.basicConfig(
         level=logging.INFO,
@@ -142,5 +168,7 @@ def main() -> None:
 
 if __name__ == "__main__":
     # main()
+    # set_sgbm_pcd()
+    set_dnn_pcd()
     store_capture(to_yolo=True,to_pcd=True)
     pass
