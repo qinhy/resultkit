@@ -1457,7 +1457,7 @@ class PcdRunner:
         
         seconds_per_imag = elapsed = time.perf_counter() - start_time
         logger(
-            f"[{LOG_SERVICE}:{LOG_CONTROLLER}:convert] conversion completed ({seconds_per_imag:.2f} sec/image)",
+            f"[{LOG_SERVICE}:{LOG_CONTROLLER}:convert] conversion completed ({seconds_per_imag:.2f} sec/item)",
             extra={
                 "output_path": result.output_path,
                 "backend": result.backend,

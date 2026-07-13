@@ -32,6 +32,11 @@ def opencam(name):
     logging.info(f"\n=== {name}.open ===")
     call_method(name, "open", {})
 
+def checkcam(name):
+    logging.info(f"\n=== {name}.status ===")
+    status = call_method(name, "status", {})
+    return status.get("opened",False)
+
 def store_watch(sts=[
         "rgbd_left",
         "rgbd_right"
@@ -110,7 +115,10 @@ def main() -> None:
     ]
     for s in sts:
         opencam(s)
-    time.sleep(20)
+    
+    for s in sts:
+        while not checkcam(s):
+            time.sleep(5)
 
     store_watch()
     time.sleep(3)

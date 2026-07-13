@@ -19,6 +19,22 @@ from ultralytics import YOLO
 from common import EmptyParams, HookDispatcher, RpcModel, openapi_doc
 from store.custom_record_store import CustomRecord
 from resultkit.logger import logger
+from yolo_utils import (
+    binary_mask_to_polygon_contours,
+    binary_mask_to_uncompressed_rle,
+    decode_instance_masks,
+    decode_yolo_predictions,
+    greedy_class_aware_clusters,
+    letterbox_tensor,
+    make_divisible,
+    paste_binary_mask,
+    split_prediction_batch,
+    split_proto_batch,
+    tile_positions,
+    torch_class_aware_nms,
+    uncompressed_rle_to_binary_mask,
+    unwrap_yolo_model_output,
+)
 
 
 DEFAULT_SERVICE_NAME = "jrpc"
@@ -35,6 +51,24 @@ YoloTask = Literal["detect", "segment"]
 MaskEncoding = Literal["rle"]
 MaskOrder = Literal["row_major"]
 TiledMaskOutput = Literal["tile", "full_image"]
+
+
+class YoloPolygon(BaseModel):
+    """One polygon ring in absolute source-image XY coordinates."""
+
+    points_xy: list[list[float]]
+    is_hole: bool = False
+    parent_index: int | None = None
+
+
+class YoloInstancePolygon(BaseModel):
+    """JSON-friendly polygon representation of one instance mask."""
+
+    format: Literal["polygon"] = "polygon"
+    size: list[int]
+    polygons: list[YoloPolygon]
+    area: int
+    threshold: float
 
 
 class YoloBaseModel(RpcModel):
@@ -79,16 +113,18 @@ class YoloSettings(YoloBaseModel):
 
     model_name: str = "yolov8n-seg.pt"
 
-    # Kept as ``imgz`` for compatibility with the original JSON-RPC contract.
-    # Ultralytics calls this parameter ``imgsz``.
-    imgz: int = Field(default=1280, gt=0)
+    imgsz: int = Field(default=1280, gt=0)
     confidence: float = Field(default=0.25, ge=0.0, le=1.0)
     iou: float = Field(default=0.45, ge=0.0, le=1.0)
     max_detections: int = Field(default=100, gt=0)
+    
     stride: int = Field(default=32, gt=0)
     tile_overlap: int = Field(default=128, ge=0)
+    tile_batch_size: int = Field(default=4, ge=0)
+
     half: bool = True
     include_masks: bool = True
+    mask_format: Literal["polygon", "rle"] = "polygon"
     mask_threshold: float = Field(default=0.5, ge=0.0, le=1.0)
     # In tiling mode, "full_image" writes every final mask on the original
     # image canvas: size=[image_height, image_width], origin_xy=[0, 0].
@@ -98,10 +134,9 @@ class YoloSettings(YoloBaseModel):
     # Intersection-over-smaller-box threshold used in addition to IoU.
     # This helps join two clipped halves of an object at a tile boundary.
     tile_merge_iom: float = Field(default=0.15, ge=0.0, le=1.0)
-
-    @property
-    def imgsz(self) -> int:
-        return self.imgz
+    
+    polygon_epsilon: float = 1.0
+    polygon_min_area: float = 1.0
 
 
 class YoloResult(StartYoloParams):
@@ -157,7 +192,7 @@ class YoloDetection(BaseModel):
     confidence: float
     bbox_xyxy: list[float] = Field(min_length=4, max_length=4)
     tile: YoloTile | None = None
-    mask: YoloInstanceMask | None = None
+    mask: YoloInstanceMask | YoloInstancePolygon | None = None
 
 
 class YoloDetectResult(BaseModel):
@@ -205,8 +240,9 @@ class YoloDetector:
       adding ``tile_batch_size`` to ``YoloSettings``; otherwise it defaults to 8.
     * Detection tensors are copied to CPU in bulk instead of synchronizing once
       for every scalar.
-    * Mask RLE creation uses vectorized run-boundary detection rather than a
-      Python loop over every pixel.
+    * Masks remain compact RLE internally for tiled merging, then default to
+      simplified polygon points in final JSON output. Set ``mask_format`` to
+      ``"rle"`` to preserve the previous external representation.
 
     This class assumes the same project-level dependencies and data models as
     the original class: ``YoloSettings``, ``StartYoloParams``,
@@ -247,6 +283,7 @@ class YoloDetector:
                 "iou": self.settings.iou,
                 "include_masks": self.settings.include_masks,
                 "tile_batch_size": self._tile_batch_size(),
+                "mask_format": self._mask_format(),
             },
         )
 
@@ -266,6 +303,16 @@ class YoloDetector:
                     "iou": settings.iou,
                     "max_detections": settings.max_detections,
                     "include_masks": settings.include_masks,
+                    "mask_format": str(
+                        getattr(settings, "mask_format", "polygon")
+                        or "polygon"
+                    ).lower(),
+                    "polygon_epsilon": float(
+                        getattr(settings, "polygon_epsilon", 1.0) or 0.0
+                    ),
+                    "polygon_min_area": float(
+                        getattr(settings, "polygon_min_area", 1.0) or 0.0
+                    ),
                     "tile_batch_size": max(
                         1,
                         int(getattr(settings, "tile_batch_size", 8) or 8),
@@ -449,6 +496,7 @@ class YoloDetector:
                 "cuda_device": params.cuda_device,
                 "model_name": self.settings.model_name,
                 "tile_batch_size": self._tile_batch_size(),
+                "mask_format": self._mask_format(),
             },
         )
 
@@ -530,7 +578,7 @@ class YoloDetector:
         # assert result is not None
         seconds_per_imag = elapsed/processed_count if processed_count else 0
         logger(
-            f"[{self.service_name}:{self.controller_name}:detect] inference request completed ({seconds_per_imag:.2f} sec/image)",
+            f"[{self.service_name}:{self.controller_name}:detect] inference request completed ({seconds_per_imag:.2f} sec/item)",
             extra={
                 "processed_count": processed_count,
                 "last_output_json_path": result.output_json_path,
@@ -734,6 +782,84 @@ class YoloDetector:
 
         return batch_results
 
+    def _mask_format(self) -> str:
+        """Return the configured external mask representation."""
+        mask_format = str(
+            getattr(self.settings, "mask_format", "polygon") or "polygon"
+        ).strip().lower()
+        if mask_format not in {"polygon", "rle"}:
+            raise ValueError(
+                "mask_format must be either 'polygon' or 'rle', got "
+                f"{mask_format!r}"
+            )
+        return mask_format
+
+    def _rle_to_polygon(
+        self,
+        mask: YoloInstanceMask,
+        *,
+        image_width: int,
+        image_height: int,
+    ) -> YoloInstancePolygon:
+        """Convert one internal RLE mask to absolute source-image polygons."""
+        binary_mask = self._rle_to_binary_mask(mask)
+        contours = binary_mask_to_polygon_contours(
+            binary_mask,
+            simplify_epsilon=float(
+                getattr(self.settings, "polygon_epsilon", 1.0) or 0.0
+            ),
+            minimum_area=float(
+                getattr(self.settings, "polygon_min_area", 1.0) or 0.0
+            ),
+        )
+        origin_x, origin_y = int(mask.origin_xy[0]), int(mask.origin_xy[1])
+
+        polygons = [
+            YoloPolygon(
+                points_xy=[
+                    [float(x + origin_x), float(y + origin_y)]
+                    for x, y in contour.points_xy
+                ],
+                is_hole=contour.is_hole,
+                parent_index=contour.parent_index,
+            )
+            for contour in contours
+        ]
+
+        return YoloInstancePolygon(
+            size=[int(image_height), int(image_width)],
+            polygons=polygons,
+            area=int(mask.area),
+            threshold=float(mask.threshold),
+        )
+
+    def _convert_detection_masks_for_output(
+        self,
+        detections: list[YoloDetection],
+        *,
+        image_width: int,
+        image_height: int,
+    ) -> list[YoloDetection]:
+        """Convert final masks to the configured external representation."""
+        if self._mask_format() == "rle":
+            return detections
+
+        converted: list[YoloDetection] = []
+        for detection in detections:
+            polygon_mask = (
+                self._rle_to_polygon(
+                    detection.mask,
+                    image_width=image_width,
+                    image_height=image_height,
+                )
+                if detection.mask is not None
+                else None
+            )
+            converted.append(
+                detection.model_copy(update={"mask": polygon_mask})
+            )
+        return converted
+
     def _detect_resized(
         self,
         image_path: Path,
@@ -745,6 +871,11 @@ class YoloDetector:
         height = int(image.shape[-2])
         width = int(image.shape[-1])
         detections = self._predict_batch([image], cuda_device)[0]
+        detections = self._convert_detection_masks_for_output(
+            detections,
+            image_width=width,
+            image_height=height,
+        )
 
         return {
             "task": "segment" if self._is_segment_model else "detect",
@@ -896,6 +1027,12 @@ class YoloDetector:
             # tile-local masks, keep the original fast NMS behavior.
             merged = self._nms(all_detections, self.settings.iou)
 
+        merged = self._convert_detection_masks_for_output(
+            merged,
+            image_width=width,
+            image_height=height,
+        )
+
         logger(
             f"[{self.service_name}:{self.controller_name}:detect:tiling] tiled inference completed",
             extra={
@@ -923,63 +1060,21 @@ class YoloDetector:
         image: Any,
         dtype: Any,
     ) -> tuple[Any, float, tuple[int, int]]:
-        """Letterbox a CHW uint8 tensor entirely with Torch operations.
-
-        Returns a normalized CHW floating-point tensor with a fixed square
-        spatial size, together with the scale and left/top padding needed for
-        restoring detection coordinates.
-        """
-
-        if image.ndim != 3:
-            raise ValueError(
-                f"Expected CHW image tensor, got shape {tuple(image.shape)}"
-            )
-
-        _, height, width = image.shape
-        height = int(height)
-        width = int(width)
-
-        img_size = self._make_divisible(
-            self.settings.imgsz,
-            self.settings.stride,
+        """Letterbox and normalize a CHW tensor using reusable utilities."""
+        return letterbox_tensor(
+            image,
+            image_size=self._make_divisible(
+                self.settings.imgsz,
+                self.settings.stride,
+            ),
+            dtype=dtype,
         )
-        gain = min(img_size / width, img_size / height)
 
-        resized_width = int(round(width * gain))
-        resized_height = int(round(height * gain))
-
-        pad_w = img_size - resized_width
-        pad_h = img_size - resized_height
-        pad_left = int(round(pad_w / 2 - 0.1))
-        pad_top = int(round(pad_h / 2 - 0.1))
-        pad_right = pad_w - pad_left
-        pad_bottom = pad_h - pad_top
-
-        tensor = image.to(dtype=dtype)
-        tensor.mul_(1.0 / 255.0)
-
-        if (resized_height, resized_width) != (height, width):
-            tensor = F.interpolate(
-                tensor.unsqueeze(0),
-                size=(resized_height, resized_width),
-                mode="bilinear",
-                align_corners=False,
-            ).squeeze(0)
-
-        if pad_w or pad_h:
-            tensor = F.pad(
-                tensor,
-                (pad_left, pad_right, pad_top, pad_bottom),
-                mode="constant",
-                value=114.0 / 255.0,
-            )
-
-        return tensor.contiguous(), gain, (pad_left, pad_top)
 
     @staticmethod
     def _make_divisible(value: int, divisor: int) -> int:
-        divisor = max(int(divisor), 1)
-        return int(math.ceil(int(value) / divisor) * divisor)
+        return make_divisible(value, divisor)
+
 
     @staticmethod
     def _tile_positions(
@@ -987,156 +1082,32 @@ class YoloDetector:
         tile_size: int,
         step: int,
     ) -> list[int]:
-        if length <= tile_size:
-            return [0]
+        return tile_positions(length, tile_size, step)
 
-        positions = list(
-            range(0, max(length - tile_size + 1, 1), step)
-        )
-        last = length - tile_size
-        if positions[-1] != last:
-            positions.append(last)
-        return positions
 
     def _unwrap_model_output(self, output: Any) -> tuple[Any, Any | None]:
-        """Return the inference prediction tensor and optional mask prototypes.
+        """Locate prediction and prototype tensors across Ultralytics layouts."""
+        return unwrap_yolo_model_output(
+            output,
+            target_mask_dim=int(self._mask_coeff_count or 0),
+        )
 
-        Ultralytics has used more than one segmentation return layout:
-
-        * older YOLOv8: ``(pred, (features, mask_coefficients, proto))``
-        * newer releases: ``((pred, proto), raw_predictions)``
-        * exported models: commonly ``(pred, proto)``
-
-        Detection models usually return ``(pred, raw_predictions)``.  The old
-        implementation assumed that ``output[0]`` was always a tensor, which is
-        not true for the newer segmentation layout.
-        """
-        if not isinstance(output, (tuple, list)):
-            return output, None
-
-        target_mask_dim = int(self._mask_coeff_count or 0)
-
-        def find_proto(value: Any) -> Any | None:
-            candidates: list[Any] = []
-            stack = [value]
-
-            while stack:
-                item = stack.pop()
-                if isinstance(item, dict):
-                    stack.extend(item.values())
-                    continue
-                if isinstance(item, (tuple, list)):
-                    stack.extend(item)
-                    continue
-
-                shape = getattr(item, "shape", None)
-                ndim = getattr(item, "ndim", None)
-                if shape is None or ndim != 4 or len(shape) != 4:
-                    continue
-
-                channels = int(shape[1])
-                if target_mask_dim and channels == target_mask_dim:
-                    candidates.append(item)
-                elif not target_mask_dim and channels <= 128:
-                    candidates.append(item)
-
-            if not candidates:
-                return None
-
-            # The prototype tensor is normally the largest HxW 4-D tensor with
-            # exactly ``nm`` channels.
-            return max(
-                candidates,
-                key=lambda item: int(item.shape[-2]) * int(item.shape[-1]),
-            )
-
-        first = output[0]
-        proto = None
-
-        # Newer segmentation layout: ((predictions, proto), raw_predictions)
-        if isinstance(first, (tuple, list)):
-            if not first:
-                raise RuntimeError("YOLO returned an empty primary output")
-            predictions = first[0]
-            if len(first) > 1:
-                proto = find_proto(first[1:])
-        else:
-            # Detection and older YOLOv8 segmentation layouts.
-            predictions = first
-
-        # Older segmentation layout and exported-model fallbacks.
-        if proto is None and len(output) > 1:
-            proto = find_proto(output[1:])
-        if proto is None:
-            proto = find_proto(output)
-
-        if getattr(predictions, "ndim", None) not in (2, 3):
-            raise RuntimeError(
-                "Unable to locate YOLO prediction tensor in model output; "
-                f"primary_type={type(first).__name__}, "
-                f"prediction_type={type(predictions).__name__}"
-            )
-
-        return predictions, proto
 
     @staticmethod
     def _split_prediction_batch(
         predictions: Any,
         expected_batch_size: int,
     ) -> list[Any]:
-        """Split raw predictions without guessing channel orientation."""
-        if getattr(predictions, "ndim", None) == 2:
-            if expected_batch_size != 1:
-                raise RuntimeError(
-                    "Model returned unbatched predictions for batch size "
-                    f"{expected_batch_size}: {tuple(predictions.shape)}"
-                )
-            return [predictions]
+        return split_prediction_batch(predictions, expected_batch_size)
 
-        if getattr(predictions, "ndim", None) != 3:
-            raise RuntimeError(
-                "Unexpected YOLO prediction shape: "
-                f"{tuple(getattr(predictions, 'shape', ())) }"
-            )
-
-        if int(predictions.shape[0]) != expected_batch_size:
-            raise RuntimeError(
-                "YOLO output batch mismatch: "
-                f"expected={expected_batch_size}, "
-                f"actual={int(predictions.shape[0])}, "
-                f"shape={tuple(predictions.shape)}"
-            )
-
-        return [predictions[index] for index in range(expected_batch_size)]
 
     @staticmethod
     def _split_proto_batch(
         proto: Any | None,
         expected_batch_size: int,
     ) -> list[Any | None]:
-        if proto is None:
-            return [None] * expected_batch_size
+        return split_proto_batch(proto, expected_batch_size)
 
-        if getattr(proto, "ndim", None) == 3:
-            if expected_batch_size != 1:
-                raise RuntimeError(
-                    "Model returned unbatched mask prototypes for batch size "
-                    f"{expected_batch_size}: {tuple(proto.shape)}"
-                )
-            return [proto]
-
-        if getattr(proto, "ndim", None) != 4:
-            return [None] * expected_batch_size
-
-        if int(proto.shape[0]) != expected_batch_size:
-            raise RuntimeError(
-                "YOLO prototype batch mismatch: "
-                f"expected={expected_batch_size}, "
-                f"actual={int(proto.shape[0])}, "
-                f"shape={tuple(proto.shape)}"
-            )
-
-        return [proto[index] for index in range(expected_batch_size)]
 
     def _decode_predictions(
         self,
@@ -1147,153 +1118,24 @@ class YoloDetector:
         pad: tuple[int, int],
         proto: Any | None = None,
     ) -> tuple[Any, Any, Any, Any | None]:
-
-        pred = predictions[0] if predictions.ndim == 3 else predictions
-
-        if pred.ndim != 2:
-            raise RuntimeError(
-                f"Unexpected YOLO output shape: {tuple(predictions.shape)}"
-            )
-
-        nc = int(self._nc or len(self._names) or 0)
-        proto_mask_dim = (
-            int(proto.shape[0])
-            if proto is not None and getattr(proto, "ndim", 0) == 3
-            else int(proto.shape[1])
-            if proto is not None and getattr(proto, "ndim", 0) == 4
-            else 0
+        """Adapt detector metadata to the reusable YOLO tensor decoder."""
+        return decode_yolo_predictions(
+            predictions=predictions,
+            class_count=self._nc,
+            class_name_count=len(self._names),
+            mask_coeff_count=self._mask_coeff_count,
+            proto=proto,
+            confidence_threshold=float(self.settings.confidence),
+            original_width=original_width,
+            original_height=original_height,
+            gain=gain,
+            pad=pad,
         )
-        mask_dim = int(self._mask_coeff_count or proto_mask_dim or 0)
 
-        possible_channels = {6}
-        if nc:
-            possible_channels.update({4 + nc, 5 + nc})
-            if mask_dim:
-                possible_channels.update(
-                    {
-                        4 + nc + mask_dim,
-                        5 + nc + mask_dim,
-                    }
-                )
 
-        channels_first_raw = (
-            pred.shape[0] in possible_channels
-            and pred.shape[1] not in possible_channels
-        )
-        unknown_names_channels_first = (
-            nc == 0
-            and pred.shape[0] < pred.shape[1]
-            and pred.shape[0] <= 512
-        )
-        if channels_first_raw or unknown_names_channels_first:
-            pred = pred.transpose(0, 1).contiguous()
 
-        channels = int(pred.shape[-1])
-        if channels < 6:
-            empty = torch.empty((0,), device=pred.device)
-            return (
-                torch.empty((0, 4), device=pred.device),
-                empty,
-                empty.long(),
-                None,
-            )
 
-        boxes: Any
-        scores: Any
-        class_ids: Any
-        mask_coefficients = None
 
-        if nc and mask_dim and channels == 4 + nc + mask_dim:
-            boxes = self._xywh_to_xyxy(pred[:, :4])
-            scores, class_ids = pred[:, 4 : 4 + nc].max(dim=1)
-            mask_coefficients = pred[
-                :, 4 + nc : 4 + nc + mask_dim
-            ]
-        elif nc and mask_dim and channels == 5 + nc + mask_dim:
-            boxes = self._xywh_to_xyxy(pred[:, :4])
-            class_scores, class_ids = pred[:, 5 : 5 + nc].max(dim=1)
-            scores = pred[:, 4] * class_scores
-            mask_coefficients = pred[
-                :, 5 + nc : 5 + nc + mask_dim
-            ]
-        elif nc and channels == 4 + nc:
-            boxes = self._xywh_to_xyxy(pred[:, :4])
-            scores, class_ids = pred[:, 4:].max(dim=1)
-        elif nc and channels == 5 + nc:
-            boxes = self._xywh_to_xyxy(pred[:, :4])
-            class_scores, class_ids = pred[:, 5:].max(dim=1)
-            scores = pred[:, 4] * class_scores
-        elif channels == 6:
-            boxes = pred[:, :4].clone()
-            scores = pred[:, 4]
-            class_ids = pred[:, 5].long()
-        elif mask_dim and channels > 4 + mask_dim:
-            inferred_nc = channels - 4 - mask_dim
-            boxes = self._xywh_to_xyxy(pred[:, :4])
-            scores, class_ids = pred[
-                :, 4 : 4 + inferred_nc
-            ].max(dim=1)
-            mask_coefficients = pred[
-                :, 4 + inferred_nc : 4 + inferred_nc + mask_dim
-            ]
-        else:
-            boxes = self._xywh_to_xyxy(pred[:, :4])
-            scores, class_ids = pred[:, 4:].max(dim=1)
-
-        keep = scores >= self.settings.confidence
-        boxes = boxes[keep]
-        scores = scores[keep]
-        class_ids = class_ids[keep].long()
-        if mask_coefficients is not None:
-            mask_coefficients = mask_coefficients[keep]
-
-        if boxes.numel() == 0:
-            return (
-                boxes.reshape(0, 4),
-                scores,
-                class_ids,
-                mask_coefficients,
-            )
-
-        boxes = self._scale_boxes_from_letterbox(
-            boxes,
-            original_width,
-            original_height,
-            gain,
-            pad,
-        )
-        return boxes, scores, class_ids, mask_coefficients
-
-    @staticmethod
-    def _xywh_to_xyxy(boxes: Any) -> Any:
-        converted = boxes.clone()
-        converted[:, 0] = boxes[:, 0] - boxes[:, 2] / 2
-        converted[:, 1] = boxes[:, 1] - boxes[:, 3] / 2
-        converted[:, 2] = boxes[:, 0] + boxes[:, 2] / 2
-        converted[:, 3] = boxes[:, 1] + boxes[:, 3] / 2
-        return converted
-
-    @staticmethod
-    def _scale_boxes_from_letterbox(
-        boxes: Any,
-        original_width: int,
-        original_height: int,
-        gain: float,
-        pad: tuple[int, int],
-    ) -> Any:
-        pad_left, pad_top = pad
-        boxes[:, [0, 2]] -= pad_left
-        boxes[:, [1, 3]] -= pad_top
-        boxes[:, :4] /= gain
-        boxes[:, [0, 2]] = boxes[:, [0, 2]].clamp(
-            0,
-            original_width,
-        )
-        boxes[:, [1, 3]] = boxes[:, [1, 3]].clamp(
-            0,
-            original_height,
-        )
-        return boxes
 
     def _process_instance_masks(
         self,
@@ -1307,153 +1149,54 @@ class YoloDetector:
         gain: float,
         pad: tuple[int, int],
     ) -> list[YoloInstanceMask | None]:
-        """Convert YOLO segmentation prototypes and coefficients to RLE."""
-
+        """Decode masks in ``utils.py`` and adapt them to project RLE models."""
         if mask_coefficients.numel() == 0:
             return []
 
-        if proto.ndim == 4:
-            proto = proto[0]
-        if proto.ndim != 3:
-            logger(
-                f"[{self.service_name}:{self.controller_name}:mask:decode] unexpected prototype shape",
-                level="warning",
-                extra={"proto_shape": tuple(proto.shape)},
+        try:
+            cpu_masks = decode_instance_masks(
+                proto=proto,
+                mask_coefficients=mask_coefficients,
+                boxes=boxes,
+                original_width=original_width,
+                original_height=original_height,
+                input_width=input_width,
+                input_height=input_height,
+                gain=gain,
+                pad=pad,
+                threshold=float(self.settings.mask_threshold),
             )
-            return [None] * int(mask_coefficients.shape[0])
-
-        proto = proto.float()
-        mask_coefficients = mask_coefficients.float()
-        mask_dim, proto_height, proto_width = proto.shape
-
-        if int(mask_coefficients.shape[1]) != int(mask_dim):
+        except ValueError as exc:
             logger(
-                f"[{self.service_name}:{self.controller_name}:mask:decode] mask coefficient mismatch",
+                f"[{self.service_name}:{self.controller_name}:mask:decode] mask decoding skipped",
                 level="warning",
                 extra={
                     "coefficient_shape": tuple(mask_coefficients.shape),
-                    "proto_shape": tuple(proto.shape),
+                    "proto_shape": tuple(getattr(proto, "shape", ())),
+                    "error": str(exc),
                 },
             )
             return [None] * int(mask_coefficients.shape[0])
 
-        masks = mask_coefficients @ proto.reshape(mask_dim, -1)
-        masks = masks.reshape(
-            -1,
-            proto_height,
-            proto_width,
-        ).sigmoid()
-
-        masks = F.interpolate(
-            masks[:, None],
-            size=(input_height, input_width),
-            mode="bilinear",
-            align_corners=False,
-        )[:, 0]
-
-        pad_left, pad_top = pad
-        resized_width = int(round(original_width * gain))
-        resized_height = int(round(original_height * gain))
-        crop_left = max(pad_left, 0)
-        crop_top = max(pad_top, 0)
-        crop_right = min(crop_left + resized_width, input_width)
-        crop_bottom = min(crop_top + resized_height, input_height)
-
-        if crop_right <= crop_left or crop_bottom <= crop_top:
-            return [None] * int(mask_coefficients.shape[0])
-
-        masks = masks[
-            :,
-            crop_top:crop_bottom,
-            crop_left:crop_right,
-        ]
-
-        if masks.shape[-2:] != (original_height, original_width):
-            masks = F.interpolate(
-                masks[:, None],
-                size=(original_height, original_width),
-                mode="bilinear",
-                align_corners=False,
-            )[:, 0]
-
-        binary_masks = masks >= self.settings.mask_threshold
-        binary_masks = self._crop_masks_to_boxes(binary_masks, boxes)
-
-        # Transfer the complete mask batch once.
-        cpu_masks = binary_masks.detach().to("cpu")
         return [self._binary_mask_to_rle(mask) for mask in cpu_masks]
 
-    @staticmethod
-    def _crop_masks_to_boxes(masks: Any, boxes: Any) -> Any:
-        """Zero out mask pixels outside each detection box."""
 
-        if masks.numel() == 0:
-            return masks
 
-        n, height, width = masks.shape
-        x = torch.arange(
-            width,
-            device=masks.device,
-        ).view(1, 1, width)
-        y = torch.arange(
-            height,
-            device=masks.device,
-        ).view(1, height, 1)
-
-        x1 = boxes[:, 0].floor().view(n, 1, 1)
-        y1 = boxes[:, 1].floor().view(n, 1, 1)
-        x2 = boxes[:, 2].ceil().view(n, 1, 1)
-        y2 = boxes[:, 3].ceil().view(n, 1, 1)
-
-        inside = (
-            (x >= x1)
-            & (x < x2)
-            & (y >= y1)
-            & (y < y2)
-        )
-        return masks & inside
 
     def _binary_mask_to_rle(self, mask: Any) -> YoloInstanceMask:
-        """Encode a boolean CPU mask as row-major uncompressed RLE."""
-
-        flat = mask.reshape(-1).to(dtype=torch.uint8)
-        pixel_count = int(flat.numel())
-
-        if pixel_count == 0:
-            counts = [0]
-            area = 0
-        else:
-            changes = torch.nonzero(
-                flat[1:] != flat[:-1],
-                as_tuple=False,
-            ).flatten() + 1
-
-            boundaries = torch.cat(
-                (
-                    torch.zeros(1, dtype=torch.long),
-                    changes.to(dtype=torch.long),
-                    torch.tensor([pixel_count], dtype=torch.long),
-                )
-            )
-            counts = (boundaries[1:] - boundaries[:-1]).tolist()
-
-            # Uncompressed COCO-style RLE starts with a zero run. If the first
-            # pixel is foreground, prepend an empty background run.
-            if int(flat[0].item()) == 1:
-                counts.insert(0, 0)
-
-            area = int(flat.sum().item())
-
+        """Adapt reusable row-major RLE primitives to ``YoloInstanceMask``."""
+        counts, area = binary_mask_to_uncompressed_rle(mask)
         height = int(mask.shape[0])
         width = int(mask.shape[1])
 
         return YoloInstanceMask(
             size=[height, width],
             origin_xy=[0, 0],
-            counts=[int(value) for value in counts],
+            counts=counts,
             area=area,
             threshold=float(self.settings.mask_threshold),
         )
+
 
     @staticmethod
     def _shift_mask_origin(
@@ -1469,26 +1212,8 @@ class YoloDetector:
 
     @staticmethod
     def _rle_to_binary_mask(mask: YoloInstanceMask) -> Any:
-        """Decode this service's row-major uncompressed RLE on CPU."""
-        height, width = (int(mask.size[0]), int(mask.size[1]))
-        pixel_count = height * width
-        counts = torch.as_tensor(mask.counts, dtype=torch.long)
+        return uncompressed_rle_to_binary_mask(mask.counts, mask.size)
 
-        if counts.numel() == 0:
-            return torch.zeros((height, width), dtype=torch.bool)
-        if bool((counts < 0).any()):
-            raise ValueError("RLE counts must be non-negative")
-        if int(counts.sum().item()) != pixel_count:
-            raise ValueError(
-                "RLE count total does not match mask size: "
-                f"sum={int(counts.sum().item())}, expected={pixel_count}"
-            )
-
-        # Runs alternate background/foreground and always begin with
-        # background. repeat_interleave avoids looping over every pixel.
-        values = torch.arange(counts.numel(), dtype=torch.long).remainder(2)
-        flat = torch.repeat_interleave(values, counts).to(torch.bool)
-        return flat.reshape(height, width)
 
     @classmethod
     def _paste_instance_mask(
@@ -1496,26 +1221,9 @@ class YoloDetector:
         canvas: Any,
         mask: YoloInstanceMask,
     ) -> None:
-        """OR a compact mask into its original-image position."""
         local = cls._rle_to_binary_mask(mask)
-        canvas_height, canvas_width = canvas.shape
-        origin_x, origin_y = (int(mask.origin_xy[0]), int(mask.origin_xy[1]))
-        mask_height, mask_width = local.shape
+        paste_binary_mask(canvas, local, origin_xy=mask.origin_xy)
 
-        dst_left = max(origin_x, 0)
-        dst_top = max(origin_y, 0)
-        dst_right = min(origin_x + mask_width, canvas_width)
-        dst_bottom = min(origin_y + mask_height, canvas_height)
-        if dst_right <= dst_left or dst_bottom <= dst_top:
-            return
-
-        src_left = dst_left - origin_x
-        src_top = dst_top - origin_y
-        src_right = src_left + (dst_right - dst_left)
-        src_bottom = src_top + (dst_bottom - dst_top)
-        canvas[dst_top:dst_bottom, dst_left:dst_right] |= local[
-            src_top:src_bottom, src_left:src_right
-        ]
 
     def _mask_to_full_image_rle(
         self,
@@ -1531,29 +1239,7 @@ class YoloDetector:
         self._paste_instance_mask(canvas, mask)
         return self._binary_mask_to_rle(canvas)
 
-    @staticmethod
-    def _box_iou_and_iom(
-        box: Any,
-        boxes: Any,
-    ) -> tuple[Any, Any]:
-        """Return IoU and intersection-over-smaller-area for one vs many."""
-        xx1 = torch.maximum(box[0], boxes[:, 0])
-        yy1 = torch.maximum(box[1], boxes[:, 1])
-        xx2 = torch.minimum(box[2], boxes[:, 2])
-        yy2 = torch.minimum(box[3], boxes[:, 3])
-        intersection = (xx2 - xx1).clamp(min=0) * (yy2 - yy1).clamp(min=0)
 
-        box_area = (box[2] - box[0]).clamp(min=0) * (
-            box[3] - box[1]
-        ).clamp(min=0)
-        boxes_area = (boxes[:, 2] - boxes[:, 0]).clamp(min=0) * (
-            boxes[:, 3] - boxes[:, 1]
-        ).clamp(min=0)
-        union = box_area + boxes_area - intersection
-        smaller = torch.minimum(box_area.expand_as(boxes_area), boxes_area)
-        iou = intersection / union.clamp(min=1e-7)
-        iom = intersection / smaller.clamp(min=1e-7)
-        return iou, iom
 
     def _merge_tiled_instances(
         self,
@@ -1563,194 +1249,9 @@ class YoloDetector:
         iou_threshold: float,
         iom_threshold: float,
     ) -> list[YoloDetection]:
-        """Merge duplicate tiled instances and emit full-image-coordinate masks.
-
-        Detections are clustered class-aware, beginning with the highest
-        confidence item. Normal IoU catches standard duplicates; IoM also
-        catches clipped halves whose overlap is only the tile-overlap strip.
-        Every cluster's masks are OR'ed on one original-image canvas.
-        """
+        """Merge tiled duplicates and OR their masks on full-image canvases."""
         if not detections:
             return []
-
-        boxes = torch.tensor(
-            [det.bbox_xyxy for det in detections], dtype=torch.float32
-        )
-        scores = torch.tensor(
-            [det.confidence for det in detections], dtype=torch.float32
-        )
-        class_ids = torch.tensor(
-            [det.class_id for det in detections], dtype=torch.long
-        )
-        remaining = scores.argsort(descending=True)
-        merged: list[YoloDetection] = []
-
-        while remaining.numel() > 0:
-            seed_index = int(remaining[0].item())
-            candidate_indices = remaining
-            candidate_boxes = boxes[candidate_indices]
-            iou, iom = self._box_iou_and_iom(
-                boxes[seed_index], candidate_boxes
-            )
-            same_class = (
-                class_ids[candidate_indices] == class_ids[seed_index]
-            )
-            belongs = same_class & (
-                (iou >= float(iou_threshold))
-                | (iom >= float(iom_threshold))
-            )
-            # The seed always belongs, including degenerate-box edge cases.
-            belongs[0] = True
-            cluster_indices = candidate_indices[belongs]
-            remaining = candidate_indices[~belongs]
-
-            representative = detections[seed_index]
-            canvas = torch.zeros(
-                (int(image_height), int(image_width)),
-                dtype=torch.bool,
-            )
-            cluster_boxes = []
-            mask_found = False
-
-            for index_tensor in cluster_indices:
-                index = int(index_tensor.item())
-                det = detections[index]
-                cluster_boxes.append(det.bbox_xyxy)
-                if det.mask is not None:
-                    self._paste_instance_mask(canvas, det.mask)
-                    mask_found = True
-
-            cluster_box_tensor = torch.tensor(
-                cluster_boxes, dtype=torch.float32
-            )
-            union_box = [
-                float(cluster_box_tensor[:, 0].min().clamp(0, image_width).item()),
-                float(cluster_box_tensor[:, 1].min().clamp(0, image_height).item()),
-                float(cluster_box_tensor[:, 2].max().clamp(0, image_width).item()),
-                float(cluster_box_tensor[:, 3].max().clamp(0, image_height).item()),
-            ]
-
-            full_mask = (
-                self._binary_mask_to_rle(canvas) if mask_found else None
-            )
-            merged.append(
-                representative.model_copy(
-                    update={
-                        "bbox_xyxy": union_box,
-                        "tile": None,
-                        "mask": full_mask,
-                    }
-                )
-            )
-
-        return merged
-
-    @staticmethod
-    def _torch_class_aware_nms(
-        boxes: Any,
-        scores: Any,
-        class_ids: Any,
-        iou_threshold: float,
-        max_detections: int,
-    ) -> Any:
-
-        if boxes.numel() == 0:
-            return torch.empty(
-                (0,),
-                dtype=torch.long,
-                device=boxes.device,
-            )
-
-        try:
-            from torchvision.ops import batched_nms
-
-            keep = batched_nms(
-                boxes,
-                scores,
-                class_ids,
-                iou_threshold,
-            )
-        except Exception:
-            keep_parts = []
-            for cls in class_ids.unique():
-                cls_indices = torch.where(class_ids == cls)[0]
-                cls_keep_local = YoloDetector._torch_nms_single_class(
-                    boxes[cls_indices],
-                    scores[cls_indices],
-                    iou_threshold,
-                )
-                keep_parts.append(cls_indices[cls_keep_local])
-
-            if not keep_parts:
-                return torch.empty(
-                    (0,),
-                    dtype=torch.long,
-                    device=boxes.device,
-                )
-
-            keep = torch.cat(keep_parts)
-            keep = keep[scores[keep].argsort(descending=True)]
-
-        return keep[:max_detections]
-
-    @staticmethod
-    def _torch_nms_single_class(
-        boxes: Any,
-        scores: Any,
-        iou_threshold: float,
-    ) -> Any:
-
-        if boxes.numel() == 0:
-            return torch.empty(
-                (0,),
-                dtype=torch.long,
-                device=boxes.device,
-            )
-
-        x1, y1, x2, y2 = boxes.unbind(dim=1)
-        areas = (
-            (x2 - x1).clamp(min=0)
-            * (y2 - y1).clamp(min=0)
-        )
-        order = scores.argsort(descending=True)
-        keep = []
-
-        while order.numel() > 0:
-            current = order[0]
-            keep.append(current)
-            if order.numel() == 1:
-                break
-
-            rest = order[1:]
-            xx1 = torch.maximum(x1[current], x1[rest])
-            yy1 = torch.maximum(y1[current], y1[rest])
-            xx2 = torch.minimum(x2[current], x2[rest])
-            yy2 = torch.minimum(y2[current], y2[rest])
-
-            inter_w = (xx2 - xx1).clamp(min=0)
-            inter_h = (yy2 - yy1).clamp(min=0)
-            intersection = inter_w * inter_h
-            union = areas[current] + areas[rest] - intersection
-            iou = intersection / union.clamp(min=1e-7)
-            order = rest[iou <= iou_threshold]
-
-        if keep:
-            return torch.stack(keep)
-        return torch.empty(
-            (0,),
-            dtype=torch.long,
-            device=boxes.device,
-        )
-
-    @staticmethod
-    def _nms(
-        detections: list[YoloDetection],
-        iou_threshold: float,
-    ) -> list[YoloDetection]:
-        """Class-aware NMS for detections merged across overlapping tiles."""
-        if not detections:
-            return []
-
 
         boxes = torch.tensor(
             [det.bbox_xyxy for det in detections],
@@ -1764,8 +1265,94 @@ class YoloDetector:
             [det.class_id for det in detections],
             dtype=torch.long,
         )
+        clusters = greedy_class_aware_clusters(
+            boxes,
+            scores,
+            class_ids,
+            iou_threshold=iou_threshold,
+            iom_threshold=iom_threshold,
+        )
 
-        keep = YoloDetector._torch_class_aware_nms(
+        merged: list[YoloDetection] = []
+        for cluster_indices in clusters:
+            representative = detections[cluster_indices[0]]
+            cluster_boxes = boxes[cluster_indices]
+            canvas = torch.zeros(
+                (int(image_height), int(image_width)),
+                dtype=torch.bool,
+            )
+            mask_found = False
+
+            for index in cluster_indices:
+                mask = detections[index].mask
+                if mask is not None:
+                    self._paste_instance_mask(canvas, mask)
+                    mask_found = True
+
+            union_box = [
+                float(cluster_boxes[:, 0].min().clamp(0, image_width).item()),
+                float(cluster_boxes[:, 1].min().clamp(0, image_height).item()),
+                float(cluster_boxes[:, 2].max().clamp(0, image_width).item()),
+                float(cluster_boxes[:, 3].max().clamp(0, image_height).item()),
+            ]
+            merged.append(
+                representative.model_copy(
+                    update={
+                        "bbox_xyxy": union_box,
+                        "tile": None,
+                        "mask": (
+                            self._binary_mask_to_rle(canvas)
+                            if mask_found
+                            else None
+                        ),
+                    }
+                )
+            )
+
+        return merged
+
+
+    @staticmethod
+    def _torch_class_aware_nms(
+        boxes: Any,
+        scores: Any,
+        class_ids: Any,
+        iou_threshold: float,
+        max_detections: int,
+    ) -> Any:
+        return torch_class_aware_nms(
+            boxes,
+            scores,
+            class_ids,
+            iou_threshold,
+            max_detections,
+        )
+
+
+
+
+    @staticmethod
+    def _nms(
+        detections: list[YoloDetection],
+        iou_threshold: float,
+    ) -> list[YoloDetection]:
+        """Class-aware NMS for detections merged across overlapping tiles."""
+        if not detections:
+            return []
+
+        boxes = torch.tensor(
+            [det.bbox_xyxy for det in detections],
+            dtype=torch.float32,
+        )
+        scores = torch.tensor(
+            [det.confidence for det in detections],
+            dtype=torch.float32,
+        )
+        class_ids = torch.tensor(
+            [det.class_id for det in detections],
+            dtype=torch.long,
+        )
+        keep = torch_class_aware_nms(
             boxes,
             scores,
             class_ids,
@@ -1773,6 +1360,7 @@ class YoloDetector:
             max_detections=len(detections),
         )
         return [detections[index] for index in keep.tolist()]
+
 
 
 class YoloRunner:

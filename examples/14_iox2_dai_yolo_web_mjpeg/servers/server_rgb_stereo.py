@@ -527,14 +527,14 @@ class CameraWorker:
                 last_frame_id=self.frame_id or None,
             )
             gen = build_dai_generator(config)
-            emit_status(
-                self.status_queue,
-                "running",
-                camera_restart_count=self.camera_restart_count,
-                last_frame_id=self.frame_id or None,
-                encoded_topic=config.encoded_topic,
-                encoded_payload_format=BUNDLE_FORMAT,
-            )
+            # emit_status(
+            #     self.status_queue,
+            #     "running",
+            #     camera_restart_count=self.camera_restart_count,
+            #     last_frame_id=self.frame_id or None,
+            #     encoded_topic=config.encoded_topic,
+            #     encoded_payload_format=BUNDLE_FORMAT,
+            # )
 
             for frame in gen:
                 if self.stop_event.is_set():
@@ -718,6 +718,9 @@ class CameraController:
                     f"Worker sent invalid calibration payload type: {type(calibration).__name__}"
                 )
 
+        if self._last_worker_state == "running":
+            self.opened = True
+
         self._camera_restart_count = int_or_keep(
             self._camera_restart_count,
             msg.get("camera_restart_count"),
@@ -770,7 +773,6 @@ class CameraController:
             daemon=False,
         )
         self._process.start()
-        self.opened = True
         self._last_worker_state = "process_started"
         self._ensure_watchdog_unlocked()
 
@@ -893,7 +895,6 @@ class CameraController:
         with self._state_lock:
             try:
                 if self._is_worker_alive() and config == self.config:
-                    self.opened = True
                     return self._status_unlocked()
                 if self._process is not None:
                     self._stop_worker_unlocked()

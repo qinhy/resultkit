@@ -1,8 +1,15 @@
 from datetime import datetime
+from typing import Any, Optional
 
-def logger(msg, level="info"):
+def logger(msg,
+            level: str = "info",
+            extra: Optional[dict[str, Any]] = None,):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"{timestamp} [{level.upper()}] {msg}")
+    if extra is None:
+        print(f"{timestamp} [{level.upper()}] {msg} ({extra})")
+    else:
+        print(f"{timestamp} [{level.upper()}] {msg}")
+
 
 try:
 
@@ -14,7 +21,6 @@ try:
     import threading
     import time
     import traceback
-    from typing import Any, Optional
 
     import redis
 
