@@ -11,7 +11,7 @@ store = CustomStore("recording")
 record = store.add_record(
     mode="rgb_stereo",
     timestamp_ns_utc=TIMESTAMP_NS,
-    field_id="field_01",
+    field_id="field_all",
     sequence=1,
     exist_ok=True,
 )
@@ -134,5 +134,5 @@ issues = record.close(validate=True)
 print(f"Record path: {record.path}")
 print("Validation issues:", issues)
 print("All records:")
-for path in store.list_records(mode="rgb_stereo", date="2026-07-08", field_id="field_01"):
+for path in store.list_records(mode="rgb_stereo", date="2026-07-08", field_id="field_all"):
     print(" -", path)

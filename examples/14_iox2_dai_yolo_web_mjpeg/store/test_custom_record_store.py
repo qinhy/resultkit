@@ -22,7 +22,7 @@ class CustomRecordStoreTests(unittest.TestCase):
         root = Path(tempfile.mkdtemp()) / "recording"
         ts = 1783521310000000000
         store = CustomStore(root)
-        record = store.add_record("rgb_stereo", ts, "field_01")
+        record = store.add_record("rgb_stereo", ts, "field_all")
 
         img = Image.new("RGB", (2, 2))
         disp = Image.new("I;16", (2, 2))

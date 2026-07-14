@@ -3,7 +3,7 @@
 
 Public RPC API uses stream lists only:
     watch({"stream_ids": ["left", "right"]})
-    capture({"stream_ids": ["left", "right"], "field_id": "field_01"})
+    capture({"stream_ids": ["left", "right"], "field_id": "field_all"})
 
 For one camera, still pass a list:
     capture({"stream_ids": ["left"]})
@@ -91,7 +91,7 @@ class StreamsParams(StoreModel):
 
 
 class CaptureParams(StreamsParams):
-    field_id: str = "field_01"
+    field_id: str = "field_all"
     gis: Any | None = None
     capture_timeout_s: float | None = None
     fresh_frame: bool = True
@@ -426,7 +426,7 @@ class StoreController:
         return {
             **openapi_doc("store_status", id=1, params={}),
             **openapi_doc("store_watch", id=2, params={"stream_ids": STREAM_IDS}),
-            **openapi_doc("store_capture", id=3, params={"stream_ids": STREAM_IDS, "field_id": "field_01", "gis": None}),
+            **openapi_doc("store_capture", id=3, params={"stream_ids": STREAM_IDS, "field_id": "field_all", "gis": None}),
         }
 
     def _check(self, stream_ids: list[str]) -> list[str]:
@@ -566,7 +566,7 @@ class StoreController:
 
     def capture(self, params: CaptureParams) -> CaptureResult:
         with self._lock:
-            field_id = str(params.field_id or "field_01")
+            field_id = str(params.field_id or "field_all")
             logger(f"[{args.service_name}:{args.controller_name}:capture] capture requested",
                 extra={
                     "stream_ids": getattr(params, "stream_ids", []),

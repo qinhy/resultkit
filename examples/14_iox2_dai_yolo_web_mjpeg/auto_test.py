@@ -56,7 +56,7 @@ def store_capture(sts=[
     params = {
         "service": "jrpc",
         "stream_ids": sts,
-        "field_id": "field_01",
+        "field_id": "field_all",
         "gis": None,
         "capture_timeout_s": None,
         "fresh_frame": True,
@@ -177,6 +177,8 @@ def main() -> None:
 if __name__ == "__main__":
     # main()
     # set_sgbm_pcd()
-    set_dnn_pcd()
-    store_capture(to_yolo=True,to_pcd=True)
+    # set_dnn_pcd()
+    for i in range(100):
+        store_capture(to_yolo=True,to_pcd=False)
+        time.sleep(0.1)
     pass

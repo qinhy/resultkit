@@ -111,7 +111,7 @@ class StartYoloParams(YoloBaseModel):
 class YoloSettings(YoloBaseModel):
     """Runtime settings for model inference and detection serialization."""
 
-    model_name: str = "yolov8n-seg.pt"
+    model_name: str = "yolov8x-seg.pt"
 
     imgsz: int = Field(default=1280, gt=0)
     confidence: float = Field(default=0.25, ge=0.0, le=1.0)
@@ -119,7 +119,7 @@ class YoloSettings(YoloBaseModel):
     max_detections: int = Field(default=100, gt=0)
     
     stride: int = Field(default=32, gt=0)
-    tile_overlap: int = Field(default=128, ge=0)
+    tile_overlap: int = Field(default=256, ge=0)
     tile_batch_size: int = Field(default=4, ge=0)
 
     half: bool = True

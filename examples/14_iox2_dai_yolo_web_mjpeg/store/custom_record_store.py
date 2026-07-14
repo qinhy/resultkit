@@ -1006,7 +1006,7 @@ class CustomStore:
         self,
         mode: RecordMode,
         timestamp_ns_utc: int,
-        field_id: str = "field_01",
+        field_id: str = "field_all",
         sequence: int = 1,
         exist_ok: bool = False,
     ) -> CustomRecord:
