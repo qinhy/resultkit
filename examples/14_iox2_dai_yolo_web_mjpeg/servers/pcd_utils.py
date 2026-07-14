@@ -452,7 +452,57 @@ def save_ply_ascii(path: str | Path, points_m, colors_rgb):
     return path
 
 
-def save_point_cloud(path: str | Path, points_m, colors_rgb, *, binary_pcd=True):
+# def save_point_cloud(path: str | Path, points_m, colors_rgb, *, binary_pcd=True):
+#     suffix = Path(path).suffix.lower()
+#     if suffix == ".pcd": return save_pcd(path, points_m, colors_rgb, binary=binary_pcd)
+#     if suffix == ".ply": return save_ply_ascii(path, points_m, colors_rgb)
+#     raise ValueError("Use .pcd or .ply")
+
+
+def save_point_cloud(
+    path: str | Path,
+    points_m,
+    colors_rgb,
+    *,
+    binary_pcd: bool = True,
+    prepend_center_of_gravity: bool = False,
+    center_color_rgb=None,
+):
+    points = np.asarray(points_m)
+    colors = np.asarray(colors_rgb)
+
+    if points.ndim != 2 or points.shape[1] != 3:
+        raise ValueError("points_m must have shape (N, 3)")
+
+    if colors.ndim != 2 or colors.shape[1] != 3:
+        raise ValueError("colors_rgb must have shape (N, 3)")
+
+    if len(points) != len(colors):
+        raise ValueError("points_m and colors_rgb must have the same length")
+
+    if prepend_center_of_gravity:
+        if len(points) == 0:
+            raise ValueError(
+                "Cannot calculate the center of gravity of an empty point cloud"
+            )
+
+        # Equal-weight center of gravity / centroid.
+        center = points.mean(axis=0, keepdims=True)
+
+        if center_color_rgb is None:
+            # Use the average point-cloud color.
+            center_color = colors.mean(axis=0, keepdims=True).astype(
+                colors.dtype
+            )
+        else:
+            center_color = np.asarray(
+                center_color_rgb, dtype=colors.dtype
+            ).reshape(1, 3)
+
+        # Insert the center point before all original points.
+        points = np.concatenate((center, points), axis=0)
+        colors = np.concatenate((center_color, colors), axis=0)
+
     suffix = Path(path).suffix.lower()
     if suffix == ".pcd": return save_pcd(path, points_m, colors_rgb, binary=binary_pcd)
     if suffix == ".ply": return save_ply_ascii(path, points_m, colors_rgb)
