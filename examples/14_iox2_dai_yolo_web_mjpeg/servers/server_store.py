@@ -97,7 +97,7 @@ class CaptureParams(StreamsParams):
     fresh_frame: bool = True
     # hook_urls:list[list[str]] = [[]]
     hook_urls:list[list[str]] = [
-            ["http://localhost:8000/controllers/yolo/start"
+            ["http://localhost:8000/controllers/yolo/start",
              "http://localhost:8000/controllers/pcd/to_pcd"
             ],
     ]

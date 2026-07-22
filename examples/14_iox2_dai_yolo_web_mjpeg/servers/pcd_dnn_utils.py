@@ -221,6 +221,30 @@ def compute_disparity_fast_foundationstereo(left_rectified: np.ndarray, right_re
                              model_scale=model_scale, remove_invisible=remove_invisible)
 
 
+def stereo_to_point_cloud(left_image: np.ndarray, right_image: np.ndarray,
+                                          calibration: StereoRgbCalibration | None = None,  # noqa: F405
+                                          disparity_predictor: FastFoundationStereoDisparity | None = None,
+                                          *,
+                                          repo_dir: str | Path | None = None, model_path: str | Path | None = None,
+                                          model_dir: str | Path | None = None, device: DeviceLike = "cuda",
+                                          valid_iters: int = 8, max_disp: int = 192, hiera: bool = False,
+                                          model_scale: float = 1.0, stereo_input_color_order: ColorOrder = "RGB",
+                                          alpha: float = 0.0,
+                                          min_disparity: float = 0.5, max_depth_m: float | None = 10.0,
+                                          stride: int = 1, remove_invisible: bool = True):
+    
+    rectifier = calibration.get_rectifier(alpha)
+    left, right, rect = rectifier.rectify(left_image, right_image)
+    predictor = disparity_predictor or FastFoundationStereoDisparity(
+        repo_dir, model_path, model_dir, device, valid_iters, max_disp, hiera
+    )
+    disparity = predictor.predict(left, right, input_color_order=stereo_input_color_order,
+                                            model_scale=model_scale, remove_invisible=remove_invisible)
+    points, _ = rect.disparity_to_points_rectified(disparity,
+                                              min_disparity=max(0.5, float(min_disparity)),
+                                              max_depth_m=max_depth_m, stride=stride)
+    return disparity, rect, points
+
 def stereo_rgb_to_colored_point_cloud_dnn(left_image: np.ndarray, right_image: np.ndarray, rgb_image: np.ndarray, *,
                                           calibration: StereoRgbCalibration | None = None,  # noqa: F405
                                           disparity_predictor: FastFoundationStereoDisparity | None = None,
@@ -235,15 +259,25 @@ def stereo_rgb_to_colored_point_cloud_dnn(left_image: np.ndarray, right_image: n
                                           save_binary_pcd: bool = True, remove_invisible: bool = True) -> ColoredPointCloud:  # noqa: F405
     """Full DNN pipeline: raw stereo+RGB -> colored point cloud, optionally saved as PCD/PLY."""
     calibration = calibration or StereoRgbCalibration.default()  # noqa: F405
-    left, right, rect = rectify_stereo_pair(left_image, right_image, calibration, alpha=alpha)  # noqa: F405
-    disparity_predictor = disparity_predictor or FastFoundationStereoDisparity(
-        repo_dir, model_path, model_dir, device, valid_iters, max_disp, hiera
-    )
-    disparity = disparity_predictor.predict(left, right, input_color_order=stereo_input_color_order,
-                                            model_scale=model_scale, remove_invisible=remove_invisible)
-    points_rect, _ = disparity_to_points_rectified(disparity, rect, min_disparity=float(min_disparity),  # noqa: F405
-                                                   max_depth_m=max_depth_m, stride=stride)
-    points, colors = colorize_points_from_rgb(points_rect, rgb_image, calibration, rectification=rect,  # noqa: F405
+    disparity, rect, points = stereo_to_point_cloud(left_image,right_image,
+                                                    calibration=calibration,
+                                                    disparity_predictor=disparity_predictor,
+                                                    repo_dir=repo_dir,
+                                                    model_path=model_path,
+                                                    model_dir=model_dir,
+                                                    device=device,
+                                                    valid_iters=valid_iters,
+                                                    max_disp=max_disp,
+                                                    hiera=hiera,
+                                                    model_scale=model_scale,
+                                                    stereo_input_color_order=stereo_input_color_order,
+                                                    alpha=alpha,
+                                                    min_disparity=min_disparity,
+                                                    max_depth_m=max_depth_m,
+                                                    stride=stride,
+                                                    remove_invisible=remove_invisible,)
+    
+    points, colors = colorize_points_from_rgb(points, rgb_image, calibration, rectification=rect,  # noqa: F405
                                               points_frame="left_rectified", output_frame=output_frame,
                                               input_color_order=input_color_order,
                                               rgb_image_is_undistorted=rgb_image_is_undistorted)
@@ -265,16 +299,16 @@ def stereo_rgb_to_colored_point_cloud_rgb_res_dnn(left_image: np.ndarray, right_
                                                   splat_px: int = 1, output_frame: Literal["left", "rgb"] = "left",
                                                   save_binary_pcd: bool = True, remove_invisible: bool = True) -> ColoredPointCloud:  # noqa: F405
     """DNN sibling of stereo_rgb_to_colored_point_cloud_rgb_res(): output at RGB-image pixel density."""
-    calibration = calibration or StereoRgbCalibration.default()  # noqa: F405
-    left, right, rect = rectify_stereo_pair(left_image, right_image, calibration, alpha=alpha)  # noqa: F405
-    disparity_predictor = disparity_predictor or FastFoundationStereoDisparity(
-        repo_dir, model_path, model_dir, device, valid_iters, max_disp, hiera
-    )
-    disparity = disparity_predictor.predict(left, right, input_color_order=stereo_input_color_order,
-                                            model_scale=model_scale, remove_invisible=remove_invisible)
-    points_rect, _ = disparity_to_points_rectified(disparity, rect, min_disparity=float(min_disparity),  # noqa: F405
-                                                   max_depth_m=max_depth_m, stride=1)
-    points_left = rectified_left_to_original_left(points_rect, rect)  # noqa: F405
+    calibration = calibration or StereoRgbCalibration.default()
+    disparity, rect, points = stereo_to_point_cloud(left_image,right_image,
+                                                    calibration, repo_dir,model_path,
+                                                    model_dir,device,
+                                                    valid_iters,max_disp,hiera,
+                                                    model_scale,stereo_input_color_order,
+                                                    alpha,min_disparity,max_depth_m,
+                                                    1,remove_invisible)
+    
+    points_left = rectified_left_to_original_left(points, rect)  # noqa: F405
     depth_rgb, _ = points_left_to_rgb_depth(points_left, rgb_image, calibration,  # noqa: F405
                                             rgb_image_is_undistorted=rgb_image_is_undistorted,
                                             splat_px=splat_px)
@@ -335,4 +369,31 @@ if __name__ == "__main__":
     #     left, right, rgb, disparity_predictor=predictor, output_path="rgb_res_cloud.pcd",
     #     input_color_order="BGR", model_scale=0.5, splat_px=1, output_frame="left", max_depth_m=2.0,
     # )
+    
+    root = "recording/rgb_stereo/2026-07-22/field_all/111737.603022000JST/"
+    left = read_image(root+"imgs/rgbd_left/left.jpg", color=False)
+    right = read_image(root+"imgs/rgbd_left/right.jpg", color=False)
+    rgb = read_image(root+"imgs/rgbd_left/rgb.jpg", color=True)  # cv2 gives BGR
+    with open(root+"calib/rgbd_left.json") as f:
+        import json
+        calibration = StereoRgbCalibration.from_dict(json.load(f))
+    
+    predictor = FastFoundationStereoDisparity(
+        repo_dir="./examples/14_iox2_dai_yolo_web_mjpeg/fast-foundationstereo",
+        model_path="weights/23-36-37/model_best_bp2_serialize.pth",
+        valid_iters=8,
+        max_disp=192,
+    )
+
+    cloud = stereo_rgb_to_colored_point_cloud_dnn(
+        left,
+        right,
+        rgb,
+        calibration=calibration,
+        disparity_predictor=predictor,
+        output_path="colored_cloud_dnn.pcd",
+        input_color_order="BGR",
+        max_depth_m=5.0,
+        stride=1,
+    )    
     pass

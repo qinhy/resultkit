@@ -16,6 +16,12 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+import ast
+import colorsys
+import json
+from pathlib import Path
+from typing import Any, Mapping
+from PIL import Image, ImageDraw, ImageFont
 
 @dataclass(frozen=True, slots=True)
 class PolygonContour:
@@ -755,3 +761,362 @@ def greedy_class_aware_clusters(
         remaining = candidate_indices[~belongs]
 
     return clusters
+
+
+def show_yolo_results_pil(
+    results: str | Path | Mapping[str, Any],
+    *,
+    confidence_threshold: float = 0.25,
+    draw_boxes: bool = True,
+    draw_masks: bool = True,
+    draw_labels: bool = True,
+    mask_alpha: int = 90,
+    box_width: int = 4,
+    font_path: str | Path | None = None,
+    font_size: int = 24,
+    output_path: str | Path | None = None,
+    show: bool = True,
+) -> Image.Image:
+    """
+    Draw YOLO detection and segmentation results using Pillow.
+
+    Expected detection format:
+        {
+            "detections": [
+                {
+                    "class_id": 39,
+                    "class_name": "bottle",
+                    "confidence": 0.95,
+                    "bbox_xyxy": [x1, y1, x2, y2],
+                    "mask": {
+                        "format": "polygon",
+                        "polygons": [
+                            {
+                                "points_xy": [[x, y], ...],
+                                "is_hole": False
+                            }
+                        ]
+                    }
+                }
+            ]
+        }
+
+    Args:
+        image:
+            Input image path or PIL image.
+
+        results:
+            YOLO result dictionary or path to a JSON/text file.
+
+        confidence_threshold:
+            Ignore detections below this confidence.
+
+        mask_alpha:
+            Segmentation opacity from 0 to 255.
+
+        output_path:
+            Optional path for saving the annotated image.
+
+        show:
+            Open the result with PIL.Image.show().
+
+    Returns:
+        Annotated RGB PIL image.
+    """
+    base_image = _load_image(results['input_jpg_path'])
+    result_data = _load_results(results)
+
+    # RGBA is needed for transparent segmentation overlays.
+    annotated = base_image.convert("RGBA")
+    image_width, image_height = annotated.size
+    font = _load_font(font_path, font_size)
+
+    detections = result_data.get("detections", [])
+
+    # Draw lower-confidence detections first, so stronger detections remain visible.
+    detections = sorted(
+        detections,
+        key=lambda item: float(item.get("confidence", 0.0)),
+    )
+
+    for detection in detections:
+        confidence = float(detection.get("confidence", 0.0))
+        if confidence < confidence_threshold:
+            continue
+
+        class_id = int(detection.get("class_id", 0))
+        class_name = str(detection.get("class_name", class_id))
+        color = _class_color(class_id)
+
+        if draw_masks:
+            _draw_detection_mask(
+                annotated,
+                detection,
+                color=color,
+                alpha=mask_alpha,
+                image_size=(image_width, image_height),
+            )
+
+        draw = ImageDraw.Draw(annotated)
+
+        bbox = detection.get("bbox_xyxy")
+        if draw_boxes and bbox and len(bbox) == 4:
+            x1, y1, x2, y2 = _clamp_bbox(
+                bbox,
+                image_width=image_width,
+                image_height=image_height,
+            )
+
+            draw.rectangle(
+                (x1, y1, x2, y2),
+                outline=(*color, 255),
+                width=box_width,
+            )
+
+            if draw_labels:
+                label = f"{class_name} {confidence:.2f}"
+                _draw_label(
+                    draw,
+                    position=(x1, y1),
+                    text=label,
+                    font=font,
+                    color=color,
+                    image_size=(image_width, image_height),
+                )
+
+    output = annotated.convert("RGB")
+
+    if output_path is not None:
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output.save(output_path)
+
+    if show:
+        output.show()
+
+    return output
+
+
+def _load_image(image: str | Path | Image.Image) -> Image.Image:
+    if isinstance(image, Image.Image):
+        return image.copy().convert("RGB")
+
+    image_path = Path(image)
+    if not image_path.is_file():
+        raise FileNotFoundError(f"Image not found: {image_path}")
+
+    with Image.open(image_path) as opened_image:
+        return opened_image.convert("RGB")
+
+
+def _load_results(
+    results: str | Path | Mapping[str, Any],
+) -> dict[str, Any]:
+    if isinstance(results, Mapping):
+        return dict(results)
+
+    results_path = Path(results)
+    if not results_path.is_file():
+        raise FileNotFoundError(f"Results file not found: {results_path}")
+
+    text = results_path.read_text(encoding="utf-8")
+
+    try:
+        # Normal JSON files.
+        loaded = json.loads(text)
+    except json.JSONDecodeError:
+        # Also accepts a pasted Python dictionary using single quotes.
+        loaded = ast.literal_eval(text)
+
+    if not isinstance(loaded, dict):
+        raise ValueError("The YOLO results must contain a dictionary/object.")
+
+    return loaded
+
+
+def _draw_detection_mask(
+    image: Image.Image,
+    detection: Mapping[str, Any],
+    *,
+    color: tuple[int, int, int],
+    alpha: int,
+    image_size: tuple[int, int],
+) -> None:
+    mask_data = detection.get("mask")
+    if not isinstance(mask_data, Mapping):
+        return
+
+    if mask_data.get("format") != "polygon":
+        return
+
+    polygons = mask_data.get("polygons", [])
+    if not polygons:
+        return
+
+    width, height = image_size
+
+    # One grayscale mask per detection.
+    instance_mask = Image.new("L", (width, height), 0)
+    mask_draw = ImageDraw.Draw(instance_mask)
+
+    # Draw regular polygons first.
+    for polygon in polygons:
+        if polygon.get("is_hole", False):
+            continue
+
+        points = _prepare_polygon_points(
+            polygon.get("points_xy", []),
+            width=width,
+            height=height,
+        )
+
+        if len(points) >= 3:
+            mask_draw.polygon(points, fill=255)
+
+    # Remove hole polygons after the outer polygons have been filled.
+    for polygon in polygons:
+        if not polygon.get("is_hole", False):
+            continue
+
+        points = _prepare_polygon_points(
+            polygon.get("points_xy", []),
+            width=width,
+            height=height,
+        )
+
+        if len(points) >= 3:
+            mask_draw.polygon(points, fill=0)
+
+    # Apply the requested opacity to the binary mask.
+    alpha = max(0, min(255, int(alpha)))
+    instance_mask = instance_mask.point(
+        lambda value: alpha if value > 0 else 0
+    )
+
+    overlay = Image.new("RGBA", image.size, (*color, 0))
+    overlay.putalpha(instance_mask)
+    image.alpha_composite(overlay)
+
+
+def _prepare_polygon_points(
+    points: list[list[float]],
+    *,
+    width: int,
+    height: int,
+) -> list[tuple[int, int]]:
+    prepared: list[tuple[int, int]] = []
+
+    for point in points:
+        if len(point) < 2:
+            continue
+
+        x = max(0, min(width - 1, round(float(point[0]))))
+        y = max(0, min(height - 1, round(float(point[1]))))
+        prepared.append((x, y))
+
+    return prepared
+
+
+def _clamp_bbox(
+    bbox: list[float],
+    *,
+    image_width: int,
+    image_height: int,
+) -> tuple[int, int, int, int]:
+    x1, y1, x2, y2 = map(float, bbox)
+
+    x1 = max(0, min(image_width - 1, round(x1)))
+    y1 = max(0, min(image_height - 1, round(y1)))
+    x2 = max(0, min(image_width - 1, round(x2)))
+    y2 = max(0, min(image_height - 1, round(y2)))
+
+    # Protect against incorrectly ordered coordinates.
+    if x2 < x1:
+        x1, x2 = x2, x1
+    if y2 < y1:
+        y1, y2 = y2, y1
+
+    return x1, y1, x2, y2
+
+
+def _draw_label(
+    draw: ImageDraw.ImageDraw,
+    *,
+    position: tuple[int, int],
+    text: str,
+    font: ImageFont.ImageFont,
+    color: tuple[int, int, int],
+    image_size: tuple[int, int],
+) -> None:
+    x, y = position
+    image_width, image_height = image_size
+    padding = 4
+
+    text_box = draw.textbbox((0, 0), text, font=font)
+    text_width = text_box[2] - text_box[0]
+    text_height = text_box[3] - text_box[1]
+
+    label_width = text_width + padding * 2
+    label_height = text_height + padding * 2
+
+    # Prefer drawing above the box. Move below it when near the top edge.
+    label_y = y - label_height
+    if label_y < 0:
+        label_y = y
+
+    label_x = min(x, max(0, image_width - label_width))
+    label_y = min(label_y, max(0, image_height - label_height))
+
+    draw.rectangle(
+        (
+            label_x,
+            label_y,
+            label_x + label_width,
+            label_y + label_height,
+        ),
+        fill=(*color, 230),
+    )
+
+    # Choose black or white text based on the background brightness.
+    brightness = (
+        0.299 * color[0]
+        + 0.587 * color[1]
+        + 0.114 * color[2]
+    )
+    text_color = (0, 0, 0, 255) if brightness > 150 else (255, 255, 255, 255)
+
+    draw.text(
+        (label_x + padding, label_y + padding),
+        text,
+        fill=text_color,
+        font=font,
+    )
+
+
+def _load_font(
+    font_path: str | Path | None,
+    font_size: int,
+) -> ImageFont.ImageFont:
+    if font_path is not None:
+        return ImageFont.truetype(str(font_path), font_size)
+
+    # DejaVu Sans is commonly included with Pillow/Linux installations.
+    try:
+        return ImageFont.truetype("DejaVuSans.ttf", font_size)
+    except OSError:
+        return ImageFont.load_default()
+
+
+def _class_color(class_id: int) -> tuple[int, int, int]:
+    """
+    Produce a stable, visually distinct color from a class ID.
+    """
+    hue = (class_id * 0.618033988749895) % 1.0
+    red, green, blue = colorsys.hsv_to_rgb(hue, 0.75, 1.0)
+
+    return (
+        round(red * 255),
+        round(green * 255),
+        round(blue * 255),
+    )
+

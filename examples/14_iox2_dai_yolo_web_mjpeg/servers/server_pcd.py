@@ -18,6 +18,7 @@ from common import HookDispatcher
 from iox2_jsonrpc import EmptyParams, RpcModel
 from store.custom_record_store import CustomRecord
 from server_yolo import YoloDetectResult
+from pcd_yolo_utils import split_cloud
 from resultkit.logger import logger
 
 LOG_SERVICE = "jrpc"
@@ -35,14 +36,13 @@ for path in (
 
 from pcd_utils import (  # noqa: E402
     DEFAULT_CALIBRATION,
+    ColoredPointCloud,
+    SGBMDisparityPredictor,
     StereoRgbCalibration,
-    compute_disparity_sgbm,
     cv2,
-    disparity_to_points_rectified,
     points_left_to_rgb_depth,
     read_image,
     rectified_left_to_original_left,
-    rectify_stereo_pair,
     rgb8,
     rgb_depth_to_points_rgb,
     save_point_cloud,
@@ -861,53 +861,29 @@ class PcdRunner:
                 "splat_px": splat_px,
             },
         )
-        if backend.backend == "sgbm":
-            left_rect, right_rect, rect = rectify_stereo_pair(
-                left_image,
-                right_image,
-                calibration,
-                alpha=alpha,
-            )
-            disparity = compute_disparity_sgbm(
-                left_rect,
-                right_rect,
-                min_disparity=min_disparity,
-                num_disparities=num_disparities,
-                block_size=block_size,
-            )
+        rectifier = calibration.get_rectifier(alpha=alpha)       
+        left_rect, right_rect, rect = rectifier.rectify(left_image, right_image)
+        
+        if backend.backend == "sgbm":   
+            predictor = SGBMDisparityPredictor(num_disparities=num_disparities,
+                                                min_disparity=min_disparity,
+                                                block_size=block_size,
+                                                uniqueness_ratio=8,
+                                                speckle_window_size=80,
+                                                speckle_range=2,
+                                                disp12_max_diff=1,
+                                                pre_filter_cap=31)
+            disparity = predictor.predict(left_rect, right_rect)
         elif backend.backend == "dnn":
-            if stereo_rgb_to_colored_point_cloud_dnn is None:
-                raise ImportError("DNN depth backend is unavailable; could not import pcd_dnn_utils") from _DNN_IMPORT_ERROR
-            cloud = stereo_rgb_to_colored_point_cloud_dnn(
-                left_image=left_image,
-                right_image=right_image,
-                rgb_image=rgb_image,
-                calibration=calibration,
-                output_path=None,
-                min_disparity=float(min_disparity),
-                max_depth_m=max_depth_m,
-                stride=1,
-                output_frame="left",
-                save_binary_pcd=True,
-                input_color_order=input_color_order,
-                alpha=alpha,
-                rgb_image_is_undistorted=rgb_image_is_undistorted,
-                disparity_predictor=self._get_dnn_predictor(backend),
-                model_scale=float(backend.model_scale),
-                stereo_input_color_order=backend.stereo_input_color_order,
-                remove_invisible=backend.remove_invisible,
-            )
-            if cloud.disparity is None or cloud.rectification is None:
-                raise RuntimeError("DNN depth result did not include disparity and rectification")
-            disparity = cloud.disparity
-            rect = cloud.rectification
+            predictor:FastFoundationStereoDisparity = self._get_dnn_predictor(backend)
+            disparity = predictor.predict(left_rect, right_rect, input_color_order=input_color_order)
+            
         else:
             raise ValueError(f"Unsupported backend: {backend.backend}")
 
         rgb_h, rgb_w = np.asarray(rgb_image).shape[:2]
-        points_rect, _xy_left_rect = disparity_to_points_rectified(
+        points_rect, _xy_left_rect = rect.disparity_to_points_rectified(
             disparity,
-            rect,
             min_disparity=max(0.5, float(min_disparity)),
             max_depth_m=max_depth_m,
             stride=1,
@@ -924,6 +900,14 @@ class PcdRunner:
             rgb_image_is_undistorted=rgb_image_is_undistorted,
             splat_px=splat_px,
         )
+        points_rgb, pixel_xy = rgb_depth_to_points_rgb(
+            depth_rgb_m, calibration, rgb_image_is_undistorted=rgb_image_is_undistorted
+        )
+        if not len(points_rgb):
+            logger(
+                f"[{LOG_SERVICE}:{LOG_CONTROLLER}:depth:error] No points projected into the RGB image",
+                level="error"
+            )
         logger(
             f"[{LOG_SERVICE}:{LOG_CONTROLLER}:depth:compute] RGB-aligned depth computed",
             extra={
@@ -932,8 +916,11 @@ class PcdRunner:
                 "disparity_shape": tuple(np.asarray(disparity).shape),
             },
         )
-        return depth_rgb_m, disparity, rect
-
+        
+        points_left = transform_points(points_rgb, np.linalg.inv(calibration.left_to_rgb))
+        x, y = pixel_xy.T
+        return points_left, rgb8(rgb_image[y, x, :3], order=input_color_order), pixel_xy, depth_rgb_m, disparity, rect
+    
     def _detect_result_to_segments(
         self,
         *,
@@ -1400,43 +1387,28 @@ class PcdRunner:
             raise ValueError(f"output_path must end with .pcd or .npz, got: {output_path}")
 
         backend = self._effective_backend(params)
-        conversion_args = dict(
+        points_left, colors_rgb, pixel_xy, depth_rgb_m, disparity, rect = self._compute_rgb_aligned_depth(
             left_image=_read_image_or_npy(params.left_path, color=False),
             right_image=_read_image_or_npy(params.right_path, color=False),
             rgb_image=_read_image_or_npy(params.rgb_path, color=True),
             calibration=calibration,
-            output_path=output_path if output_suffix == ".pcd" else None,
-            min_disparity=float(params.min_disparity),
-            max_depth_m=params.max_depth_m,
-            stride=params.stride,
-            output_frame=params.output_frame,
-            save_binary_pcd=params.save_binary_pcd,
+            backend=backend,
             input_color_order=params.input_color_order,
-            alpha=params.alpha,
             rgb_image_is_undistorted=params.rgb_image_is_undistorted,
+            alpha=params.alpha,
+            min_disparity=float(params.min_disparity),
+            num_disparities=params.num_disparities,
+            block_size=params.block_size,
+            max_depth_m=params.max_depth_m,
+            splat_px=1,
         )
 
-        if backend.backend == "sgbm":
-            cloud = stereo_rgb_to_colored_point_cloud(
-                **conversion_args,
-                num_disparities=params.num_disparities,
-                block_size=params.block_size,
-            )
-        elif backend.backend == "dnn":
-            if stereo_rgb_to_colored_point_cloud_dnn is None:
-                raise ImportError("DNN depth backend is unavailable; could not import pcd_dnn_utils") from _DNN_IMPORT_ERROR
-            cloud = stereo_rgb_to_colored_point_cloud_dnn(
-                **conversion_args,
-                disparity_predictor=self._get_dnn_predictor(backend),
-                model_scale=float(backend.model_scale),
-                stereo_input_color_order=backend.stereo_input_color_order,
-                remove_invisible=backend.remove_invisible,
-            )
-        else:
-            raise ValueError(f"Unsupported backend: {backend.backend}")
+        cloud = ColoredPointCloud(points_left, colors_rgb, disparity, rect)
 
         if output_suffix == ".npz":
             _save_cloud_npz(output_path, cloud)
+        else:
+            save_point_cloud(output_path, points_left, colors_rgb, binary_pcd=params.save_binary_pcd)
 
         depth_min_m, depth_max_m, depth_mean_m = _depth_statistics(cloud.points_m)
         disparity_height, disparity_width = (None, None) if cloud.disparity is None else cloud.disparity.shape[:2]
@@ -1576,7 +1548,7 @@ class PcdRunner:
         rgb_image = _read_image_or_npy(params.rgb_path, color=True)
 
         yolo_result:YoloDetectResult = _read_detect_result(params.yolo_result_path)
-        depth_rgb_m, disparity, rect = self._compute_rgb_aligned_depth(
+        points_left, colors_rgb, pixel_xy, depth_rgb_m, disparity, rect = self._compute_rgb_aligned_depth(
             left_image=left_image,
             right_image=right_image,
             rgb_image=rgb_image,
@@ -1592,27 +1564,20 @@ class PcdRunner:
             splat_px=params.splat_px,
         )
 
-        result = self._detect_result_to_segments(
-            yolo_result=yolo_result,
-            depth_rgb_m=depth_rgb_m,
-            disparity=disparity,
-            rectification=rect,
-            rgb_image=rgb_image,
-            calibration=calibration,
-            output_dir=output_dir,
-            frame_name=params.frame_name,
-            input_color_order=params.input_color_order,
-            output_frame=params.output_frame,
-            rgb_image_is_undistorted=params.rgb_image_is_undistorted,
-            # mask_threshold=params.mask_threshold,
-            # overlap_policy=params.overlap_policy,
-            # min_points=params.min_points,
-            # save_pcd=params.save_pcd,
-            # save_pixels=params.save_pixels,
-            # save_meta=params.save_meta,
-            save_binary_pcd=params.save_binary_pcd,
+        manifest = split_cloud(
+            points_left,
+            colors_rgb,
+            pixel_xy,
+            yolo_result,
+            output_dir,
+            min_points=1,
+            erode_pixels=0,
+            exclusive=False,
+            save_background=True,
+            save_full_cloud=True,
+            binary_pcd=False,
         )
-        self._last_yolo_segments = result
+        self._last_yolo_segments = manifest
 
         # instance_map_path = None
         # depth_rgb_path = None

@@ -230,6 +230,9 @@ class StereoRgbCalibration:
     def default(cls):
         return cls.from_dict(DEFAULT_CALIBRATION)
 
+    def get_rectifier(self, alpha=0.0, zero_disparity=True):
+        return StereoRectifier(self, alpha, zero_disparity)
+
     @property
     def stereo_baseline_m(self) -> float: return abs(float(self.left_to_right[0, 3]))
     @property
@@ -261,6 +264,27 @@ class StereoRectification:
     valid_roi_left: tuple[int, int, int, int]
     valid_roi_right: tuple[int, int, int, int]
 
+    def disparity_to_points_rectified(self, disparity, *, min_disparity=0.5,
+                                    max_depth_m=10.0, stride=1, mask=None):
+        c = cv2()
+        d = np.asarray(disparity, np.float32)
+        if d.ndim != 2:
+            raise ValueError(f"disparity must be HxW, got {d.shape}")
+        valid = np.isfinite(d) & (d > float(min_disparity))
+        if mask is not None:
+            m = np.asarray(mask, bool)
+            if m.shape != d.shape:
+                raise ValueError(f"mask shape {m.shape} does not match disparity shape {d.shape}")
+            valid &= m
+        if stride > 1:
+            s = np.zeros_like(valid); s[::stride, ::stride] = True; valid &= s
+        points = c.reprojectImageTo3D(np.nan_to_num(d), self.Q)
+        valid &= np.isfinite(points).all(axis=2) & (points[:, :, 2] > 0)
+        if max_depth_m is not None:
+            valid &= points[:, :, 2] <= float(max_depth_m)
+        y, x = np.nonzero(valid)
+        return points[y, x].astype(np.float64), np.column_stack([x, y]).astype(np.int32)
+    
 
 @dataclass(frozen=True)
 class ColoredPointCloud:
@@ -270,84 +294,88 @@ class ColoredPointCloud:
     rectification: StereoRectification | None = None
 
 
-def load_calibration_json(path: str | Path, *, source_translation_unit: Literal["m", "cm", "mm"] = "cm"):
-    return StereoRgbCalibration.from_dict(json.loads(Path(path).read_text()), source_translation_unit=source_translation_unit)
+class StereoRectifier:
+    def __init__(self, calibration:StereoRgbCalibration, alpha=0.0, zero_disparity=True):
+        self.calibration = calibration
+        self.alpha, self.zero_disparity = alpha, zero_disparity
 
+    def make(self, image_size=None):
+        c, cal = cv2(), self.calibration
+        size = image_size or cal.left_resolution
 
-def make_stereo_rectification(calibration: StereoRgbCalibration, *, image_size=None, alpha=0.0, zero_disparity=True):
-    c = cv2()
-    image_size = image_size or calibration.left_resolution
-    if image_size != calibration.left_resolution:
-        warnings.warn("Input size differs from calibration; intrinsics are scaled.", RuntimeWarning, stacklevel=2)
-    K1 = scale_K(calibration.left_intrinsics, calibration.left_resolution, image_size)
-    K2 = scale_K(calibration.right_intrinsics, calibration.right_resolution, image_size)
-    flags = c.CALIB_ZERO_DISPARITY if zero_disparity else 0
-    R1, R2, P1, P2, Q, roi1, roi2 = c.stereoRectify(
-        K1, calibration.left_distortion, K2, calibration.right_distortion, image_size,
-        calibration.left_to_right_rotation, calibration.left_to_right_translation_m,
-        flags=flags, alpha=float(alpha),
-    )
-    maps = [c.initUndistortRectifyMap(K, D, R, P, image_size, c.CV_32FC1)
-            for K, D, R, P in ((K1, calibration.left_distortion, R1, P1),
-                               (K2, calibration.right_distortion, R2, P2))]
-    return StereoRectification(image_size, *maps[0], *maps[1], R1, R2, P1, P2, Q, tuple(map(int, roi1)), tuple(map(int, roi2)))
+        if size != cal.left_resolution:
+            warnings.warn("Input size differs from calibration; intrinsics are scaled.", RuntimeWarning, stacklevel=2)
 
+        K1 = scale_K(cal.left_intrinsics, cal.left_resolution, size)
+        K2 = scale_K(cal.right_intrinsics, cal.right_resolution, size)
+        flags = c.CALIB_ZERO_DISPARITY if self.zero_disparity else 0
 
-def rectify_stereo_pair(left_image, right_image, calibration=None, *, rectification=None, alpha=0.0):
-    c = cv2()
-    if left_image is None or right_image is None or left_image.shape[:2] != right_image.shape[:2]:
-        raise ValueError("left/right images are required and must have matching sizes")
-    h, w = left_image.shape[:2]
-    rectification = rectification or make_stereo_rectification(
-        calibration or StereoRgbCalibration.default(), image_size=(w, h), alpha=alpha
-    )
-    left = c.remap(left_image, rectification.left_map_x, rectification.left_map_y, c.INTER_LINEAR, borderMode=c.BORDER_CONSTANT)
-    right = c.remap(right_image, rectification.right_map_x, rectification.right_map_y, c.INTER_LINEAR, borderMode=c.BORDER_CONSTANT)
-    return left, right, rectification
+        R1, R2, P1, P2, Q, roi1, roi2 = c.stereoRectify(
+            K1, cal.left_distortion, K2, cal.right_distortion, size,
+            cal.left_to_right_rotation, cal.left_to_right_translation_m,
+            flags=flags, alpha=float(self.alpha),
+        )
 
+        maps = [
+            c.initUndistortRectifyMap(K, D, R, P, size, c.CV_32FC1)
+            for K, D, R, P in (
+                (K1, cal.left_distortion, R1, P1),
+                (K2, cal.right_distortion, R2, P2),
+            )
+        ]
 
-def compute_disparity_sgbm(left_rectified, right_rectified, *, min_disparity=0, num_disparities=128, block_size=5,
-                           uniqueness_ratio=8, speckle_window_size=80, speckle_range=2,
-                           disp12_max_diff=1, pre_filter_cap=31, invalid_to_nan=True):
-    c = cv2()
-    left, right = gray8(left_rectified), gray8(right_rectified)
-    if left.shape != right.shape:
-        raise ValueError("Rectified left/right images must have the same shape")
-    num_disparities = math.ceil(max(16, int(num_disparities)) / 16) * 16
-    block_size = max(3, int(block_size)) | 1
-    p1, p2 = 8 * block_size ** 2, 32 * block_size ** 2
-    matcher = c.StereoSGBM_create(
-        minDisparity=int(min_disparity), numDisparities=num_disparities, blockSize=block_size,
-        P1=p1, P2=p2, disp12MaxDiff=int(disp12_max_diff), uniquenessRatio=int(uniqueness_ratio),
-        speckleWindowSize=int(speckle_window_size), speckleRange=int(speckle_range),
-        preFilterCap=int(pre_filter_cap), mode=c.STEREO_SGBM_MODE_SGBM_3WAY,
-    )
-    disparity = matcher.compute(left, right).astype(np.float32) / 16
-    if invalid_to_nan:
-        disparity[disparity <= float(min_disparity)] = np.nan
-    return disparity
+        return StereoRectification(
+            size, *maps[0], *maps[1], R1, R2, P1, P2, Q,
+            tuple(map(int, roi1)), tuple(map(int, roi2)),
+        )
 
+    def rectify(self, left, right, rectification=None):
+        c = cv2()
 
-def disparity_to_points_rectified(disparity, rectification: StereoRectification, *, min_disparity=0.5,
-                                  max_depth_m=10.0, stride=1, mask=None):
-    c = cv2()
-    d = np.asarray(disparity, np.float32)
-    if d.ndim != 2:
-        raise ValueError(f"disparity must be HxW, got {d.shape}")
-    valid = np.isfinite(d) & (d > float(min_disparity))
-    if mask is not None:
-        m = np.asarray(mask, bool)
-        if m.shape != d.shape:
-            raise ValueError(f"mask shape {m.shape} does not match disparity shape {d.shape}")
-        valid &= m
-    if stride > 1:
-        s = np.zeros_like(valid); s[::stride, ::stride] = True; valid &= s
-    points = c.reprojectImageTo3D(np.nan_to_num(d), rectification.Q)
-    valid &= np.isfinite(points).all(axis=2) & (points[:, :, 2] > 0)
-    if max_depth_m is not None:
-        valid &= points[:, :, 2] <= float(max_depth_m)
-    y, x = np.nonzero(valid)
-    return points[y, x].astype(np.float64), np.column_stack([x, y]).astype(np.int32)
+        if left is None or right is None or left.shape[:2] != right.shape[:2]:
+            raise ValueError("Left/right images are required and must have matching sizes.")
+
+        h, w = left.shape[:2]
+        r = rectification or self.make((w, h))
+
+        remap = lambda image, x, y: c.remap(
+            image, x, y, c.INTER_LINEAR, borderMode=c.BORDER_CONSTANT
+        )
+
+        return (
+            remap(left, r.left_map_x, r.left_map_y),
+            remap(right, r.right_map_x, r.right_map_y),
+            r,
+        )
+
+class SGBMDisparityPredictor:
+    def __init__(self, min_disparity=0, num_disparities=128, block_size=5,
+                 uniqueness_ratio=8, speckle_window_size=80, speckle_range=2,
+                 disp12_max_diff=1, pre_filter_cap=31, invalid_to_nan=True):
+        c = cv2()
+        self.min_disparity, self.invalid_to_nan = int(min_disparity), invalid_to_nan
+        num_disparities = math.ceil(max(16, int(num_disparities)) / 16) * 16
+        block_size = max(3, int(block_size)) | 1
+        self.matcher = c.StereoSGBM_create(
+            minDisparity=self.min_disparity, numDisparities=num_disparities, blockSize=block_size,
+            P1=8 * block_size**2, P2=32 * block_size**2,
+            disp12MaxDiff=int(disp12_max_diff), uniquenessRatio=int(uniqueness_ratio),
+            speckleWindowSize=int(speckle_window_size), speckleRange=int(speckle_range),
+            preFilterCap=int(pre_filter_cap), mode=c.STEREO_SGBM_MODE_SGBM_3WAY,
+        )
+
+    def predict(self, left, right):
+        left, right = gray8(left), gray8(right)
+
+        if left.shape != right.shape:
+            raise ValueError("Rectified left/right images must have the same shape")
+
+        disparity = self.matcher.compute(left, right).astype(np.float32) / 16
+
+        if self.invalid_to_nan:
+            disparity[disparity <= self.min_disparity] = np.nan
+
+        return disparity
 
 
 def rectified_left_to_original_left(points_rectified_m, rectification: StereoRectification):
@@ -515,22 +543,34 @@ def npz_to_pcd(input_npz: str | Path, output_path: str | Path, *, binary_pcd=Tru
     return Path(output_path)
 
 
-def stereo_rgb_to_colored_point_cloud(left_image, right_image, rgb_image, *, calibration=None, output_path=None,
-                                      input_color_order: ColorOrder = "RGB", rgb_image_is_undistorted=False,
-                                      alpha=0.0, min_disparity=0, num_disparities=128, block_size=5,
-                                      max_depth_m=10.0, stride=1, output_frame: OutputFrame = "left",
-                                      save_binary_pcd=True):
-    calibration = calibration or StereoRgbCalibration.default()
-    left, right, rect = rectify_stereo_pair(left_image, right_image, calibration, alpha=alpha)
-    disparity = compute_disparity_sgbm(left, right, min_disparity=min_disparity,
-                                       num_disparities=num_disparities, block_size=block_size)
-    points, _ = disparity_to_points_rectified(disparity, rect, min_disparity=max(0.5, float(min_disparity)),
+def stereo_to_point_cloud(left_image, right_image, calibration:StereoRgbCalibration, *, alpha=0.0, min_disparity=0,
+                          num_disparities=128, block_size=5, max_depth_m=10.0, stride=1):
+    
+    rectifier = calibration.get_rectifier(alpha)
+    left, right, rect = rectifier.rectify(left_image, right_image)
+    predictor = SGBMDisparityPredictor(num_disparities=num_disparities, block_size=block_size)
+    disparity = predictor.predict(left, right)
+    points, _ = rect.disparity_to_points_rectified(disparity,
+                                              min_disparity=max(0.5, float(min_disparity)),
                                               max_depth_m=max_depth_m, stride=stride)
-    points, colors = colorize_points_from_rgb(points, rgb_image, calibration, rectification=rect,
-                                              output_frame=output_frame, input_color_order=input_color_order,
-                                              rgb_image_is_undistorted=rgb_image_is_undistorted)
-    if output_path:
-        save_point_cloud(output_path, points, colors, binary_pcd=save_binary_pcd)
+    return disparity, rect, points
+
+
+def stereo_rgb_to_colored_point_cloud(left_image, right_image, rgb_image, *, calibration=None,
+                                      output_path=None, input_color_order: ColorOrder = "RGB",
+                                      rgb_image_is_undistorted=False, alpha=0.0, min_disparity=0,
+                                      num_disparities=128, block_size=5, max_depth_m=10.0, stride=1,
+                                      output_frame: OutputFrame = "left", save_binary_pcd=True):
+    calibration = calibration or StereoRgbCalibration.default()
+    disparity, rect, points = stereo_to_point_cloud(
+        left_image, right_image, calibration, alpha=alpha, min_disparity=min_disparity,
+        num_disparities=num_disparities, block_size=block_size, max_depth_m=max_depth_m, stride=stride
+    )
+    points, colors = colorize_points_from_rgb(
+        points, rgb_image, calibration, rectification=rect, output_frame=output_frame,
+        input_color_order=input_color_order, rgb_image_is_undistorted=rgb_image_is_undistorted
+    )
+    if output_path: save_point_cloud(output_path, points, colors, binary_pcd=save_binary_pcd)
     return ColoredPointCloud(points, colors, disparity, rect)
 
 
@@ -587,11 +627,10 @@ def stereo_rgb_to_colored_point_cloud_rgb_res(left_image, right_image, rgb_image
                                       max_depth_m=10.0, splat_px=1, output_frame: RgbOutputFrame = "left",
                                       save_binary_pcd=True):
     calibration = calibration or StereoRgbCalibration.default()
-    left, right, rect = rectify_stereo_pair(left_image, right_image, calibration, alpha=alpha)
-    disparity = compute_disparity_sgbm(left, right, min_disparity=min_disparity,
-                                       num_disparities=num_disparities, block_size=block_size)
-    points_rect, _ = disparity_to_points_rectified(disparity, rect, min_disparity=max(0.5, float(min_disparity)),
-                                                   max_depth_m=max_depth_m, stride=1)
+    disparity, rect, points_rect = stereo_to_point_cloud(
+        left_image, right_image, calibration, alpha=alpha, min_disparity=min_disparity,
+        num_disparities=num_disparities, block_size=block_size, max_depth_m=max_depth_m, stride=1
+    )
     points_left = rectified_left_to_original_left(points_rect, rect)
     depth_rgb, _ = points_left_to_rgb_depth(points_left, rgb_image, calibration,
                                             rgb_image_is_undistorted=rgb_image_is_undistorted,
@@ -645,11 +684,11 @@ if __name__ == "__main__":
     # )
 
     # print(f"Saved {len(cloud.points_m):,} colored points")
-
-    left = read_image("recording/rgb_stereo/2026-07-10/field_all/145058.976618400JST/imgs/rgbd_left/left.jpg", color=False)
-    right = read_image("recording/rgb_stereo/2026-07-10/field_all/145058.976618400JST/imgs/rgbd_left/right.jpg", color=False)
-    rgb = read_image("recording/rgb_stereo/2026-07-10/field_all/145058.976618400JST/imgs/rgbd_left/rgb.jpg", color=True)  # cv2 gives BGR
-    with open("recording/rgb_stereo/2026-07-10/field_all/145058.976618400JST/calib/rgbd_left.json") as f:
+    root = "recording/rgb_stereo/2026-07-22/field_all/111737.603022000JST/"
+    left = read_image(root+"imgs/rgbd_left/left.jpg", color=False)
+    right = read_image(root+"imgs/rgbd_left/right.jpg", color=False)
+    rgb = read_image(root+"imgs/rgbd_left/rgb.jpg", color=True)  # cv2 gives BGR
+    with open(root+"calib/rgbd_left.json") as f:
         calibration = StereoRgbCalibration.from_dict(json.load(f))
     
     cloud = stereo_rgb_to_colored_point_cloud(
