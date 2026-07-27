@@ -4,24 +4,25 @@ The functions in this module deliberately avoid project-specific settings,
 logging, and Pydantic models.  They operate on tensors and plain Python data so
 they can be reused by detectors, tests, converters, and offline tooling.
 """
-
 from __future__ import annotations
 
+# Standard library imports
+import ast
+import colorsys
+import json
 import math
+from collections import defaultdict
 from dataclasses import dataclass
-from typing import Any
+from pathlib import Path
+from typing import Any, Literal, Mapping, Optional
 
+# Third-party imports
 import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
-
-import ast
-import colorsys
-import json
-from pathlib import Path
-from typing import Any, Mapping
 from PIL import Image, ImageDraw, ImageFont
+
 
 @dataclass(frozen=True, slots=True)
 class PolygonContour:
@@ -1119,4 +1120,887 @@ def _class_color(class_id: int) -> tuple[int, int, int]:
         round(green * 255),
         round(blue * 255),
     )
+
+def plot_yolo_mixed_predictions(
+    result,
+    *,
+    draw_masks: bool = True,
+    draw_mask_outlines: bool = True,
+    draw_boxes: bool = True,
+    mask_opacity: float = 0.28,
+    mask_outline_opacity: float = 0.85,
+    box_opacity: float = 0.95,
+    label_opacity: float = 0.58,
+    mask_outline_width: int = 2,
+    box_width: int = 3,
+    font_size: int = 18,
+    font_path: Optional[str] = None,
+    show_confidence: bool = True,
+    group_overlap: float = 0.25,
+    padding: int = 7,
+    line_spacing: int = 4,
+    color_by: Literal["class", "instance"] = "instance",
+    orig_is_bgr: bool = True,
+) -> Image.Image:
+    """
+    Render overlapping Ultralytics YOLO predictions as a PIL image.
+
+    Drawing order:
+        1. All segmentation fills, combined without front/back ordering.
+        2. All segmentation outlines, combined without front/back ordering.
+        3. All bounding-box outlines, combined without front/back ordering.
+        4. Grouped translucent label panels.
+
+    At pixels shared by multiple predictions:
+        - The contributing colors are averaged.
+        - Opacity is accumulated.
+        - No later prediction erases an earlier prediction.
+        results = model("image.jpg")
+
+    pretty_image = plot_yolo_mixed_predictions(
+        results[0],
+
+        # Every instance gets its own color.
+        color_by="instance",
+
+        # Transparent segmentation.
+        mask_opacity=0.22,
+        mask_outline_opacity=0.80,
+        mask_outline_width=2,
+
+        # All boxes remain visible.
+        box_opacity=0.90,
+        box_width=3,
+
+        # Existing grouped-label style.
+        label_opacity=0.55,
+        group_overlap=0.20,
+    )
+
+    pretty_image.show()
+    pretty_image.save("mixed_predictions.png")
+
+    Args:
+        result:
+            One Ultralytics Results object, such as results[0].
+
+        draw_masks:
+            Draw segmentation fills when result.masks is available.
+
+        draw_mask_outlines:
+            Draw segmentation polygon boundaries.
+
+        draw_boxes:
+            Draw every bounding box.
+
+        mask_opacity:
+            Per-mask fill opacity from 0.0 to 1.0.
+
+        mask_outline_opacity:
+            Per-mask boundary opacity from 0.0 to 1.0.
+
+        box_opacity:
+            Bounding-box opacity from 0.0 to 1.0.
+
+        label_opacity:
+            Label-panel background opacity from 0.0 to 1.0.
+
+        mask_outline_width:
+            Segmentation-boundary width in pixels.
+
+        box_width:
+            Bounding-box width in pixels.
+
+        font_size:
+            Label font size.
+
+        font_path:
+            Optional path to a TrueType or OpenType font.
+
+        show_confidence:
+            Include confidence values in labels.
+
+        group_overlap:
+            Group labels when:
+
+                intersection_area / smaller_box_area
+
+            is greater than or equal to this value.
+
+        padding:
+            Label-panel inner padding.
+
+        line_spacing:
+            Spacing between rows in grouped labels.
+
+        color_by:
+            "class":
+                All detections of the same class use the same color.
+
+            "instance":
+                Every prediction receives a different color. This is usually
+                clearer for strongly overlapping predictions.
+
+        orig_is_bgr:
+            True for normal Ultralytics/OpenCV result.orig_img arrays.
+            Ignored when result.orig_img is already a PIL image.
+
+    Returns:
+        PIL.Image.Image in RGB mode.
+    """
+
+    def clamp_opacity(value: float) -> float:
+        return float(np.clip(value, 0.0, 1.0))
+
+    def original_to_pil() -> Image.Image:
+        original = result.orig_img
+
+        if isinstance(original, Image.Image):
+            return original.convert("RGB")
+
+        array = np.asarray(original)
+
+        if array.dtype != np.uint8:
+            array = np.clip(array, 0, 255).astype(np.uint8)
+
+        if array.ndim == 2:
+            return Image.fromarray(array).convert("RGB")
+
+        if array.ndim != 3 or array.shape[2] not in (3, 4):
+            raise ValueError(
+                "result.orig_img must be a PIL image or an HxW, "
+                "HxWx3, or HxWx4 NumPy array."
+            )
+
+        if array.shape[2] == 4:
+            if orig_is_bgr:
+                array = array[..., [2, 1, 0, 3]]
+
+            return Image.fromarray(array).convert("RGB")
+
+        if orig_is_bgr:
+            array = array[..., ::-1]
+
+        return Image.fromarray(array).convert("RGB")
+
+    def prediction_color(key: int) -> tuple[int, int, int]:
+        """Return a stable, visually separated RGB color."""
+
+        hue = (int(key) * 0.618033988749895) % 1.0
+        red, green, blue = colorsys.hsv_to_rgb(
+            hue,
+            0.68,
+            0.96,
+        )
+
+        return (
+            round(red * 255),
+            round(green * 255),
+            round(blue * 255),
+        )
+
+    def get_class_name(class_id: int) -> str:
+        names = result.names
+
+        if isinstance(names, dict):
+            return str(names.get(class_id, class_id))
+
+        if 0 <= class_id < len(names):
+            return str(names[class_id])
+
+        return str(class_id)
+
+    def overlap_over_smaller(
+        first: np.ndarray,
+        second: np.ndarray,
+    ) -> float:
+        left = max(float(first[0]), float(second[0]))
+        top = max(float(first[1]), float(second[1]))
+        right = min(float(first[2]), float(second[2]))
+        bottom = min(float(first[3]), float(second[3]))
+
+        intersection = (
+            max(0.0, right - left)
+            * max(0.0, bottom - top)
+        )
+
+        first_area = (
+            max(0.0, float(first[2] - first[0]))
+            * max(0.0, float(first[3] - first[1]))
+        )
+
+        second_area = (
+            max(0.0, float(second[2] - second[0]))
+            * max(0.0, float(second[3] - second[1]))
+        )
+
+        smaller_area = min(first_area, second_area)
+
+        if smaller_area <= 0:
+            return 0.0
+
+        return intersection / smaller_area
+
+    def composite_all_layers(
+        base: Image.Image,
+        coverage_layers: list[np.ndarray],
+        layer_colors: list[tuple[int, int, int]],
+        opacity: float,
+    ) -> Image.Image:
+        """
+        Composite all layers simultaneously.
+
+        For a pixel covered by k predictions:
+
+            color = average of all contributing colors
+            alpha = 1 - (1 - opacity) ** k
+
+        This makes the operation independent of prediction order.
+        """
+
+        opacity = clamp_opacity(opacity)
+
+        if opacity <= 0 or not coverage_layers:
+            return base
+
+        height, width = coverage_layers[0].shape
+
+        color_sum = np.zeros(
+            (height, width, 3),
+            dtype=np.float32,
+        )
+
+        coverage_count = np.zeros(
+            (height, width),
+            dtype=np.float32,
+        )
+
+        for coverage, color in zip(
+            coverage_layers,
+            layer_colors,
+        ):
+            active = np.asarray(coverage, dtype=bool)
+
+            if active.shape != (height, width):
+                raise ValueError(
+                    "All coverage layers must match the image dimensions."
+                )
+
+            coverage_count[active] += 1.0
+            color_sum[active] += np.asarray(
+                color,
+                dtype=np.float32,
+            )
+
+        active_pixels = coverage_count > 0
+
+        if not np.any(active_pixels):
+            return base
+
+        mixed_colors = np.zeros_like(color_sum)
+
+        mixed_colors[active_pixels] = (
+            color_sum[active_pixels]
+            / coverage_count[active_pixels, None]
+        )
+
+        combined_alpha = np.zeros(
+            (height, width),
+            dtype=np.float32,
+        )
+
+        combined_alpha[active_pixels] = (
+            1.0
+            - np.power(
+                1.0 - opacity,
+                coverage_count[active_pixels],
+            )
+        )
+
+        base_array = np.asarray(
+            base.convert("RGB"),
+            dtype=np.float32,
+        )
+
+        output = (
+            base_array
+            * (1.0 - combined_alpha[..., None])
+            + mixed_colors
+            * combined_alpha[..., None]
+        )
+
+        return Image.fromarray(
+            np.clip(output, 0, 255).astype(np.uint8)
+        )
+
+    def build_polygon_layers(
+        polygons,
+        image_size: tuple[int, int],
+        outline_width: int,
+    ) -> tuple[list[np.ndarray], list[np.ndarray]]:
+        image_width, image_height = image_size
+
+        fill_layers: list[np.ndarray] = []
+        outline_layers: list[np.ndarray] = []
+
+        for polygon in polygons:
+            fill_image = Image.new(
+                "1",
+                (image_width, image_height),
+                0,
+            )
+
+            outline_image = Image.new(
+                "1",
+                (image_width, image_height),
+                0,
+            )
+
+            polygon_array = np.asarray(
+                polygon,
+                dtype=np.float32,
+            )
+
+            if (
+                polygon_array.ndim != 2
+                or polygon_array.shape[0] < 3
+                or polygon_array.shape[1] != 2
+            ):
+                empty = np.zeros(
+                    (image_height, image_width),
+                    dtype=bool,
+                )
+
+                fill_layers.append(empty)
+                outline_layers.append(empty.copy())
+                continue
+
+            points = [
+                (
+                    int(np.clip(round(x), 0, image_width - 1)),
+                    int(np.clip(round(y), 0, image_height - 1)),
+                )
+                for x, y in polygon_array
+            ]
+
+            ImageDraw.Draw(fill_image).polygon(
+                points,
+                fill=1,
+            )
+
+            if outline_width > 0:
+                closed_points = points + [points[0]]
+
+                ImageDraw.Draw(outline_image).line(
+                    closed_points,
+                    fill=1,
+                    width=outline_width,
+                    joint="curve",
+                )
+
+            fill_layers.append(
+                np.asarray(fill_image, dtype=bool)
+            )
+
+            outline_layers.append(
+                np.asarray(outline_image, dtype=bool)
+            )
+
+        return fill_layers, outline_layers
+
+    def build_box_layers(
+        boxes: list[tuple[int, int, int, int]],
+        image_size: tuple[int, int],
+        width: int,
+    ) -> list[np.ndarray]:
+        image_width, image_height = image_size
+        layers: list[np.ndarray] = []
+
+        for box in boxes:
+            layer_image = Image.new(
+                "1",
+                (image_width, image_height),
+                0,
+            )
+
+            ImageDraw.Draw(layer_image).rectangle(
+                box,
+                outline=1,
+                width=max(1, width),
+            )
+
+            layers.append(
+                np.asarray(layer_image, dtype=bool)
+            )
+
+        return layers
+
+    def rectangles_intersect(
+        first: tuple[int, int, int, int],
+        second: tuple[int, int, int, int],
+        margin: int = 5,
+    ) -> bool:
+        return not (
+            first[2] + margin <= second[0]
+            or second[2] + margin <= first[0]
+            or first[3] + margin <= second[1]
+            or second[3] + margin <= first[1]
+        )
+
+    def place_label_panel(
+        group_box: tuple[int, int, int, int],
+        panel_width: int,
+        panel_height: int,
+        occupied: list[tuple[int, int, int, int]],
+        image_width: int,
+        image_height: int,
+    ) -> tuple[int, int]:
+        group_x1, group_y1, group_x2, group_y2 = group_box
+
+        max_x = max(0, image_width - panel_width)
+        max_y = max(0, image_height - panel_height)
+
+        def position_is_free(x: int, y: int) -> bool:
+            candidate = (
+                x,
+                y,
+                x + panel_width,
+                y + panel_height,
+            )
+
+            return not any(
+                rectangles_intersect(candidate, previous)
+                for previous in occupied
+            )
+
+        candidates = [
+            # Above the group.
+            (
+                group_x1,
+                group_y1 - panel_height - 5,
+            ),
+            (
+                group_x2 - panel_width,
+                group_y1 - panel_height - 5,
+            ),
+
+            # Below the group.
+            (
+                group_x1,
+                group_y2 + 5,
+            ),
+            (
+                group_x2 - panel_width,
+                group_y2 + 5,
+            ),
+
+            # Fallback inside the group.
+            (
+                group_x1 + 5,
+                group_y1 + 5,
+            ),
+        ]
+
+        for x, y in candidates:
+            x = int(np.clip(x, 0, max_x))
+            y = int(np.clip(y, 0, max_y))
+
+            if position_is_free(x, y):
+                return x, y
+
+        search_x = int(np.clip(group_x1, 0, max_x))
+        search_step = max(12, panel_height // 3)
+
+        for search_y in range(
+            0,
+            max_y + 1,
+            search_step,
+        ):
+            if position_is_free(search_x, search_y):
+                return search_x, search_y
+
+        return (
+            int(np.clip(group_x1, 0, max_x)),
+            int(np.clip(group_y1, 0, max_y)),
+        )
+
+    image = original_to_pil()
+    image_width, image_height = image.size
+
+    boxes_object = getattr(result, "boxes", None)
+
+    if boxes_object is None or len(boxes_object) == 0:
+        return image
+
+    boxes = (
+        boxes_object.xyxy
+        .detach()
+        .cpu()
+        .numpy()
+        .astype(np.float32)
+    )
+
+    classes = (
+        boxes_object.cls
+        .detach()
+        .cpu()
+        .numpy()
+        .astype(int)
+    )
+
+    if boxes_object.conf is None:
+        confidences = np.ones(
+            len(boxes),
+            dtype=np.float32,
+        )
+    else:
+        confidences = (
+            boxes_object.conf
+            .detach()
+            .cpu()
+            .numpy()
+            .astype(np.float32)
+        )
+
+    normalized_boxes: list[
+        tuple[int, int, int, int]
+    ] = []
+
+    for x1, y1, x2, y2 in boxes:
+        normalized_boxes.append(
+            (
+                int(np.clip(round(x1), 0, image_width - 1)),
+                int(np.clip(round(y1), 0, image_height - 1)),
+                int(np.clip(round(x2), 0, image_width - 1)),
+                int(np.clip(round(y2), 0, image_height - 1)),
+            )
+        )
+
+    colors: list[tuple[int, int, int]] = []
+
+    for index, class_id in enumerate(classes):
+        color_key = (
+            int(class_id)
+            if color_by == "class"
+            else index
+        )
+
+        colors.append(
+            prediction_color(color_key)
+        )
+
+    # ------------------------------------------------------------
+    # 1. Draw all segmentation fills simultaneously.
+    # ------------------------------------------------------------
+
+    masks_object = getattr(result, "masks", None)
+
+    if masks_object is not None and len(masks_object) > 0:
+        polygons = list(masks_object.xy)
+
+        usable_count = min(
+            len(polygons),
+            len(colors),
+        )
+
+        polygons = polygons[:usable_count]
+        mask_colors = colors[:usable_count]
+
+        mask_fill_layers, mask_boundary_layers = (
+            build_polygon_layers(
+                polygons,
+                image.size,
+                max(1, mask_outline_width),
+            )
+        )
+
+        if draw_masks:
+            image = composite_all_layers(
+                image,
+                mask_fill_layers,
+                mask_colors,
+                mask_opacity,
+            )
+
+        # --------------------------------------------------------
+        # 2. Draw all mask boundaries simultaneously.
+        # --------------------------------------------------------
+
+        if (
+            draw_mask_outlines
+            and mask_outline_width > 0
+        ):
+            image = composite_all_layers(
+                image,
+                mask_boundary_layers,
+                mask_colors,
+                mask_outline_opacity,
+            )
+
+    # ------------------------------------------------------------
+    # 3. Draw all bounding boxes simultaneously.
+    # ------------------------------------------------------------
+
+    if draw_boxes and box_width > 0:
+        box_layers = build_box_layers(
+            normalized_boxes,
+            image.size,
+            box_width,
+        )
+
+        image = composite_all_layers(
+            image,
+            box_layers,
+            colors,
+            box_opacity,
+        )
+
+    # ------------------------------------------------------------
+    # 4. Draw the grouped translucent labels.
+    # ------------------------------------------------------------
+
+    try:
+        font = ImageFont.truetype(
+            font_path or "DejaVuSans.ttf",
+            font_size,
+        )
+    except OSError:
+        font = ImageFont.load_default()
+
+    # Union-find grouping for overlapping detections.
+    parents = list(range(len(boxes)))
+
+    def find(index: int) -> int:
+        while parents[index] != index:
+            parents[index] = parents[parents[index]]
+            index = parents[index]
+
+        return index
+
+    def union(first: int, second: int) -> None:
+        first_root = find(first)
+        second_root = find(second)
+
+        if first_root != second_root:
+            parents[second_root] = first_root
+
+    overlap_threshold = float(
+        np.clip(group_overlap, 0.0, 1.0)
+    )
+
+    for first_index in range(len(boxes)):
+        for second_index in range(
+            first_index + 1,
+            len(boxes),
+        ):
+            overlap = overlap_over_smaller(
+                boxes[first_index],
+                boxes[second_index],
+            )
+
+            if overlap >= overlap_threshold:
+                union(first_index, second_index)
+
+    groups: dict[int, list[int]] = defaultdict(list)
+
+    for index in range(len(boxes)):
+        groups[find(index)].append(index)
+
+    grouped_indices = sorted(
+        groups.values(),
+        key=lambda group: min(
+            boxes[index][1]
+            for index in group
+        ),
+    )
+
+    label_layer = Image.new(
+        "RGBA",
+        image.size,
+        (0, 0, 0, 0),
+    )
+
+    label_draw = ImageDraw.Draw(label_layer)
+
+    occupied_panels: list[
+        tuple[int, int, int, int]
+    ] = []
+
+    panel_alpha = round(
+        clamp_opacity(label_opacity) * 255
+    )
+
+    for group in grouped_indices:
+        # Highest confidence first.
+        group = sorted(
+            group,
+            key=lambda index: float(confidences[index]),
+            reverse=True,
+        )
+
+        rows = []
+
+        for index in group:
+            text = get_class_name(
+                int(classes[index])
+            )
+
+            if show_confidence:
+                text += (
+                    f"  {float(confidences[index]):.2f}"
+                )
+
+            text_box = label_draw.textbbox(
+                (0, 0),
+                text,
+                font=font,
+            )
+
+            rows.append(
+                {
+                    "index": index,
+                    "text": text,
+                    "bbox": text_box,
+                    "width": text_box[2] - text_box[0],
+                    "height": text_box[3] - text_box[1],
+                }
+            )
+
+        swatch_size = max(9, font_size // 2)
+        swatch_gap = 7
+
+        panel_width = (
+            max(
+                row["width"]
+                + swatch_size
+                + swatch_gap
+                for row in rows
+            )
+            + padding * 2
+        )
+
+        panel_height = (
+            padding * 2
+            + sum(
+                row["height"]
+                for row in rows
+            )
+            + line_spacing
+            * max(0, len(rows) - 1)
+        )
+
+        panel_width = min(
+            panel_width,
+            image_width,
+        )
+
+        panel_height = min(
+            panel_height,
+            image_height,
+        )
+
+        group_box = (
+            round(
+                min(
+                    boxes[index][0]
+                    for index in group
+                )
+            ),
+            round(
+                min(
+                    boxes[index][1]
+                    for index in group
+                )
+            ),
+            round(
+                max(
+                    boxes[index][2]
+                    for index in group
+                )
+            ),
+            round(
+                max(
+                    boxes[index][3]
+                    for index in group
+                )
+            ),
+        )
+
+        panel_x, panel_y = place_label_panel(
+            group_box=group_box,
+            panel_width=panel_width,
+            panel_height=panel_height,
+            occupied=occupied_panels,
+            image_width=image_width,
+            image_height=image_height,
+        )
+
+        panel_box = (
+            panel_x,
+            panel_y,
+            panel_x + panel_width,
+            panel_y + panel_height,
+        )
+
+        occupied_panels.append(panel_box)
+
+        label_draw.rounded_rectangle(
+            panel_box,
+            radius=7,
+            fill=(10, 10, 12, panel_alpha),
+            outline=(255, 255, 255, 55),
+            width=1,
+        )
+
+        current_y = panel_y + padding
+
+        for row in rows:
+            row_height = row["height"]
+            row_center_y = (
+                current_y + row_height // 2
+            )
+
+            swatch_y = (
+                row_center_y
+                - swatch_size // 2
+            )
+
+            label_draw.rounded_rectangle(
+                (
+                    panel_x + padding,
+                    swatch_y,
+                    panel_x + padding + swatch_size,
+                    swatch_y + swatch_size,
+                ),
+                radius=2,
+                fill=(
+                    *colors[row["index"]],
+                    245,
+                ),
+            )
+
+            label_draw.text(
+                (
+                    panel_x
+                    + padding
+                    + swatch_size
+                    + swatch_gap,
+                    current_y - row["bbox"][1],
+                ),
+                row["text"],
+                font=font,
+                fill=(255, 255, 255, 255),
+            )
+
+            current_y += (
+                row_height + line_spacing
+            )
+
+    return Image.alpha_composite(
+        image.convert("RGBA"),
+        label_layer,
+    ).convert("RGB")
+
+
+
 
