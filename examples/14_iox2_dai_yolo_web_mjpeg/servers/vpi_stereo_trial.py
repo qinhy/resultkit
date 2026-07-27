@@ -1,6 +1,6 @@
 """Minimal NVIDIA VPI CUDA trial for the existing pcd_utils.py pipeline.
 
-This uses VPI CUDA for stereo disparity and pcd_utils_optimized.py for RGB
+This uses VPI CUDA for stereo disparity and pcd_utils.py for RGB
 projection/colorization. The optimized colorizer implements OpenCV's full
 4/5/8/12/14-coefficient distortion model directly, avoiding the very large
 Jacobian allocated by Python cv2.projectPoints().
@@ -14,7 +14,7 @@ from pathlib import Path
 
 import numpy as np
 
-from pcd_utils_optimized import (
+from pcd_utils import (
     ColoredPointCloud,
     StereoRgbCalibration,
     colorize_points_from_rgb,
