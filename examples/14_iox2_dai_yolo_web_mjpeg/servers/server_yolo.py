@@ -111,7 +111,7 @@ class StartYoloParams(YoloBaseModel):
 class YoloSettings(YoloBaseModel):
     """Runtime settings for model inference and detection serialization."""
 
-    model_name: str = "yolov8x-seg.pt"
+    model_name: str = "yolo11l-seg.pt"
 
     imgsz: int = Field(default=1280, gt=0)
     confidence: float = Field(default=0.25, ge=0.0, le=1.0)

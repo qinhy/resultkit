@@ -9,5 +9,5 @@ start "store_dual" uv run .\examples\14_iox2_dai_yolo_web_mjpeg\servers\server_s
 start "yolo" uv run .\examples\14_iox2_dai_yolo_web_mjpeg\servers\server_yolo.py
 start "pcd" uv run .\examples\14_iox2_dai_yolo_web_mjpeg\servers\server_pcd.py
 @REM start uv run .\examples\14_iox2_dai_yolo_web_mjpeg\servers\server_iox2redis.py /iox2redis --store-file ./iox2redis-store.json
-start uv run .\examples\14_iox2_dai_yolo_web_mjpeg\cli.py api
+start "web" uv run .\examples\14_iox2_dai_yolo_web_mjpeg\cli.py api
 @REM start uv run .\examples\14_iox2_dai_yolo_web_mjpeg\auto_test.py
