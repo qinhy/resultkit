@@ -1,7 +1,9 @@
 """Minimal NVIDIA VPI CUDA trial for the existing pcd_utils.py pipeline.
 
-This intentionally leaves rectification, 3-D reprojection, RGB projection, and
-PCD writing in pcd_utils.py unchanged. Only stereo disparity runs with VPI CUDA.
+This uses VPI CUDA for stereo disparity and pcd_utils_optimized.py for RGB
+projection/colorization. The optimized colorizer implements OpenCV's full
+4/5/8/12/14-coefficient distortion model directly, avoiding the very large
+Jacobian allocated by Python cv2.projectPoints().
 """
 from __future__ import annotations
 
@@ -12,7 +14,7 @@ from pathlib import Path
 
 import numpy as np
 
-from pcd_utils import (
+from pcd_utils_optimized import (
     ColoredPointCloud,
     StereoRgbCalibration,
     colorize_points_from_rgb,
@@ -159,7 +161,8 @@ def run(args: argparse.Namespace) -> ColoredPointCloud:
     )
     t4 = time.perf_counter()
 
-    points, colors = colorize_points_from_rgb(
+    # Warm up the optimized NumPy colorizer, then report a stable median.
+    colorize_points_from_rgb(
         points_rectified,
         rgb,
         calibration,
@@ -167,9 +170,24 @@ def run(args: argparse.Namespace) -> ColoredPointCloud:
         output_frame=args.output_frame,
         input_color_order="BGR",
     )
+    color_timings = []
+    points = colors = None
+    for _ in range(args.color_runs):
+        start = time.perf_counter()
+        points, colors = colorize_points_from_rgb(
+            points_rectified,
+            rgb,
+            calibration,
+            rectification=rect,
+            output_frame=args.output_frame,
+            input_color_order="BGR",
+        )
+        color_timings.append(time.perf_counter() - start)
+    assert points is not None and colors is not None
     t5 = time.perf_counter()
 
-    save_point_cloud(args.output, points, colors, binary_pcd=True)
+    if not args.skip_write:
+        save_point_cloud(args.output, points, colors, binary_pcd=True)
     t6 = time.perf_counter()
 
     finite = np.isfinite(disparity)
@@ -182,11 +200,19 @@ def run(args: argparse.Namespace) -> ColoredPointCloud:
         f"mean={np.mean(timings) * 1000:.2f} ms over {args.runs} runs"
     )
     print(f"3-D reprojection:  {(t4 - t3) * 1000:.2f} ms")
-    print(f"RGB colorization:  {(t5 - t4) * 1000:.2f} ms")
-    print(f"PCD writing:       {(t6 - t5) * 1000:.2f} ms")
+    print(
+        "RGB colorization:  "
+        f"median={np.median(color_timings) * 1000:.2f} ms, "
+        f"mean={np.mean(color_timings) * 1000:.2f} ms over {args.color_runs} runs"
+    )
+    print(
+        "PCD writing:       "
+        + (f"{(t6 - t5) * 1000:.2f} ms" if not args.skip_write else "skipped")
+    )
     print(f"Valid disparity:   {finite.sum():,}/{finite.size:,} pixels")
     print(f"Saved points:      {len(points):,}")
-    print(f"Output:            {Path(args.output).resolve()}")
+    if not args.skip_write:
+        print(f"Output:            {Path(args.output).resolve()}")
 
     return ColoredPointCloud(points, colors, disparity, rect)
 
@@ -205,6 +231,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-depth", type=float, default=5.0)
     parser.add_argument("--stride", type=int, default=1)
     parser.add_argument("--runs", type=int, default=10)
+    parser.add_argument("--color-runs", type=int, default=5)
+    parser.add_argument("--skip-write", action="store_true")
     parser.add_argument("--output-frame", choices=("left", "left_rectified"), default="left")
     return parser.parse_args()
 

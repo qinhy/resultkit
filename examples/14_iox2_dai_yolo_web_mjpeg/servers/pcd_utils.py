@@ -389,14 +389,107 @@ def transform_points(points_m, transform_4x4):
     return p @ T[:3, :3].T + T[:3, 3]
 
 
+def _tilt_projection_matrix(tau_x: float, tau_y: float, *, dtype=np.float64) -> np.ndarray:
+    """OpenCV tilted-sensor projection matrix, without Jacobian calculation."""
+    cx, sx = math.cos(float(tau_x)), math.sin(float(tau_x))
+    cy, sy = math.cos(float(tau_y)), math.sin(float(tau_y))
+    rot_x = np.array(((1, 0, 0), (0, cx, sx), (0, -sx, cx)), dtype=dtype)
+    rot_y = np.array(((cy, 0, -sy), (0, 1, 0), (sy, 0, cy)), dtype=dtype)
+    rot_xy = rot_y @ rot_x
+    proj_z = np.array(
+        (
+            (rot_xy[2, 2], 0, -rot_xy[0, 2]),
+            (0, rot_xy[2, 2], -rot_xy[1, 2]),
+            (0, 0, 1),
+        ),
+        dtype=dtype,
+    )
+    return proj_z @ rot_xy
+
+
+def _project_camera_points_opencv_model(
+    points_camera,
+    K,
+    distortion=None,
+    *,
+    dtype=np.float64,
+):
+    """Project camera-frame points using OpenCV's 4/5/8/12/14-term model.
+
+    Unlike cv2.projectPoints(), this computes image coordinates only and does
+    not allocate the large calibration Jacobian returned by the Python binding.
+    """
+    p = np.asarray(points_camera, dtype=dtype)
+    if p.ndim != 2 or p.shape[1] != 3:
+        raise ValueError(f"points_camera must be Nx3, got {p.shape}")
+
+    K = np.asarray(K, dtype=dtype)
+    if K.shape != (3, 3):
+        raise ValueError(f"K must be 3x3, got {K.shape}")
+
+    z = p[:, 2]
+    with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+        x = p[:, 0] / z
+        y = p[:, 1] / z
+
+        if distortion is not None:
+            source = np.asarray(distortion, dtype=dtype).reshape(-1)
+            if len(source) not in (4, 5, 8, 12, 14):
+                raise ValueError(
+                    "distortion must contain 4, 5, 8, 12, or 14 coefficients"
+                )
+            d = np.zeros(14, dtype=dtype)
+            d[: len(source)] = source
+            k1, k2, p1, p2, k3, k4, k5, k6, s1, s2, s3, s4, tau_x, tau_y = d
+
+            r2 = x * x + y * y
+            r4 = r2 * r2
+            r6 = r4 * r2
+            radial = (1 + k1 * r2 + k2 * r4 + k3 * r6) / (
+                1 + k4 * r2 + k5 * r4 + k6 * r6
+            )
+            xy = x * y
+            x_distorted = (
+                x * radial
+                + 2 * p1 * xy
+                + p2 * (r2 + 2 * x * x)
+                + s1 * r2
+                + s2 * r4
+            )
+            y_distorted = (
+                y * radial
+                + p1 * (r2 + 2 * y * y)
+                + 2 * p2 * xy
+                + s3 * r2
+                + s4 * r4
+            )
+
+            if tau_x != 0 or tau_y != 0:
+                tilt = _tilt_projection_matrix(tau_x, tau_y, dtype=dtype)
+                tx = tilt[0, 0] * x_distorted + tilt[0, 1] * y_distorted + tilt[0, 2]
+                ty = tilt[1, 0] * x_distorted + tilt[1, 1] * y_distorted + tilt[1, 2]
+                tz = tilt[2, 0] * x_distorted + tilt[2, 1] * y_distorted + tilt[2, 2]
+                x = tx / tz
+                y = ty / tz
+            else:
+                x, y = x_distorted, y_distorted
+
+        u = K[0, 0] * x + K[0, 1] * y + K[0, 2]
+        v = K[1, 0] * x + K[1, 1] * y + K[1, 2]
+
+    pixels = np.empty((len(p), 2), dtype=dtype)
+    pixels[:, 0] = u
+    pixels[:, 1] = v
+    return pixels
+
+
 def project_points_to_rgb_pixels(points_left_m, rgb_image, calibration: StereoRgbCalibration, *, rgb_image_is_undistorted=False):
-    c = cv2()
     rgb_h, rgb_w = np.asarray(rgb_image).shape[:2]
     K = scale_K(calibration.rgb_intrinsics, calibration.rgb_resolution, (rgb_w, rgb_h))
     points_rgb = transform_points(points_left_m, calibration.left_to_rgb)
-    pixels, _ = c.projectPoints(points_rgb.reshape(-1, 1, 3), np.zeros((3, 1)), np.zeros((3, 1)),
-                                K, None if rgb_image_is_undistorted else calibration.rgb_distortion)
-    return pixels.reshape(-1, 2).astype(np.float64), points_rgb
+    distortion = None if rgb_image_is_undistorted else calibration.rgb_distortion
+    pixels = _project_camera_points_opencv_model(points_rgb, K, distortion, dtype=np.float64)
+    return pixels, points_rgb
 
 
 def sample_rgb_colors(rgb_image, pixel_xy, *, input_color_order: ColorOrder = "RGB", interpolation: Literal["nearest"] = "nearest"):
@@ -414,24 +507,76 @@ def sample_rgb_colors(rgb_image, pixel_xy, *, input_color_order: ColorOrder = "R
 def colorize_points_from_rgb(points_m, rgb_image, calibration: StereoRgbCalibration, *, rectification=None,
                              points_frame: PointsFrame = "left_rectified", output_frame: OutputFrame = "left",
                              input_color_order: ColorOrder = "RGB", rgb_image_is_undistorted=False):
-    points = np.asarray(points_m, np.float64)
+    """Colorize points without cv2.projectPoints' large Jacobian allocation.
+
+    Float32 is used internally because the result is nearest-neighbor pixel
+    sampling. Returned point coordinates remain float64 for API compatibility.
+    """
+    image = np.asarray(rgb_image)
+    if image.ndim != 3 or image.shape[2] < 3:
+        raise ValueError("rgb_image must be HxWx3/4")
+    if input_color_order not in ("RGB", "BGR"):
+        raise ValueError("input_color_order must be 'RGB' or 'BGR'")
+
+    points = np.asarray(points_m, np.float32)
+    if points.ndim != 2 or points.shape[1] != 3:
+        raise ValueError(f"points_m must be Nx3, got {points.shape}")
+
     if points_frame == "left_rectified":
         if rectification is None:
             raise ValueError("rectification is required for rectified-left points")
-        points_left = rectified_left_to_original_left(points, rectification)
+        # Row-vector equivalent of p_left = R1.T @ p_rectified.
+        points_left = points @ np.asarray(rectification.R1, np.float32)
     elif points_frame == "left":
         points_left = points
     else:
         raise ValueError(f"Unsupported points_frame: {points_frame}")
-    pixels, points_rgb = project_points_to_rgb_pixels(points_left, rgb_image, calibration,
-                                                      rgb_image_is_undistorted=rgb_image_is_undistorted)
-    front = points_rgb[:, 2] > 0
-    colors, valid_front = sample_rgb_colors(rgb_image, pixels[front], input_color_order=input_color_order)
-    valid = np.zeros(len(points), bool)
-    valid[np.flatnonzero(front)[valid_front]] = True
+
     if output_frame not in ("left", "left_rectified"):
         raise ValueError(f"Unsupported output_frame: {output_frame}")
-    out_points = points_left[valid] if output_frame == "left" else points[valid]
+
+    transform = np.asarray(calibration.left_to_rgb, np.float32)
+    points_rgb = points_left @ transform[:3, :3].T
+    points_rgb += transform[:3, 3]
+
+    front_indices = np.flatnonzero(
+        np.isfinite(points_rgb).all(axis=1) & (points_rgb[:, 2] > 0)
+    )
+    if not len(front_indices):
+        return np.empty((0, 3), np.float64), np.empty((0, 3), np.uint8)
+
+    rgb_h, rgb_w = image.shape[:2]
+    K = scale_K(
+        calibration.rgb_intrinsics,
+        calibration.rgb_resolution,
+        (rgb_w, rgb_h),
+    ).astype(np.float32)
+    distortion = None if rgb_image_is_undistorted else calibration.rgb_distortion
+    pixels = _project_camera_points_opencv_model(
+        points_rgb[front_indices], K, distortion, dtype=np.float32
+    )
+
+    # Round only after checking finiteness to avoid invalid-cast warnings.
+    finite_pixels = np.isfinite(pixels).all(axis=1)
+    finite_indices = np.flatnonzero(finite_pixels)
+    if not len(finite_indices):
+        return np.empty((0, 3), np.float64), np.empty((0, 3), np.uint8)
+
+    finite_xy = pixels[finite_indices]
+    u = np.rint(finite_xy[:, 0]).astype(np.int32)
+    v = np.rint(finite_xy[:, 1]).astype(np.int32)
+    inside = (0 <= u) & (u < rgb_w) & (0 <= v) & (v < rgb_h)
+
+    selected_front = finite_indices[inside]
+    selected = front_indices[selected_front]
+    u, v = u[inside], v[inside]
+
+    colors = image[v, u, :3]
+    if input_color_order == "BGR":
+        colors = colors[:, ::-1]
+    colors = rgb8(colors, "RGB")
+
+    out_points = points_left[selected] if output_frame == "left" else points[selected]
     return out_points.astype(np.float64), colors
 
 
@@ -532,8 +677,8 @@ def save_point_cloud(
         colors = np.concatenate((center_color, colors), axis=0)
 
     suffix = Path(path).suffix.lower()
-    if suffix == ".pcd": return save_pcd(path, points_m, colors_rgb, binary=binary_pcd)
-    if suffix == ".ply": return save_ply_ascii(path, points_m, colors_rgb)
+    if suffix == ".pcd": return save_pcd(path, points, colors, binary=binary_pcd)
+    if suffix == ".ply": return save_ply_ascii(path, points, colors)
     raise ValueError("Use .pcd or .ply")
 
 
