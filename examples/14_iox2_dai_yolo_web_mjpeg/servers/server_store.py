@@ -616,42 +616,27 @@ class StoreController:
 
                 ts = time.time_ns()
                 for stream_id in stream_ids:
-                    if stream_id in frames:
-                        try:
-                            calib = self._calibration_dicts.get(stream_id)
-                            captures.append(save_frame(stream_id, store, frames[stream_id],
-                                                       field_id, ts, params.gis,
-                                                       calib))
-                            logger(f"[{args.service_name}:{args.controller_name}:capture] stream capture saved",
-                                extra={
-                                    "stream_id": stream_id,
-                                    "field_id": field_id,
-                                    "record_id": captures[-1].record_id,
-                                },
-                            )
-                            
-                            if captures[-1].db_record is not None:
-                                logger(f"[{args.service_name}:{args.controller_name}:capture] dispatching hooks",
-                                    extra={
-                                        "stream_id": stream_id,
-                                        "record_id": captures[-1].record_id,
-                                        "hook_chains": params.hook_urls,
-                                    },
-                                )
-                                self._hooks.dispatch(
-                                    db_record=captures[-1].db_record,
-                                    hook_chains=params.hook_urls,
-                                )
-                                logger(f"[{args.service_name}:{args.controller_name}:capture] hooks dispatched",
-                                    extra={"stream_id": stream_id, "record_id": captures[-1].record_id},
-                                )
-                        except Exception:
-                            error = traceback.format_exc()
-                            logger(f"[{args.service_name}:{args.controller_name}:capture:error] failed to save stream capture",level="error",
-                                extra={"stream_id": stream_id, "field_id": field_id},
-                            )
-                            captures.append(StreamCapture(ok=False, stream_id=stream_id, field_id=field_id,
-                                    topic=self.config.streams[stream_id], error=error))
+                    if stream_id not in frames:continue
+
+                    try:
+                        calib = self._calibration_dicts.get(stream_id)
+                        captures.append(save_frame(stream_id, store, frames[stream_id],
+                                                    field_id, ts, params.gis,
+                                                    calib))
+                        logger(f"[{args.service_name}:{args.controller_name}:capture] stream capture saved ({stream_id})",
+                            extra={
+                                "stream_id": stream_id,
+                                "field_id": field_id,
+                                "record_id": captures[-1].record_id,
+                            },
+                        )
+                    except Exception:
+                        error = traceback.format_exc()
+                        logger(f"[{args.service_name}:{args.controller_name}:capture:error] failed to save stream capture",level="error",
+                            extra={"stream_id": stream_id, "field_id": field_id},
+                        )
+                        captures.append(StreamCapture(ok=False, stream_id=stream_id, field_id=field_id,
+                                topic=self.config.streams[stream_id], error=error))
 
                 captures.sort(key=lambda x: stream_ids.index(x.stream_id))
                 ok = all(x.ok for x in captures)
@@ -669,6 +654,26 @@ class StoreController:
                         "failure_count": sum(1 for capture in captures if not capture.ok),
                     },
                 )
+
+                db_records = {x.db_record["record_id"]:x for x in captures if x.db_record is not None}
+                for capture in db_records.values():
+                    db_record = capture.db_record
+                    if db_record is not None:
+                        logger(f"[{args.service_name}:{args.controller_name}:capture] dispatching hooks ({capture.record_id})",
+                            extra={
+                                "stream_id": stream_id,
+                                "record_id": capture.record_id,
+                                "hook_chains": params.hook_urls,
+                            },
+                        )
+                        self._hooks.dispatch(
+                            db_record=db_record,
+                            hook_chains=params.hook_urls,
+                        )
+                        logger(f"[{args.service_name}:{args.controller_name}:capture] hooks dispatched",
+                            extra={"stream_id": stream_id, "record_id": capture.record_id},
+                        )
+
                 return result
             except Exception:
                 self._last_error = traceback.format_exc()

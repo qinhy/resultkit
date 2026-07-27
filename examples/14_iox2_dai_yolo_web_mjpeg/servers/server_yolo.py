@@ -433,7 +433,7 @@ class YoloDetector:
             self._model_dtype = None
 
             logger(
-                f"[{self.service_name}:{self.controller_name}:model:load] YOLO model loaded",
+                f"[{self.service_name}:{self.controller_name}:model:load] YOLO model loaded ({self._model_name_loaded})",
                 extra={
                     "model_name": self.settings.model_name,
                     "class_count": self._nc,
@@ -1363,6 +1363,14 @@ class YoloDetector:
 
 
 
+def drain_queue(queue: Queue[Any], timeout: float | None = None) -> list[Any]:
+    items = [queue.get(timeout=timeout)]
+    while True:
+        try:
+            items.append(queue.get_nowait())
+        except Empty:
+            return items
+            
 class YoloRunner:
     """Background worker that consumes StartYoloParams from a queue."""
 
@@ -1451,39 +1459,47 @@ class YoloRunner:
         )
         while not self._stop_event.is_set():
             try:
-                params = self.input_queue.get(timeout=0.2)
+                batch_params:List[StartYoloParams] = drain_queue(self.input_queue, timeout=0.1)
             except Empty:
                 continue
 
             logger(
-                f"[{self.service_name}:{self.controller_name}:runner:request] inference request dequeued",
+                f"[{self.service_name}:{self.controller_name}:runner:request] inference request dequeued"
+                f" (input_count: {sum([len(params.input_jpg_paths) for params in batch_params])})"
+                f" (queue_size: {self.input_queue.qsize()})"
+                ,
                 extra={
                     "queue_size": self.input_queue.qsize(),
-                    "input_count": len(params.input_jpg_paths),
-                    "output_count": len(params.output_json_paths),
-                    "size_mode": params.size_mode,
-                    "cuda_device": params.cuda_device,
+                    "input_count":sum([len(params.input_jpg_paths) for params in batch_params]),
+                    "output_count": sum([len(params.output_json_paths) for params in batch_params]),
+                    "size_mode": batch_params[0].size_mode,
+                    "cuda_device": batch_params[0].cuda_device,
                 },
             )
 
             try:
-                result = self.detector.detect(params)
-                if params.hook_urls and params.hook_urls[0]:
-                    logger(
-                        f"[{self.service_name}:{self.controller_name}:runner:hooks] dispatching hooks",
-                        extra={
-                            "output_json_path": result.output_json_path,
-                            "hook_chains": params.hook_urls,
-                        },
-                    )
-                    self._hooks.dispatch(
-                        db_record=params.db_record,
-                        hook_chains=params.hook_urls,
-                    )
-                    logger(
-                        f"[{self.service_name}:{self.controller_name}:runner:hooks] hooks dispatched",
-                        extra={"output_json_path": result.output_json_path},
-                    )
+                results:List[YoloDetectResult] = []
+                for params in batch_params:
+                    result = self.detector.detect(params)
+                    results.append(result)
+                    
+                for params,result in zip(batch_params,results):
+                    if params.hook_urls and params.hook_urls[0]:
+                        logger(
+                            f"[{self.service_name}:{self.controller_name}:runner:hooks] dispatching hooks",
+                            extra={
+                                "output_json_path": result.output_json_path,
+                                "hook_chains": params.hook_urls,
+                            },
+                        )
+                        self._hooks.dispatch(
+                            db_record=params.db_record,
+                            hook_chains=params.hook_urls,
+                        )
+                        logger(
+                            f"[{self.service_name}:{self.controller_name}:runner:hooks] hooks dispatched",
+                            extra={"output_json_path": result.output_json_path},
+                        )
 
                 self.last_output_json_path = result.output_json_path
                 self.exception = None
