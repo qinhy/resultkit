@@ -905,8 +905,19 @@ class TorchDnnColoredCloudBuilder:
         v = K[1, 0] * x + K[1, 1] * y + K[1, 2]
         return u, v
 
-    def build_cuda(self, disparity_cuda: Any, rgb_image: Any):
-        """Return compact CUDA points/colors and a CUDA valid-pixel count."""
+    def build_cuda(
+        self,
+        disparity_cuda: Any,
+        rgb_image: Any,
+        *,
+        return_pixel_xy: bool = False,
+    ):
+        """Return compact CUDA points/colors and a CUDA valid-pixel count.
+
+        When ``return_pixel_xy`` is true, also return the integer RGB pixel
+        coordinate ``(x, y)`` associated with every returned point/color pair.
+        The default return shape is unchanged for backward compatibility.
+        """
         if isinstance(disparity_cuda, torch.Tensor):
             disparity = disparity_cuda.to(device=self.device, non_blocking=True)
         elif hasattr(disparity_cuda, "__dlpack__"):
@@ -967,14 +978,39 @@ class TorchDnnColoredCloudBuilder:
             colors = rgb_gpu[:3, v, u].T
         if self.input_color_order == "BGR":
             colors = colors.flip(1)
-        return source_points, colors.contiguous(), valid2d.count_nonzero()
 
-    def build(self, disparity_cuda: Any, rgb_image: Any):
-        """Return compact NumPy points/colors; only final outputs leave CUDA."""
-        points_t, colors_t, valid_count_t = self.build_cuda(disparity_cuda, rgb_image)
+        source_points = source_points.contiguous()
+        colors = colors.contiguous()
+        valid_count = valid2d.count_nonzero()
+        if return_pixel_xy:
+            pixel_xy = torch.stack((u, v), dim=1).contiguous()
+            return source_points, colors, pixel_xy, valid_count
+        return source_points, colors, valid_count
+
+    def build(
+        self,
+        disparity_cuda: Any,
+        rgb_image: Any,
+        *,
+        return_pixel_xy: bool = False,
+    ):
+        """Return compact NumPy outputs; only final results leave CUDA."""
+        outputs = self.build_cuda(
+            disparity_cuda,
+            rgb_image,
+            return_pixel_xy=return_pixel_xy,
+        )
+        if return_pixel_xy:
+            points_t, colors_t, pixel_xy_t, valid_count_t = outputs
+        else:
+            points_t, colors_t, valid_count_t = outputs
+
         points = points_t.detach().cpu().numpy().astype(np.float32, copy=False)
         colors = colors_t.detach().cpu().numpy().astype(np.uint8, copy=False)
         valid_count = int(valid_count_t.item())
+        if return_pixel_xy:
+            pixel_xy = pixel_xy_t.detach().cpu().numpy().astype(np.int64, copy=False)
+            return points, colors, pixel_xy, valid_count
         return points, colors, valid_count
 
 
