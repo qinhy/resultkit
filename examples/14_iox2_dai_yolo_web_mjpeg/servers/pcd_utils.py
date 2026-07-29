@@ -298,10 +298,15 @@ class StereoRectifier:
     def __init__(self, calibration:StereoRgbCalibration, alpha=0.0, zero_disparity=True):
         self.calibration = calibration
         self.alpha, self.zero_disparity = alpha, zero_disparity
+        self.rectification: StereoRectification | None = None
+        self.image_size = None
 
     def make(self, image_size=None):
+        if self.rectification and image_size == self.image_size:
+            return self.rectification
+        
         c, cal = cv2(), self.calibration
-        size = image_size or cal.left_resolution
+        self.image_size = size = image_size or cal.left_resolution
 
         if size != cal.left_resolution:
             warnings.warn("Input size differs from calibration; intrinsics are scaled.", RuntimeWarning, stacklevel=2)
@@ -324,10 +329,11 @@ class StereoRectifier:
             )
         ]
 
-        return StereoRectification(
+        self.rectification = StereoRectification(
             size, *maps[0], *maps[1], R1, R2, P1, P2, Q,
             tuple(map(int, roi1)), tuple(map(int, roi2)),
         )
+        return self.rectification
 
     def rectify(self, left, right, rectification=None):
         c = cv2()
@@ -843,9 +849,9 @@ if __name__ == "__main__":
         calibration=calibration,
         output_path="colored_cloud.pcd",
         input_color_order="BGR",
-        num_disparities=160,
+        num_disparities=320,
         block_size=5,
-        max_depth_m=5.0,
+        max_depth_m=2.0,
         stride=1,
     )    
     pass

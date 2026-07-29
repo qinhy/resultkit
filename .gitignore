@@ -187,3 +187,4 @@ iox2redis-store.json
 /recording
 examples/14_iox2_dai_yolo_web_mjpeg/fast-foundationstereo/
 tmp/
+*.pcd
