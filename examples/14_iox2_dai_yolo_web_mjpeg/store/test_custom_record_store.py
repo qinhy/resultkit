@@ -31,9 +31,9 @@ class CustomRecordStoreTests(unittest.TestCase):
         record.add_image("cam_c", "right", img)
         record.add_disparity("cam_c", disp, {"algorithm": "sgbm"})
         record.add_calibration("cam_c", {"camera_id": "cam_c"})
-        record.add_gis("location", {"timestamp_ns": ts})
-        record.add_gis("pose", {"timestamp_ns": ts})
-        record.add_gis("coordinate_system", {"frame": "local"})
+        record.add_gnss("location", {"timestamp_ns": ts})
+        record.add_gnss("pose", {"timestamp_ns": ts})
+        record.add_gnss("coordinate_system", {"frame": "local"})
         issues = record.close(validate=True)
         self.assertEqual(issues, [])
 

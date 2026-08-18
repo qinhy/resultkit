@@ -58,7 +58,7 @@ record.add_calibration(
     },
 )
 
-record.add_gis(
+record.add_gnss(
     "location",
     {
         "timestamp_ns": TIMESTAMP_NS,
@@ -70,7 +70,7 @@ record.add_gis(
     },
 )
 
-record.add_gis(
+record.add_gnss(
     "pose",
     {
         "timestamp_ns": TIMESTAMP_NS,
@@ -81,7 +81,7 @@ record.add_gis(
     },
 )
 
-record.add_gis(
+record.add_gnss(
     "coordinate_system",
     {
         "frame": "local",

@@ -92,7 +92,7 @@ class StreamsParams(StoreModel):
 
 class CaptureParams(StreamsParams):
     field_id: str = "field_all"
-    gis: Any | None = None
+    gnss: Any | None = None
     capture_timeout_s: float | None = None
     fresh_frame: bool = True
     # hook_urls:list[list[str]] = [[]]
@@ -293,23 +293,23 @@ def write_json(path: Path, payload: Any) -> None:
     logger(f"[{args.service_name}:{args.controller_name}:write_json] wrote JSON file", extra={"path": path.as_posix()})
 
 
-def add_gis(record: Any, gis: Any | None) -> None:
-    if gis is None:
+def add_gnss(record: Any, gnss: Any | None) -> None:
+    if gnss is None:
         return
-    logger(f"[{args.service_name}:{args.controller_name}:add_gis] saving GIS data",
-        extra={"record_id": getattr(record, "record_id", None), "mapping": isinstance(gis, Mapping)},
+    logger(f"[{args.service_name}:{args.controller_name}:add_gnss] saving GIS data",
+        extra={"record_id": getattr(record, "record_id", None), "mapping": isinstance(gnss, Mapping)},
     )
-    if isinstance(gis, Mapping):
+    if isinstance(gnss, Mapping):
         for kind in ("location", "pose", "coordinate_system", "geofences", "map_notes"):
-            if kind in gis:
-                record.add_gis(kind, gis[kind])
-        write_json(record.path / "gis" / "request.json", gis)
+            if kind in gnss:
+                record.add_gnss(kind, gnss[kind])
+        write_json(record.path / "gnss" / "request.json", gnss)
     else:
-        write_json(record.path / "gis" / "request.json", {"value": gis})
+        write_json(record.path / "gnss" / "request.json", {"value": gnss})
 
 
 def save_frame(cam_name:str, store: CustomStore, frame: Frame, field_id: str,
-               ts, gis: Any | None, calib: Any | None) -> StreamCapture:    
+               ts, gnss: Any | None, calib: Any | None) -> StreamCapture:    
     # ts = time.time_ns()
     logger(f"[{args.service_name}:{args.controller_name}:save_frame] saving frame",
         extra={
@@ -338,7 +338,7 @@ def save_frame(cam_name:str, store: CustomStore, frame: Frame, field_id: str,
         },
     )
 
-    add_gis(record, gis)
+    add_gnss(record, gnss)
     images = []
     for name, data in (("rgb", frame.bundle.rgb), ("left", frame.bundle.left), ("right", frame.bundle.right)):
         record.add_image(cam_name, name, data)
@@ -426,7 +426,7 @@ class StoreController:
         return {
             **openapi_doc("store_status", id=1, params={}),
             **openapi_doc("store_watch", id=2, params={"stream_ids": STREAM_IDS}),
-            **openapi_doc("store_capture", id=3, params={"stream_ids": STREAM_IDS, "field_id": "field_all", "gis": None}),
+            **openapi_doc("store_capture", id=3, params={"stream_ids": STREAM_IDS, "field_id": "field_all", "gnss": None}),
         }
 
     def _check(self, stream_ids: list[str]) -> list[str]:
@@ -621,7 +621,7 @@ class StoreController:
                     try:
                         calib = self._calibration_dicts.get(stream_id)
                         captures.append(save_frame(stream_id, store, frames[stream_id],
-                                                    field_id, ts, params.gis,
+                                                    field_id, ts, params.gnss,
                                                     calib))
                         logger(f"[{args.service_name}:{args.controller_name}:capture] stream capture saved ({stream_id})",
                             extra={

@@ -82,18 +82,18 @@ REQUIRED_FILES: dict[str, tuple[str, ...]] = {
         f"calib/{DUAL_RGB_CAM_NAME_0}.json",
         f"calib/{DUAL_RGB_CAM_NAME_1}.json",
         "calib/extrinsics.json",
-        "gis/location.json",
-        "gis/pose.json",
-        "gis/coordinate_system.json",
+        "gnss/location.json",
+        "gnss/pose.json",
+        "gnss/coordinate_system.json",
         f"imgs/{DUAL_RGB_CAM_NAME_0}/rgb.jpg",
         f"imgs/{DUAL_RGB_CAM_NAME_1}/rgb.jpg",
     ),
     "rgb_stereo": (
         "record.json",
         f"calib/{RGB_STEREO_CAM_NAME}.json",
-        "gis/location.json",
-        "gis/pose.json",
-        "gis/coordinate_system.json",
+        "gnss/location.json",
+        "gnss/pose.json",
+        "gnss/coordinate_system.json",
         f"imgs/{RGB_STEREO_CAM_NAME}/rgb.jpg",
         f"imgs/{RGB_STEREO_CAM_NAME}/left.jpg",
         f"imgs/{RGB_STEREO_CAM_NAME}/right.jpg",
@@ -426,6 +426,34 @@ def _with_schema(data: Mapping[str, Any] | dict[str, Any]) -> dict[str, Any]:
     result.setdefault("schema_version", SCHEMA_VERSION)
     return result
 
+class CameraRecord(BaseModel):
+    cam_name:str="cam_a"
+    rgb_image_name:str="rgb.jpg"
+    left_image_name:str="left.jpg"
+    right_image_name:str="right.jpg"
+
+    def cam_path(self) -> Path:
+        return self.cam_name    
+    def rgb_path(self) -> Path:
+        return self.cam_name / self.rgb_image_name
+    def left_path(self) -> Path:
+        return self.cam_name / self.left_image_name
+    def right_path(self) -> Path:
+        return self.cam_name / self.right_image_name
+
+class YoloRecord(BaseModel):
+    cam:CameraRecord
+    def rgb_path(self) -> Path:
+        return self.cam.rgb_image_name.replace("jpg","json")
+
+class PCDRecord(BaseModel):
+    cam:CameraRecord
+    def pcd_path(self) -> Path:
+        pass
+        # return self.cam.rgb_image_name.replace("jpg","json")
+
+class GnssRecord(BaseModel):
+    pass
 
 class CustomRecord(BaseModel):
     """One synchronized single-frame capture record."""
@@ -547,8 +575,20 @@ class CustomRecord(BaseModel):
         return self.path / "pcd"
     
     @property
+    def yolo_path(self) -> Path:
+        return self.path / "yolo"
+
+    @property
+    def gnss_path(self) -> Path:
+        return self.path / "gnss"
+    
+    @property
+    def listup_cam_paths(self) -> List[Path]:
+        return [p for p in self.image_path.iterdir() if p.is_dir()]
+        
+    @property
     def listup_rgb_image_paths(self) -> List[Path]:
-        return list(self.image_path.rglob(f"rgb{CAMERA_IMAGE_EXTENSION}"))
+        return [i/f"rgb{CAMERA_IMAGE_EXTENSION}" for i in self.listup_cam_paths]
     
     @property
     def listup_rgb_image_parent_paths(self) -> List[Path]:
@@ -556,7 +596,7 @@ class CustomRecord(BaseModel):
     
     @property
     def listup_left_image_paths(self) -> List[Path]:
-        return list(self.image_path.rglob(f"left{CAMERA_IMAGE_EXTENSION}"))
+        return [i/f"left{CAMERA_IMAGE_EXTENSION}" for i in self.listup_cam_paths]
     
     @property
     def listup_left_image_parent_paths(self) -> List[Path]:
@@ -564,7 +604,11 @@ class CustomRecord(BaseModel):
     
     @property
     def listup_right_image_paths(self) -> List[Path]:
-        return list(self.image_path.rglob(f"right{CAMERA_IMAGE_EXTENSION}"))
+        return [i/f"right{CAMERA_IMAGE_EXTENSION}" for i in self.listup_cam_paths]
+    
+    @property
+    def expect_yolo_rgb_paths(self) -> Path | None:
+        return [self.yolo_path/ i.name /f"rgb.json" for i in self.listup_cam_paths]
     
     @property
     def is_stereo(self) -> bool:
@@ -573,37 +617,39 @@ class CustomRecord(BaseModel):
     @property
     def expect_disparity_path(self) -> Path | None:
         if self.is_stereo:
-            return self.path / "depth" / f"{RGB_STEREO_CAM_NAME}" / "disparity.png"
+            return self.depth_path / f"{RGB_STEREO_CAM_NAME}" / "disparity.png"
         else:
             return None
         
     @property
     def expect_disparity_json_path(self) -> Path | None:
         if self.is_stereo:
-            return self.path / "depth" / f"{RGB_STEREO_CAM_NAME}" / "disparity.json"
+            return self.depth_path / f"{RGB_STEREO_CAM_NAME}" / "disparity.json"
         else:
             return None
         
     @property
     def expect_stereo_calib(self) -> Path | None:
         if self.is_stereo:
-            return self.path / "calib" / f"{RGB_STEREO_CAM_NAME}.json"
+            return self.calib_path / f"{RGB_STEREO_CAM_NAME}.json"
         else:
             return None
+        
     @property
     def expect_pcd_path(self) -> Path | None:
         if self.is_stereo:
-            return self.path / "pcd" / f"{RGB_STEREO_CAM_NAME}.pcd"
+            return self.pcd_path / f"{RGB_STEREO_CAM_NAME}.pcd"
         else:
             return None
     
     @property
     def expect_pcd_seg_dir(self) -> Path | None:
         if self.is_stereo:
-            return self.path / "pcd" / f"{RGB_STEREO_CAM_NAME}_segs"
+            return self.pcd_path / f"{RGB_STEREO_CAM_NAME}_segs"
         else:
             return None
 
+        
     def mkdirs(self) -> None:
         """Create the leaf record directory."""
         self.path.mkdir(parents=True, exist_ok=True)
@@ -622,12 +668,12 @@ class CustomRecord(BaseModel):
         """Write calib/extrinsics.json."""
         _write_json(self.path / "calib" / "extrinsics.json", _with_schema(data))
 
-    def add_gis(self, kind: GISKind, data: Any) -> None:
+    def add_gnss(self, kind: GISKind, data: Any) -> None:
         """Write one GIS file using the canonical extension mapping."""
         if kind not in GIS_EXTENSIONS:
             raise ValueError(f"Unsupported GIS kind: {kind!r}")
         suffix = GIS_EXTENSIONS[kind]
-        out = self.path / "gis" / f"{kind}{suffix}"
+        out = self.path / "gnss" / f"{kind}{suffix}"
         if isinstance(data, Mapping):
             data = _with_schema(data)
         _write_json(out, data)
@@ -637,7 +683,7 @@ class CustomRecord(BaseModel):
         if stream not in {"rgb", "left", "right"}:
             raise ValueError(f"Unsupported image stream: {stream!r}")
         _write_mjpeg_frame(
-            self.path / "imgs" / camera_id / f"{stream}{CAMERA_IMAGE_EXTENSION}",
+            self.image_path / camera_id / f"{stream}{CAMERA_IMAGE_EXTENSION}",
             image,
         )
     
@@ -657,7 +703,7 @@ class CustomRecord(BaseModel):
         if not stream:
             raise ValueError("stream must not be empty")
 
-        source_image = self.path / "imgs" / camera_id / f"{stream}{CAMERA_IMAGE_EXTENSION}"
+        source_image = self.image_path / camera_id / f"{stream}{CAMERA_IMAGE_EXTENSION}"
         payload = {
             "schema_version": SCHEMA_VERSION,
             "timestamp_ns": self.timestamp_ns_utc,
@@ -667,11 +713,11 @@ class CustomRecord(BaseModel):
             "model": model_info,
             "detections": detections,
         }
-        _write_json(self.path / "yolo" / camera_id / f"{stream}.json", payload)
+        _write_json(self.yolo_path / camera_id / f"{stream}.json", payload)
 
         if overlay_image is not None:
             _write_mjpeg_frame(
-                self.path / "yolo" / camera_id / f"{stream}_overlay{CAMERA_IMAGE_EXTENSION}",
+                self.yolo_path / camera_id / f"{stream}_overlay{CAMERA_IMAGE_EXTENSION}",
                 overlay_image,
             )
 
@@ -925,7 +971,7 @@ class CustomRecord(BaseModel):
 
         return {
             "calibration": glob("calib/*.json"),
-            "gis": glob("gis/*.json") + glob("gis/*.geojson"),
+            "gnss": glob("gnss/*.json") + glob("gnss/*.geojson"),
             "images": glob_many("imgs/*/*.jpg", "imgs/*/*.jpeg"),
             "yolo": glob("yolo/*/*.json"),
             "yolo_overlays": glob_many("yolo/*/*_overlay.jpg", "yolo/*/*_overlay.jpeg"),
