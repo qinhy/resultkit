@@ -85,6 +85,7 @@ class StartYoloParams(YoloBaseModel):
     input_jpg_paths: List[str] = [] # field(default_factory=list)
     output_json_paths: List[str] = [] # field(default_factory=list)
 
+    input_jpg_blindmask_paths: List[str] = [] # field(default_factory=list)
     hook_urls:list[list[str]] = [[]]
 
     
@@ -214,6 +215,8 @@ class YoloDetectResult(BaseModel):
     tile_size: int | None = None
     tile_overlap: int | None = None
     tile_count: int | None = None
+    blindmask_jpg_path: str | None = None
+
 
     def model_post_init(self, context: Any) -> None:
         if self.num_detections is None:
@@ -478,12 +481,18 @@ class YoloDetector:
     def detect(self, params: StartYoloParams) -> YoloDetectResult:
         input_count = len(params.input_jpg_paths)
         output_count = len(params.output_json_paths)
+        blindmask_count = len(params.input_jpg_blindmask_paths)
 
         if input_count == 0:
             raise ValueError("At least one input JPEG path is required")
         if input_count != output_count:
             raise ValueError(
                 "input_jpg_paths and output_json_paths must have equal lengths: "
+                f"{input_count} != {output_count}"
+            )
+        if blindmask_count>0 and (input_count != blindmask_count):
+            raise ValueError(
+                "input_jpg_paths and input_jpg_blindmask_paths must have equal lengths: "
                 f"{input_count} != {output_count}"
             )
 
@@ -508,10 +517,20 @@ class YoloDetector:
         device = self._device(params.cuda_device)
         self._prepare_model(device)
 
-        for image_path_value, output_json_path_value in zip(
-            params.input_jpg_paths,
-            params.output_json_paths,
-        ):
+        if blindmask_count==0:
+            group = zip(
+                params.input_jpg_paths,
+                params.output_json_paths,
+                [None for i in params.input_jpg_paths],
+            )
+        else:
+            group = zip(
+                params.input_jpg_paths,
+                params.output_json_paths,
+                params.input_jpg_blindmask_paths,
+            )
+
+        for image_path_value, output_json_path_value, blindmask_path_value in group:
             image_path = Path(image_path_value)
             output_json_path = Path(output_json_path_value)
 
@@ -539,16 +558,19 @@ class YoloDetector:
                 image_payload = self._detect_tiled(
                     image_path,
                     params.cuda_device,
+                    blindmask_path=blindmask_path_value,
                 )
             else:
                 image_payload = self._detect_resized(
                     image_path,
                     params.cuda_device,
+                    blindmask_path=blindmask_path_value,
                 )
 
             result = YoloDetectResult(
                 input_jpg_path=str(image_path),
                 output_json_path=str(output_json_path),
+                blindmask_jpg_path=blindmask_path_value,
                 size_mode=params.size_mode,
                 cuda_device=params.cuda_device,
                 yolo_config=self.settings,
@@ -578,7 +600,9 @@ class YoloDetector:
         # assert result is not None
         seconds_per_imag = elapsed/processed_count if processed_count else 0
         logger(
-            f"[{self.service_name}:{self.controller_name}:detect] inference request completed ({seconds_per_imag:.2f} sec/item)",
+            f"[{self.service_name}:{self.controller_name}:detect] "
+            f"inference {input_count} item completed ({seconds_per_imag:.2f} sec/item)"
+            ,
             extra={
                 "processed_count": processed_count,
                 "last_output_json_path": result.output_json_path,
@@ -864,9 +888,13 @@ class YoloDetector:
         self,
         image_path: Path,
         cuda_device: int,
+        blindmask_path: Path = None,
     ) -> dict[str, Any]:
         device = self._device(cuda_device)
         image = self._decode_jpeg(image_path, device)
+        if blindmask_path:
+            blindmask = self._decode_jpeg(blindmask_path, device)
+            image = image * (blindmask>0)
 
         height = int(image.shape[-2])
         width = int(image.shape[-1])
@@ -890,9 +918,13 @@ class YoloDetector:
         self,
         image_path: Path,
         cuda_device: int,
+        blindmask_path: Path = None,
     ) -> dict[str, Any]:
         device = self._device(cuda_device)
         image = self._decode_jpeg(image_path, device)
+        if blindmask_path:
+            blindmask = self._decode_jpeg(blindmask_path, device)
+            image = image * (blindmask>0)
 
         height = int(image.shape[-2])
         width = int(image.shape[-1])

@@ -118,9 +118,6 @@ def split_cloud(
     if not valid.all():
         points_left, colors_rgb, x, y = points_left[valid], colors_rgb[valid], x[valid], y[valid]
 
-    if save_full_cloud:
-        save_point_cloud(output_dir / "full_cloud.pcd", points_left, colors_rgb, binary_pcd=binary_pcd)
-
     detections = list(enumerate(detections_json.get("detections", [])))
     if exclusive:
         detections.sort(key=lambda item: float(item[1].get("confidence", 0)), reverse=True)
@@ -154,6 +151,9 @@ def split_cloud(
             "confidence": confidence, "point_count": count, "pcd": filename,
         })
         print(f"saved {output_dir / filename} ({count} points)")
+
+    if save_full_cloud:
+        save_point_cloud(output_dir / "full.pcd", points_left, colors_rgb, binary_pcd=binary_pcd)
 
     if save_background:
         background = ~(claimed if exclusive else union)

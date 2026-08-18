@@ -17,7 +17,6 @@ from common import *
 from common import HookDispatcher
 from iox2_jsonrpc import EmptyParams, RpcModel
 from store.custom_record_store import CustomRecord
-from server_yolo import YoloDetectResult
 from pcd_yolo_utils import split_cloud
 from resultkit.logger import logger
 
@@ -46,16 +45,14 @@ from pcd_utils import (  # noqa: E402
     rgb8,
     rgb_depth_to_points_rgb,
     save_point_cloud,
-    stereo_rgb_to_colored_point_cloud,
     transform_points,
 )
 
 try:  # noqa: E402
-    from pcd_dnn_utils import FastFoundationStereoDisparity, stereo_rgb_to_colored_point_cloud_dnn
+    from pcd_dnn_utils import FastFoundationStereoDisparity
     _DNN_IMPORT_ERROR: ImportError | None = None
 except ImportError as exc:  # noqa: E402
-    FastFoundationStereoDisparity = Any  # type: ignore[misc,assignment]
-    stereo_rgb_to_colored_point_cloud_dnn = None  # type: ignore[assignment]
+    FastFoundationStereoDisparity = Any  # type: ignore[misc,assignment]  
     _DNN_IMPORT_ERROR = exc
 
 logger(
@@ -414,6 +411,8 @@ class ToPcdParams(BackendOverrides):
 
     @staticmethod
     def from_db_record(db_record: CustomRecord) -> list[ToPcdParams]:
+        if isinstance(db_record,dict):
+            db_record = CustomRecord.model_validate(db_record)
         if db_record.is_empty():return []
         img_ext = db_record.listup_left_image_paths[0].suffix
 
@@ -530,10 +529,10 @@ class ToYoloSegmentsParams(BackendOverrides):
 class ToDetectSegmentsResult(DepthBaseModel):
     backend: DepthBackend
     output_dir: str
-    frame_name: str
-    output_frame: SegmentOutputFrame
-    point_count: int
-    segment_count: int
+    frame_name: str = "left"
+    output_frame: SegmentOutputFrame = "left"
+    point_count: int = -1
+    segment_count: int = -1
     instance_map_path: str | None = None
     depth_rgb_path: str | None = None
     combined_npz_path: str | None = None
@@ -849,7 +848,7 @@ class PcdRunner:
         block_size: int,
         max_depth_m: float | None,
         splat_px: int,
-    ) -> tuple[np.ndarray, np.ndarray, Any]:
+    ):
         logger(
             f"[{LOG_SERVICE}:{LOG_CONTROLLER}:depth:compute] computing RGB-aligned depth",
             extra={
@@ -1546,8 +1545,9 @@ class PcdRunner:
         left_image = _read_image_or_npy(params.left_path, color=False)
         right_image = _read_image_or_npy(params.right_path, color=False)
         rgb_image = _read_image_or_npy(params.rgb_path, color=True)
-
-        yolo_result:YoloDetectResult = _read_detect_result(params.yolo_result_path)
+        
+        detections = json.loads(Path(params.rgb_path.replace("imgs","yolo").replace("rgb.jpg","rgb.json")
+                                     ).read_text(encoding="utf-8"))
         points_left, colors_rgb, pixel_xy, depth_rgb_m, disparity, rect = self._compute_rgb_aligned_depth(
             left_image=left_image,
             right_image=right_image,
@@ -1568,14 +1568,14 @@ class PcdRunner:
             points_left,
             colors_rgb,
             pixel_xy,
-            yolo_result,
+            detections,
             output_dir,
             min_points=1,
             erode_pixels=0,
             exclusive=False,
-            save_background=True,
+            save_background=False,
             save_full_cloud=True,
-            binary_pcd=False,
+            binary_pcd=True,
         )
         self._last_yolo_segments = manifest
 
@@ -1596,7 +1596,7 @@ class PcdRunner:
         #     combined_npz_path = str(path)
 
         ros2_result = None
-        if params.ros2_publish:
+        if False: # params.ros2_publish:
             ros2_result = self._publish_segments_ros2(
                 result,
                 Ros2PublishParams(
@@ -1609,17 +1609,17 @@ class PcdRunner:
                 ),
             )
 
-        depth_min_m, depth_max_m, depth_mean_m = _depth_statistics(result.points_m)
-        disparity_height, disparity_width = (None, None) if result.disparity is None else result.disparity.shape[:2]
+        depth_min_m, depth_max_m, depth_mean_m = _depth_statistics(points_left)
+        disparity_height, disparity_width = (None, None) if disparity is None else disparity.shape[:2]
 
         return ToDetectSegmentsResult(
             backend=backend.backend,
-            yolo_model_path=yolo_result.yolo_config.model_name,
+            # yolo_model_path=detections.yolo_config.model_name,
             output_dir=str(output_dir),
             frame_name=params.frame_name,
-            output_frame=result.output_frame,
-            point_count=int(len(result.points_m)),
-            segment_count=int(len(result.segments)),
+            # output_frame=result.output_frame,
+            point_count=int(len(points_left)),
+            # segment_count=int(len(result.segments)),
             # instance_map_path=instance_map_path,
             # depth_rgb_path=depth_rgb_path,
             # combined_npz_path=combined_npz_path,
@@ -1629,7 +1629,7 @@ class PcdRunner:
             depth_max_m=depth_max_m,
             depth_mean_m=depth_mean_m,
             ros2=ros2_result,
-            segments=_result_segments_to_summary(result.segments),
+            # segments=_result_segments_to_summary(result.segments),
         )
 
     def detect_segments_to_pcd(self, params: ToYoloSegmentsParams) -> ToDetectSegmentsResult:
@@ -1658,9 +1658,9 @@ class PcdRunner:
                 },
             )
             return result
-        except Exception:
+        except Exception as e:
             logger(
-                f"[{LOG_SERVICE}:{LOG_CONTROLLER}:segments:convert:error] segment conversion failed",level="error",
+                f"[{LOG_SERVICE}:{LOG_CONTROLLER}:segments:convert:error] segment conversion failed, {e}",level="error",
                 extra={
                     "output_dir": params.output_dir,
                     "frame_name": params.frame_name,
@@ -1732,6 +1732,7 @@ class DepthController:
         return self.runner.backend(params)
 
     def to_pcd(self, params: ToPcdParams) -> PcdAsyncResult:
+        has_db_record = bool(params.db_record)
         logger(
             f"[{self.service_name}:{self.controller_name}:to_pcd] conversion requested",
             extra={
@@ -1739,11 +1740,15 @@ class DepthController:
                 "left_path": params.left_path,
                 "right_path": params.right_path,
                 "rgb_path": params.rgb_path,
-                "has_db_record": bool(params.db_record),
+                "has_db_record": has_db_record,
             },
         )
         try:
-            db_record = CustomRecord(**params.db_record)
+            if has_db_record:
+                db_record = CustomRecord(**params.db_record)
+            else:
+                db_record = CustomRecord.empty()
+                
             if db_record.is_empty():
                 return self.runner.submit_to_pcd(params)
 
@@ -1762,9 +1767,9 @@ class DepthController:
             for conversion_params in derived_params:
                 result = self.runner.submit_to_pcd(conversion_params)
             return result
-        except Exception:
+        except Exception as e:
             logger(
-                f"[{self.service_name}:{self.controller_name}:to_pcd:error] conversion request failed",level="error",
+                f"[{self.service_name}:{self.controller_name}:to_pcd:error] conversion request failed, {e}",level="error",
                 extra={"output_path": params.output_pcd_path},
             )
             raise
