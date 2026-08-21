@@ -549,8 +549,6 @@ __all__ = [
     "build_segment_ros_messages",
 ]
 
-
-if __name__ == "__main__":
     # It supports:
     # PointCloud2:
     #   x, y, z

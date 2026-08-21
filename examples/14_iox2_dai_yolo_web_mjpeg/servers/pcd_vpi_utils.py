@@ -1269,6 +1269,3 @@ def parse_args() -> argparse.Namespace:
         parser.error("--decode-runs, --remap-runs, --runs, and --cloud-runs must be >= 1")
     return args
 
-
-if __name__ == "__main__":
-    run(parse_args())
