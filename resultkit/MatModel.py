@@ -181,13 +181,8 @@ class Model4Mat:
     
         @staticmethod
         def get_mat_ops(lib: Union[str, MatLib]) -> MatOps:
-            mat_lib = MatLib(lib)
-            if mat_lib == MatLib.NUMPY:
-                return NumpyMatOps()
-            if mat_lib == MatLib.TORCH:
-                return TorchMatOps()
-            raise ValueError(f"Unsupported matrix library: {lib}")
-
+            return MatLib.which(lib)
+        
     class MatPubSub(Mat):
         lib: str = "iceoryx2"
         dtype: DataType = DataType.FLOAT32
