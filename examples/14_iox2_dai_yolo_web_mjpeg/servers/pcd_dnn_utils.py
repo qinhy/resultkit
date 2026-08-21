@@ -778,6 +778,7 @@ class TorchDnnColoredCloudBuilder:
         device: DeviceLike = "cuda",
         rgb_layout: ImageLayout = "HWC",
         min_disparity: float = 0.5,
+        min_depth_m: float | None = 0.01,
         max_depth_m: float | None = 5.0,
         stride: int = 1,
         output_frame: Literal["left", "left_rectified"] = "left",
@@ -798,6 +799,7 @@ class TorchDnnColoredCloudBuilder:
 
         self.device = torch.device(device)
         self.min_disparity = float(min_disparity)
+        self.min_depth_m = min_depth_m
         self.max_depth_m = max_depth_m
         self.stride = int(stride)
         self.output_frame = output_frame
@@ -952,6 +954,8 @@ class TorchDnnColoredCloudBuilder:
         points_rect = torch.stack((X, Y, Z), dim=1)
 
         keep = torch.isfinite(points_rect).all(dim=1) & (Z > 0)
+        if self.min_depth_m is not None:
+            keep &= Z >= float(self.min_depth_m)
         if self.max_depth_m is not None:
             keep &= Z <= float(self.max_depth_m)
         points_rect = points_rect[keep]
@@ -1025,6 +1029,7 @@ class FastFoundationStereoTorchPipeline:
         alpha: float = 0.0,
         model_scale: float = 1.0,
         min_disparity: float = 0.5,
+        min_depth_m: float | None = 0.01,
         max_depth_m: float | None = 5.0,
         stride: int = 1,
         output_frame: Literal["left", "left_rectified"] = "left",
@@ -1039,6 +1044,7 @@ class FastFoundationStereoTorchPipeline:
         self.alpha = float(alpha)
         self.model_scale = float(model_scale)
         self.min_disparity = float(min_disparity)
+        self.min_depth_m = min_depth_m
         self.max_depth_m = max_depth_m
         self.stride = int(stride)
         self.output_frame = output_frame
@@ -1084,6 +1090,7 @@ class FastFoundationStereoTorchPipeline:
             device=self.device,
             rgb_layout=rgb_layout,
             min_disparity=self.min_disparity,
+            min_depth_m=self.min_depth_m,
             max_depth_m=self.max_depth_m,
             stride=self.stride,
             output_frame=self.output_frame,
@@ -1261,34 +1268,3 @@ if __name__ == "__main__":
     #     input_color_order="BGR", model_scale=0.5, splat_px=1, output_frame="left", max_depth_m=2.0,
     # )
     
-    root = "recording/rgb_stereo/2026-07-22/field_all/111737.603022000JST/"
-    left = root+"imgs/rgbd_left/left.jpg"
-    right = root+"imgs/rgbd_left/right.jpg"
-    rgb = root+"imgs/rgbd_left/rgb.jpg"
-    with open(root+"calib/rgbd_left.json") as f:
-        calibration = StereoRgbCalibration.from_dict(json.load(f))
-
-    predictor = FastFoundationStereoDisparity(
-        repo_dir="./examples/14_iox2_dai_yolo_web_mjpeg/fast-foundationstereo",
-        model_path="weights/23-36-37/model_best_bp2_serialize.pth",
-        device="cuda:0",
-        valid_iters=8,
-        max_disp=320,
-    )
-
-    pipeline = FastFoundationStereoTorchPipeline(
-        calibration,
-        predictor,
-        model_scale=0.5,
-        max_depth_m=5.0,
-        stride=1,
-    )
-
-    # cloud = pipeline.process(left,right,rgb,
-    #     output_path="colored_cloud_torch.pcd",
-    #     download_disparity=False,
-    # )
-    cloud = pipeline.process_jpegs(left,right,rgb,
-        output_path="colored_cloud_torch.pcd",
-        download_disparity=False,
-    )

@@ -7,14 +7,15 @@ import io
 import json
 import logging
 import threading
-from typing import Any
+from typing import Any, Dict, List
 
 from PIL import Image
 import cv2
-from fastapi import Query
-from fastapi.responses import StreamingResponse
+from fastapi import APIRouter, HTTPException, Query
+from fastapi.responses import FileResponse, StreamingResponse
 import numpy as np
 from pydantic import BaseModel
+import requests
 
 from webapi import create_auto_discover_fastapi_app
 
@@ -22,6 +23,9 @@ import os
 import sys
 from pathlib import Path
 sys.path.append(os.path.dirname(os.path.dirname(Path(__file__).absolute().parent)))
+
+from store.custom_record_store import CustomRecord,YoloRecord
+
 from resultkit.MatModel import ColorFormat, ImageShapeType, Model4Mat
 from resultkit.mat import DataType
 
@@ -212,20 +216,73 @@ async def stream_res(
     )
 
 
+def call_localhost(controller: str, method: str, params: dict = None) -> dict | None:
+    if params is None:
+        params = {}
+    url = f"http://localhost:8000/controllers/{controller}/{method}"
+    try:
+        response = requests.post(url, json=params)
+        response.raise_for_status()
+        return response.json()
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Request failed: {e}")
+        if hasattr(e, 'response') and e.response is not None:
+            logging.error(f"Response body: {e.response.text}")
+        return None
+    
+
+def last_capture_record()->CustomRecord:
+    store_status = call_localhost("store","status")
+    res = store_status["last_capture"]["captures"][-1]["db_record"]
+    return CustomRecord(**res)
+
+
+def last_ai_records()->List[Dict]:
+    store_status = call_localhost("store","status")
+    res = store_status["last_capture"]["captures"][-1]["db_record"]
+    res = CustomRecord(**res)
+    res = [r.model_dump() for r in res.get_yolo_list()]
+    return res
+
+
+def get_debug_file(path: str):
+    file_path = Path(path)
+    if not file_path.is_file():
+        raise HTTPException(
+            status_code=404,
+            detail=f"File not found: {file_path}",
+        )
+    return FileResponse(file_path)
+
+
+def yolo_debug():
+    return FileResponse(
+        "yolo_debug.html",
+        media_type="text/html",
+    )
+
+
 def run_api(host: str, port: int, reload: bool = False) -> None:
     """Run the auto-discovery FastAPI gateway."""
 
     # Import here so existing non-HTTP modes work without uvicorn installed.
     import uvicorn
     app = create_fastapi_app()
-    app.add_api_route(
-        "/imgstream/{stream_type}/{stream_name}",
-        stream_res,
-        methods=["GET"],
-        name="imgstream",
-        tags=["image"],
-    )
+    app.add_api_route("/imgstream/{stream_type}/{stream_name}",
+        stream_res, methods=["GET"], name="imgstream", tags=["image"],)
 
+    app.add_api_route("/debug/last_capture_record",
+        last_capture_record,methods=["GET"], name="debug", tags=["debug"],)
+    
+    app.add_api_route("/debug/last_ai_records",
+        last_ai_records,methods=["GET"], name="debug", tags=["debug"],)
+
+    app.add_api_route("/debug/get_debug_file",
+        get_debug_file, methods=["GET"], name="debug", tags=["debug"])
+    
+    app.add_api_route("/debug/yolo",
+        yolo_debug,methods=["GET"],tags=["debug"],)
+    
     uvicorn.run(
         app=app,
         factory=reload,

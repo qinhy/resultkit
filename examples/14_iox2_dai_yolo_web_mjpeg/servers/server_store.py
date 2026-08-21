@@ -24,7 +24,7 @@ from typing import Any, Mapping
 import numpy as np
 import requests
 
-from common import EmptyParams, HookDispatcher, RpcModel, openapi_doc, CustomStore
+from common import EmptyParams, HookDispatcher, RpcModel, openapi_doc, CustomStore, RecordPath
 from resultkit.MatModel import CodecFormat, ColorFormat, Model4Mat
 from server_rgb_stereo import BUNDLE_MAGIC, BUNDLE_VERSION, BUNDLE_FORMAT, BUNDLE_HEADER, BUNDLE_PREFIX, BUNDLE_TYPE
 # from store.custom_record_store import RGB_STEREO_CAM_NAME
@@ -287,7 +287,7 @@ def unpack(pkt: Any) -> Bundle:
     return Bundle(int(frame_index), int(pts_ns), payload[rgb_start:left_start], payload[left_start:right_start], payload[right_start:end])
 
 
-def write_json(path: Path, payload: Any) -> None:
+def write_json(path: RecordPath, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, sort_keys=False) + "\n", encoding="utf-8")
     logger(f"[{args.service_name}:{args.controller_name}:write_json] wrote JSON file", extra={"path": path.as_posix()})

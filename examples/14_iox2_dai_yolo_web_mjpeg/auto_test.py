@@ -1,6 +1,16 @@
 import logging
+import os
+from pathlib import Path
+import sys
 import time
 import requests
+
+
+EXAMPLE_DIR = Path(__file__).absolute().parent/"servers"
+if EXAMPLE_DIR not in sys.path:
+    sys.path.append(str(EXAMPLE_DIR))
+from servers.server_pcd import ToPcdParams, ToYoloSegmentsParams
+from store.custom_record_store import CustomRecord, jst_datetime_to_time_ns
 # from iox2redis import redis_for
 
 API_URL = "http://127.0.0.1:8000"
@@ -57,7 +67,7 @@ def store_capture(sts=[
         "service": "jrpc",
         "stream_ids": sts,
         "field_id": "field_all",
-        "gis": None,
+        "gnss": None,
         "capture_timeout_s": None,
         "fresh_frame": True,
         "hook_urls": [[]]
@@ -68,11 +78,29 @@ def store_capture(sts=[
         )
     if to_pcd:        
         params["hook_urls"][0].append(
-            "http://localhost:8000/controllers/pcd/to_pcd"
+            # "http://localhost:8000/controllers/pcd/to_pcd"
+            "http://localhost:8000/controllers/pcd/detect_segments_to_pcd"
         )
     store_capture = call_method("store", "capture", params)
     logging.info(store_capture)
 
+def yolo_start(params=
+  {"db_record": {
+    "root_path": ".",
+    "mode": "dual_rgb",
+    "field_id": "null",
+    "record_id": "000000.000000000JST",
+    "timestamp_ns_utc": 0,
+    "date_utc": "1970-01-01",
+    "path": "dual_rgb/1970-01-01/null/000000.000000000JST",
+    "datetime_utc": "1970-01-01T00:00:00.000000000Z"
+  }}):
+    res = call_method("yolo", "start", params)
+    logging.info(res)
+
+def yolo_set_model(params={"model_name": "weed_yolo_seg_1280.pt",}):
+    res = call_method("yolo", "set_model", params)
+    logging.info(res)
 
 def set_dnn_pcd():
     logging.info(call_method("pcd", "set_backend",{
@@ -99,6 +127,15 @@ def set_sgbm_pcd():
         "stereo_input_color_order": "RGB",
         "remove_invisible": True
     }))
+
+def pcd_to_pcd(params):
+    res = call_method("pcd", "to_pcd", params)
+    logging.info(res)
+
+def pcd_detect_segments_to_pcd(params):
+    res = call_method("pcd", "detect_segments_to_pcd", params)
+    logging.info(res)
+
 
 def main() -> None:
     logging.basicConfig(

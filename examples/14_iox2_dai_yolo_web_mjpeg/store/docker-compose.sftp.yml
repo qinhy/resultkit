@@ -1,0 +1,35 @@
+services:
+  record-sftp:
+    image: lscr.io/linuxserver/openssh-server:latest
+    container_name: record-sftp
+    hostname: record-sftp
+
+    environment:
+      PUID: "${PUID:-1000}"
+      PGID: "${PGID:-1000}"
+      TZ: "${TZ:-Asia/Tokyo}"
+
+      USER_NAME: "${SFTP_USER:-recordstore}"
+      PASSWORD_ACCESS: "true"
+      USER_PASSWORD: "${SFTP_PASSWORD:-change-me}"
+
+      SUDO_ACCESS: "false"
+      LOG_STDOUT: "true"
+
+    ports:
+      - "${SFTP_PORT:-2222}:2222"
+
+    volumes:
+      # Your EXISTING recording folder.
+      # No copying and no synchronization.
+      - type: bind
+        source: "${RECORD_PATH}"
+        target: /data
+
+      # SSH configuration / host keys
+      - ssh-config:/config
+
+    restart: unless-stopped
+
+volumes:
+  ssh-config:

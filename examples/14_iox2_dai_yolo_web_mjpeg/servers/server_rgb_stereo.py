@@ -765,7 +765,7 @@ class CameraController:
 
     def _start_worker_unlocked(self) -> None:
         self._ctx = mp.get_context("spawn")
-        self._status_queue = self._ctx.Queue(maxsize=32)
+        self._status_queue = self._ctx.Queue(maxsize=128)
         self._stop_event = self._ctx.Event()
         self._process = self._ctx.Process(
             target=camera_worker_entry,

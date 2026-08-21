@@ -8,17 +8,19 @@ from pathlib import Path
 from queue import Empty, Full, Queue
 from threading import Event, Lock, RLock, Thread
 import time
-from typing import Any, Literal
+from typing import Any, Dict, Literal
 
 import numpy as np
 from pydantic import BaseModel, Field
+import torch
 from common import *
 
 from common import HookDispatcher
 from iox2_jsonrpc import EmptyParams, RpcModel
 from store.custom_record_store import CustomRecord
-from pcd_yolo_utils import split_cloud
 from resultkit.logger import logger
+
+PCD_BACKEND:Literal["cpu","cuda","vpi"] = "cpu"
 
 LOG_SERVICE = "jrpc"
 LOG_CONTROLLER = "pcd"
@@ -33,20 +35,57 @@ for path in (
     if path_text not in sys.path:
         sys.path.append(path_text)
 
-from pcd_utils import (  # noqa: E402
-    DEFAULT_CALIBRATION,
+# if PCD_BACKEND=="cpu":
+#     from pcd_utils import (
+#         ColoredPointCloud,
+#         SGBMDisparityPredictor,
+#         StereoRgbCalibration as StereoRgbCalibrationCpu,
+#         points_left_to_rgb_depth,
+#         read_image,
+#         rectified_left_to_original_left,
+#         rgb8,
+#         rgb_depth_to_points_rgb,
+#         save_point_cloud,
+#         transform_points,
+#     )
+#     from pcd_yolo_utils import split_cloud
+
+# elif PCD_BACKEND=="cuda":
+#     from pcd_cuda_utils import (
+#         ColoredPointCloudCuda as ColoredPointCloud,
+#         StereoRgbCalibrationCpu,
+#         StereoRgbCalibrationCuda as StereoRgbCalibration,
+#         SGBMDisparityPredictorCuda as SGBMDisparityPredictor,
+#         points_left_to_rgb_depth,
+#         read_image,
+#         rectified_left_to_original_left,
+#         rgb8_cuda as rgb8,
+#         _image_cuda,
+#         rgb_depth_to_points_rgb,
+#         save_point_cloud,
+#         transform_points,
+#     )
+#     _image_gpu = _image_cuda
+#     from pcd_yolo_cuda_utils import split_cloud_cuda as split_cloud
+
+# elif PCD_BACKEND=="vpi":
+from pcd_vpi_utils import (
     ColoredPointCloud,
-    SGBMDisparityPredictor,
-    StereoRgbCalibration,
-    cv2,
+    StereoRgbCalibration as StereoRgbCalibrationCpu,
+    VPIStereoDisparityGPU as SGBMDisparityPredictor,
     points_left_to_rgb_depth,
-    read_image,
     rectified_left_to_original_left,
-    rgb8,
     rgb_depth_to_points_rgb,
-    save_point_cloud,
     transform_points,
+    read_image,
+    _image_cupy,
+    rgb8,
+    save_point_cloud,
 )
+_image_gpu = _image_cupy
+import cupy as cp
+from pcd_yolo_vpi_utils import split_cloud_vpi as split_cloud
+
 
 try:  # noqa: E402
     from pcd_dnn_utils import FastFoundationStereoDisparity
@@ -75,26 +114,7 @@ Matrix3x3 = tuple[tuple[float, float, float], ...]
 Matrix4x4 = tuple[tuple[float, float, float, float], ...]
 DistortionCoefficients = tuple[float, ...]
 
-_DEFAULT_CALIBRATION = DEFAULT_CALIBRATION
 _DNN_CACHE_KEY_FIELDS = ("repo_dir", "model_path", "model_dir", "device", "valid_iters", "max_disp", "hiera")
-_YOLO_CACHE_KEY_FIELDS = ("model_path",)
-
-
-def _as_resolution(value: Any) -> Resolution:
-    return int(value[0]), int(value[1])
-
-
-def _as_matrix(value: Any) -> tuple[tuple[float, ...], ...]:
-    return tuple(tuple(float(item) for item in row) for row in value)
-
-
-def _as_float_tuple(value: Any) -> DistortionCoefficients:
-    return tuple(float(item) for item in value)
-
-
-def _default_calibration_field(key: str, converter: Any = _as_matrix) -> Any:
-    return Field(default=converter(_DEFAULT_CALIBRATION[key]))
-
 
 def _model_to_dict(value: Any) -> dict[str, Any]:
     if value is None:
@@ -177,117 +197,6 @@ def _save_cloud_npz(path: str | Path, cloud: Any) -> Path:
         },
     )
     return output_path
-
-
-def _torch_to_numpy(x: Any) -> np.ndarray:
-    """Accept torch tensors, numpy arrays, or list-like values."""
-    if x is None:
-        return np.asarray([])
-    if hasattr(x, "detach"):
-        x = x.detach()
-    if hasattr(x, "cpu"):
-        x = x.cpu()
-    return np.asarray(x)
-
-
-def _safe_class_name(names: Any, class_id: int) -> str:
-    if isinstance(names, dict):
-        return str(names.get(class_id, class_id))
-    if isinstance(names, (list, tuple)) and 0 <= class_id < len(names):
-        return str(names[class_id])
-    return str(class_id)
-
-
-def _safe_filename_text(text: str) -> str:
-    return "".join(ch if ch.isalnum() or ch in ("_", "-") else "_" for ch in text)
-
-
-def _resize_yolo_mask_to_rgb(mask: np.ndarray, rgb_hw: tuple[int, int], threshold: float) -> np.ndarray:
-    """Resize one YOLO mask to the RGB image geometry using nearest neighbor."""
-    rgb_h, rgb_w = rgb_hw
-    m = np.asarray(mask, np.float32)
-
-    if m.shape != (rgb_h, rgb_w):
-        c = cv2()
-        m = c.resize(m, (rgb_w, rgb_h), interpolation=c.INTER_NEAREST)
-
-    return m > float(threshold)
-
-
-def _segment_meta_dict(seg: "DetectSegment3D") -> dict[str, Any]:
-    return {
-        "instance_id": int(seg.instance_id),
-        "class_id": int(seg.class_id),
-        "class_name": seg.class_name,
-        "confidence": float(seg.confidence),
-        "bbox_xyxy_rgb": [float(v) for v in seg.bbox_xyxy_rgb],
-        "mask_area_px": int(seg.mask_area_px),
-        "point_count": int(len(seg.points_m)),
-        "centroid_m": seg.centroid_m.astype(float).tolist(),
-        "aabb_min_m": seg.aabb_min_m.astype(float).tolist(),
-        "aabb_max_m": seg.aabb_max_m.astype(float).tolist(),
-        "output_frame": seg.output_frame,
-        "pcd_path": seg.pcd_path,
-        "pixels_path": seg.pixels_path,
-        "meta_path": seg.meta_path,
-    }
-
-
-def _save_segments_npz(path: str | Path, result: "DetectSegments3D") -> Path:
-    output_path = Path(path).expanduser()
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    arrays: dict[str, np.ndarray] = {
-        "points_m": np.asarray(result.points_m),
-        "colors_rgb": np.asarray(result.colors_rgb),
-        "pixels_rgb": np.asarray(result.pixels_rgb),
-        "instance_ids": np.asarray(result.instance_ids),
-        "class_ids": np.asarray(result.class_ids),
-        "confidences": np.asarray(result.confidences),
-        "instance_map": np.asarray(result.instance_map),
-    }
-    if result.depth_rgb_m is not None:
-        arrays["depth_rgb_m"] = np.asarray(result.depth_rgb_m)
-    if result.disparity is not None:
-        arrays["disparity"] = np.asarray(result.disparity)
-
-    np.savez(output_path, **arrays)
-    logger(
-        f"[{LOG_SERVICE}:{LOG_CONTROLLER}:save_segments_npz] segment archive saved",
-        extra={
-            "output_path": str(output_path),
-            "point_count": int(arrays["points_m"].shape[0]),
-            "segment_count": len(result.segments),
-        },
-    )
-    return output_path
-
-
-def _result_segments_to_summary(segments: list["DetectSegment3D"]) -> list["YoloSegmentSummary"]:
-    summaries = []
-    for seg in segments:
-        summaries.append(
-            YoloSegmentSummary(
-                instance_id=int(seg.instance_id),
-                class_id=int(seg.class_id),
-                class_name=seg.class_name,
-                confidence=float(seg.confidence),
-                bbox_xyxy_rgb=tuple(float(v) for v in seg.bbox_xyxy_rgb),
-                mask_area_px=int(seg.mask_area_px),
-                point_count=int(len(seg.points_m)),
-                depth_min_m=float(np.nanmin(seg.points_m[:, 2])) if len(seg.points_m) else None,
-                depth_max_m=float(np.nanmax(seg.points_m[:, 2])) if len(seg.points_m) else None,
-                depth_mean_m=float(np.nanmean(seg.points_m[:, 2])) if len(seg.points_m) else None,
-                centroid_m=tuple(float(v) for v in seg.centroid_m),
-                aabb_min_m=tuple(float(v) for v in seg.aabb_min_m),
-                aabb_max_m=tuple(float(v) for v in seg.aabb_max_m),
-                output_frame=seg.output_frame,
-                pcd_path=seg.pcd_path,
-                pixels_path=seg.pixels_path,
-                meta_path=seg.meta_path,
-            )
-        )
-    return summaries
 
 
 @dataclass(frozen=True)
@@ -391,7 +300,7 @@ class BackendStatusResult(BackendParams):
 
 
 class ToPcdParams(BackendOverrides):
-    db_record: dict | None = None
+    db_record: CustomRecord | None = None
     left_path: str = ""
     right_path: str = ""
     rgb_path: str = ""
@@ -420,8 +329,8 @@ class ToPcdParams(BackendOverrides):
         left_path = [p/f"left{img_ext}" for p in left_parent_paths]
         right_path = [p/f"right{img_ext}" for p in left_parent_paths]
         rgb_path = [p/f"rgb{img_ext}" for p in left_parent_paths]
-        pcd_path = db_record.pcd_path
-        calib_path = db_record.calib_path
+        pcd_path = db_record.expected_pcd_path
+        calib_path = db_record.expected_calib_path
 
         res = []
         for rgb, l, r, lp in zip(rgb_path, left_path, right_path, left_parent_paths):
@@ -440,6 +349,7 @@ class ToPcdParams(BackendOverrides):
                 res.append(param)
         return res
     
+    def get_output_path(self):return self.output_pcd_path
 
 class ToPcdResult(DepthBaseModel):
     backend: DepthBackend
@@ -455,6 +365,7 @@ class ToPcdResult(DepthBaseModel):
     calibration: str | None = None
     error: str | None = None
 
+
 class PcdAsyncResult(DepthBaseModel):
     running: bool = False
     queued: bool = False
@@ -463,8 +374,6 @@ class PcdAsyncResult(DepthBaseModel):
     current_output_path: str | None = None
     last_result: ToPcdResult | None = None
     error: str | None = None
-
-
 
 
 class Ros2PublishParams(DepthBaseModel):
@@ -506,9 +415,10 @@ class YoloSegmentSummary(BaseModel):
 
 
 class ToYoloSegmentsParams(BackendOverrides):
-    left_path: str
-    right_path: str
-    rgb_path: str
+    db_record: CustomRecord | None = None
+    left_path: str = ""
+    right_path: str = ""
+    rgb_path: str = ""
     output_dir: str = "detect_segments_out"
     frame_name: str = "frame"
     calibration: DepthCalibrationParams | None = None
@@ -524,6 +434,45 @@ class ToYoloSegmentsParams(BackendOverrides):
     num_disparities: int = 128
     block_size: int = 5
     splat_px: int = Field(default=1, ge=0)
+    hook_urls: list[list[str]] = Field(default_factory=list)
+
+    @staticmethod
+    def from_db_record(db_record: CustomRecord) -> list[ToYoloSegmentsParams]:
+        if isinstance(db_record,dict):
+            db_record = CustomRecord.model_validate(db_record)
+        if db_record.is_empty():return []
+        
+        img_ext = db_record.listup_left_image_paths[0].suffix
+
+        left_parent_paths = db_record.listup_left_image_parent_paths
+        left_path = [p/f"left{img_ext}" for p in left_parent_paths]
+        right_path = [p/f"right{img_ext}" for p in left_parent_paths]
+        rgb_path = [p/f"rgb{img_ext}" for p in left_parent_paths]
+        pcd_path = db_record.expected_pcd_path
+        calib_path = db_record.expected_calib_path
+
+        res = []
+        for rgb, l, r, lp in zip(rgb_path, left_path, right_path, left_parent_paths):
+            if rgb.exists() and l.exists() and r.exists():
+                cam_name = lp.name
+
+                param = ToPcdParams(rgb_path=str(rgb), left_path=str(l), right_path=str(r))
+                param.output_pcd_path = str(pcd_path/f"{cam_name}.pcd")
+                output_dir = str(Path(db_record.expected_pcd_path)/Path(param.get_output_path()).stem)
+                
+                seg_params:ToYoloSegmentsParams = ToYoloSegmentsParams.model_validate(param.model_dump())
+                seg_params.output_dir = output_dir
+                
+                with open(calib_path / f"{cam_name}.json" ) as f:
+                    calib:Dict = json.load(f)
+                    allowed_fields = set(_model_field_names(DepthCalibrationParams))
+                    calibration_data = {key: value for key, value in calib.items() if key in allowed_fields}
+                    seg_params.calibration = DepthCalibrationParams.model_validate(calibration_data)
+
+                res.append(seg_params)
+        return res
+    
+    def get_output_path(self):return self.output_dir
 
 
 class ToDetectSegmentsResult(DepthBaseModel):
@@ -555,8 +504,8 @@ class PcdRunner:
     processes one heavy job at a time to avoid concurrent GPU/OpenCV pressure.
     """
 
-    input_queue: Queue[ToPcdParams] = field(
-        default_factory=lambda: Queue(maxsize=16),
+    input_queue: Queue[ToPcdParams|ToYoloSegmentsParams] = field(
+        default_factory=lambda: Queue(maxsize=128),
         repr=False,
     )
     calibration_params: DepthCalibrationParams | None = None
@@ -643,17 +592,18 @@ class PcdRunner:
 
         while not self._stop_event.is_set():
             try:
-                params = self.input_queue.get(timeout=0.2)
+                params:ToPcdParams|ToYoloSegmentsParams = self.input_queue.get(timeout=0.2)
             except Empty:
-                continue
-
+                continue            
+            output_path = params.get_output_path()
+            
             with self._state_lock:
-                self._current_output_path = params.output_pcd_path
+                self._current_output_path = output_path
 
             logger(
                 f"[{LOG_SERVICE}:{LOG_CONTROLLER}:PcdRunner:run] conversion dequeued",
                 extra={
-                    "output_path": params.output_pcd_path,
+                    "output_path": output_path,
                     "queue_size": self.input_queue.qsize(),
                     "backend_override": params.backend,
                 },
@@ -661,7 +611,10 @@ class PcdRunner:
 
             try:
                 with self._process_lock:
-                    result = self._convert_to_pcd(params)
+                    if isinstance(params,ToPcdParams):
+                        result = self._convert_to_pcd(params)
+                    elif isinstance(params,ToYoloSegmentsParams):
+                        result = self._detect_segments_to_pcd(params)
 
                 with self._state_lock:
                     self._last_result = result
@@ -706,7 +659,7 @@ class PcdRunner:
                 logger(
                     f"[{LOG_SERVICE}:{LOG_CONTROLLER}:PcdRunner:run:error] conversion failed",level="error",
                     extra={
-                        "output_path": params.output_pcd_path,
+                        "output_path": output_path,
                         "backend_override": params.backend,
                         "error_type": exc.__class__.__name__,
                         "error": str(exc),
@@ -722,14 +675,14 @@ class PcdRunner:
             extra={"queue_size": self.input_queue.qsize()},
         )
 
-    def _build_calibration(self, params: DepthCalibrationParams | None = None) -> StereoRgbCalibration:
+    def _build_calibration(self, params: DepthCalibrationParams | None = None):
         if params is None:
             with self._config_lock:
                 params = self.calibration_params
         calibration_data = _model_to_dict(params)
         calibration_data.pop("service", None)
         translation_unit = calibration_data.pop("source_translation_unit", "cm")
-        calibration = StereoRgbCalibration.from_dict(
+        calibration = StereoRgbCalibrationCpu.from_dict(
             calibration_data,
             source_translation_unit=translation_unit,
         )
@@ -838,7 +791,7 @@ class PcdRunner:
         left_image: np.ndarray,
         right_image: np.ndarray,
         rgb_image: np.ndarray,
-        calibration: StereoRgbCalibration,
+        calibration: StereoRgbCalibrationCpu,
         backend: BackendParams,
         input_color_order: ColorOrder,
         rgb_image_is_undistorted: bool,
@@ -860,19 +813,25 @@ class PcdRunner:
                 "splat_px": splat_px,
             },
         )
-        rectifier = calibration.get_rectifier(alpha=alpha)       
+        height, width = left_image.shape[:2]
+        rectifier = calibration.get_rectifier(alpha=alpha)
         left_rect, right_rect, rect = rectifier.rectify(left_image, right_image)
         
+        confidence_u16 = None
         if backend.backend == "sgbm":   
-            predictor = SGBMDisparityPredictor(num_disparities=num_disparities,
+            predictor = SGBMDisparityPredictor( width=width,height=height,
+                                                num_disparities=num_disparities,
                                                 min_disparity=min_disparity,
                                                 block_size=block_size,
-                                                uniqueness_ratio=8,
-                                                speckle_window_size=80,
-                                                speckle_range=2,
-                                                disp12_max_diff=1,
-                                                pre_filter_cap=31)
+                                                # uniqueness_ratio=8,
+                                                # speckle_window_size=80,
+                                                # speckle_range=2,
+                                                # disp12_max_diff=1,
+                                                # pre_filter_cap=31
+                                            )
             disparity = predictor.predict(left_rect, right_rect)
+            if isinstance(disparity,tuple):
+                disparity,confidence_u16 = disparity
         elif backend.backend == "dnn":
             predictor:FastFoundationStereoDisparity = self._get_dnn_predictor(backend)
             disparity = predictor.predict(left_rect, right_rect, input_color_order=input_color_order)
@@ -880,17 +839,33 @@ class PcdRunner:
         else:
             raise ValueError(f"Unsupported backend: {backend.backend}")
 
-        rgb_h, rgb_w = np.asarray(rgb_image).shape[:2]
-        points_rect, _xy_left_rect = rect.disparity_to_points_rectified(
-            disparity,
+        rgb_h, rgb_w = rgb_image.shape[:2]
+        arg_com = dict(
+            disparity=disparity,
             min_disparity=max(0.5, float(min_disparity)),
             max_depth_m=max_depth_m,
-            stride=1,
+            stride=1
         )
-
+        if confidence_u16 is not None:
+            arg_com["confidence_u16"] = confidence_u16
+        points_rect, _xy = rect.disparity_to_points_rectified(**arg_com)
+        
         if len(points_rect) == 0:
-            return np.full((rgb_h, rgb_w), np.nan, np.float64), disparity, rect
+            if isinstance(points_rect,torch.Tensor):
+                return torch.full((rgb_h, rgb_w), np.nan, np.float64), disparity, rect
+            else:
+                return np.full((rgb_h, rgb_w), np.nan, np.float64), disparity, rect
+        
 
+        if isinstance(points_rect,torch.Tensor):
+            rgb_image = _image_gpu(rgb_image)
+            left_to_rgb_inv = np.linalg.inv(calibration.left_to_rgb)
+            calibration = calibration.to_cuda()
+        elif isinstance(points_rect,cp.ndarray):
+            rgb_image = _image_gpu(rgb_image)
+            calibration = calibration.to_cupy()
+            left_to_rgb_inv = cp.linalg.inv(calibration.left_to_rgb)
+        
         points_left = rectified_left_to_original_left(points_rect, rect)
         depth_rgb_m, _valid_depth_rgb = points_left_to_rgb_depth(
             points_left,
@@ -911,249 +886,16 @@ class PcdRunner:
             f"[{LOG_SERVICE}:{LOG_CONTROLLER}:depth:compute] RGB-aligned depth computed",
             extra={
                 "backend": backend.backend,
-                "valid_depth_pixels": int(np.isfinite(depth_rgb_m).sum()),
-                "disparity_shape": tuple(np.asarray(disparity).shape),
+                # "valid_depth_pixels": int(np.isfinite(depth_rgb_m).sum()),
+                # "disparity_shape": tuple(disparity.shape),
             },
         )
         
-        points_left = transform_points(points_rgb, np.linalg.inv(calibration.left_to_rgb))
+        points_left = transform_points(points_rgb, left_to_rgb_inv)
         x, y = pixel_xy.T
-        return points_left, rgb8(rgb_image[y, x, :3], order=input_color_order), pixel_xy, depth_rgb_m, disparity, rect
+        res = points_left, rgb8(rgb_image[y, x, :3], order=input_color_order), pixel_xy, depth_rgb_m, disparity, rect
+        return res
     
-    def _detect_result_to_segments(
-        self,
-        *,
-        yolo_result: Any,
-        depth_rgb_m: np.ndarray,
-        disparity: np.ndarray | None,
-        rectification: Any | None,
-        rgb_image: np.ndarray,
-        calibration: StereoRgbCalibration,
-        output_dir: Path | None,
-        frame_name: str,
-        input_color_order: ColorOrder,
-        output_frame: SegmentOutputFrame,
-        rgb_image_is_undistorted: bool,
-        mask_threshold: float,
-        overlap_policy: YoloOverlapPolicy,
-        min_points: int,
-        save_pcd: bool,
-        save_pixels: bool,
-        save_meta: bool,
-        save_binary_pcd: bool,
-    ) -> DetectSegments3D:
-        rgb_arr = np.asarray(rgb_image)
-        rgb_h, rgb_w = rgb_arr.shape[:2]
-
-        masks_obj = getattr(yolo_result, "masks", None)
-        boxes_obj = getattr(yolo_result, "boxes", None)
-
-        empty = DetectSegments3D(
-            points_m=np.empty((0, 3), np.float64),
-            colors_rgb=np.empty((0, 3), np.uint8),
-            pixels_rgb=np.empty((0, 2), np.int32),
-            instance_ids=np.empty((0,), np.int32),
-            class_ids=np.empty((0,), np.int32),
-            confidences=np.empty((0,), np.float32),
-            instance_map=np.zeros((rgb_h, rgb_w), np.uint32),
-            segments=[],
-            depth_rgb_m=depth_rgb_m,
-            disparity=disparity,
-            rectification=rectification,
-            output_frame=output_frame,
-        )
-
-        if masks_obj is None or getattr(masks_obj, "data", None) is None:
-            return empty
-
-        masks = _torch_to_numpy(masks_obj.data)
-        if masks.ndim == 2:
-            masks = masks[None, :, :]
-
-        n = int(masks.shape[0]) if masks.ndim == 3 else 0
-        if n == 0 or not np.isfinite(depth_rgb_m).any():
-            return empty
-
-        if boxes_obj is not None:
-            class_ids_yolo = _torch_to_numpy(getattr(boxes_obj, "cls", None)).astype(np.int32).reshape(-1)
-            confs_yolo = _torch_to_numpy(getattr(boxes_obj, "conf", None)).astype(np.float32).reshape(-1)
-            bboxes_yolo = _torch_to_numpy(getattr(boxes_obj, "xyxy", None)).astype(np.float32).reshape(-1, 4)
-        else:
-            class_ids_yolo = np.zeros((n,), np.int32)
-            confs_yolo = np.ones((n,), np.float32)
-            bboxes_yolo = np.full((n, 4), np.nan, np.float32)
-
-        class_ids_yolo = np.resize(class_ids_yolo, n)
-        confs_yolo = np.resize(confs_yolo, n)
-        if bboxes_yolo.shape[0] != n:
-            bboxes_yolo = np.resize(bboxes_yolo, (n, 4))
-
-        names = getattr(yolo_result, "names", None)
-
-        points_rgb, xy_rgb = rgb_depth_to_points_rgb(
-            depth_rgb_m,
-            calibration,
-            rgb_image_is_undistorted=rgb_image_is_undistorted,
-        )
-        if len(points_rgb) == 0:
-            return empty
-
-        x = xy_rgb[:, 0]
-        y = xy_rgb[:, 1]
-        colors_all = rgb8(rgb_arr[y, x, :3], input_color_order)
-
-        if output_frame == "rgb":
-            points_all = points_rgb
-        elif output_frame == "left":
-            points_all = transform_points(points_rgb, np.linalg.inv(calibration.left_to_rgb))
-        else:
-            raise ValueError("output_frame must be 'rgb' or 'left'")
-
-        bool_masks = [
-            _resize_yolo_mask_to_rgb(masks[i], (rgb_h, rgb_w), mask_threshold)
-            for i in range(n)
-        ]
-
-        instance_map = np.zeros((rgb_h, rgb_w), np.uint32)
-        if overlap_policy == "highest_confidence":
-            score_map = np.full((rgb_h, rgb_w), -np.inf, np.float32)
-            for i, m in enumerate(bool_masks):
-                inst_id = i + 1
-                conf = float(confs_yolo[i])
-                update = m & (conf >= score_map)
-                instance_map[update] = inst_id
-                score_map[update] = conf
-        elif overlap_policy == "first":
-            for i, m in enumerate(bool_masks):
-                inst_id = i + 1
-                update = m & (instance_map == 0)
-                instance_map[update] = inst_id
-        elif overlap_policy == "none":
-            for i, m in enumerate(bool_masks):
-                inst_id = i + 1
-                update = m & (instance_map == 0)
-                instance_map[update] = inst_id
-        else:
-            raise ValueError("overlap_policy must be 'highest_confidence', 'first', or 'none'")
-
-        seg_dir = None
-        if output_dir is not None:
-            seg_dir = output_dir / "segments"
-            seg_dir.mkdir(parents=True, exist_ok=True)
-
-        segments: list[DetectSegment3D] = []
-        combined_points: list[np.ndarray] = []
-        combined_colors: list[np.ndarray] = []
-        combined_pixels: list[np.ndarray] = []
-        combined_instance_ids: list[np.ndarray] = []
-        combined_class_ids: list[np.ndarray] = []
-        combined_confidences: list[np.ndarray] = []
-
-        for i, m in enumerate(bool_masks):
-            inst_id = i + 1
-            class_id = int(class_ids_yolo[i])
-            class_name = _safe_class_name(names, class_id)
-            conf = float(confs_yolo[i])
-            bbox = tuple(float(v) for v in bboxes_yolo[i].tolist())
-
-            if overlap_policy == "none":
-                keep = m[y, x]
-            else:
-                keep = instance_map[y, x] == inst_id
-
-            seg_points = points_all[keep]
-            seg_colors = colors_all[keep]
-            seg_pixels = xy_rgb[keep]
-
-            if len(seg_points) < int(min_points):
-                continue
-
-            centroid = np.nanmean(seg_points, axis=0)
-            aabb_min = np.nanmin(seg_points, axis=0)
-            aabb_max = np.nanmax(seg_points, axis=0)
-
-            pcd_path = None
-            pixels_path = None
-            meta_path = None
-            safe_name = _safe_filename_text(class_name)
-            stem = f"{frame_name}_obj_{i:03d}_id{inst_id:03d}_{safe_name}_conf{conf:.2f}"
-
-            if seg_dir is not None:
-                if save_pcd:
-                    pcd_file = seg_dir / f"{stem}.pcd"
-                    save_point_cloud(pcd_file, seg_points, seg_colors, binary_pcd=save_binary_pcd)
-                    pcd_path = str(pcd_file)
-
-                if save_pixels:
-                    pixels_file = seg_dir / f"{stem}_pixels.npy"
-                    np.save(pixels_file, seg_pixels.astype(np.int32))
-                    pixels_path = str(pixels_file)
-
-            seg = DetectSegment3D(
-                instance_id=inst_id,
-                class_id=class_id,
-                class_name=class_name,
-                confidence=conf,
-                bbox_xyxy_rgb=bbox,  # type: ignore[arg-type]
-                points_m=seg_points.astype(np.float64),
-                colors_rgb=seg_colors.astype(np.uint8),
-                pixels_rgb=seg_pixels.astype(np.int32),
-                mask_area_px=int(m.sum()),
-                centroid_m=centroid.astype(np.float64),
-                aabb_min_m=aabb_min.astype(np.float64),
-                aabb_max_m=aabb_max.astype(np.float64),
-                output_frame=output_frame,
-                pcd_path=pcd_path,
-                pixels_path=pixels_path,
-                meta_path=None,
-            )
-
-            if seg_dir is not None and save_meta:
-                meta_file = seg_dir / f"{stem}_meta.json"
-                meta = _segment_meta_dict(seg)
-                meta["meta_path"] = str(meta_file)
-                meta_file.write_text(json.dumps(meta, indent=2), encoding="utf-8")
-                meta_path = str(meta_file)
-                seg = replace(seg, meta_path=meta_path)
-
-            segments.append(seg)
-            combined_points.append(seg.points_m)
-            combined_colors.append(seg.colors_rgb)
-            combined_pixels.append(seg.pixels_rgb)
-            combined_instance_ids.append(np.full((len(seg.points_m),), inst_id, np.int32))
-            combined_class_ids.append(np.full((len(seg.points_m),), class_id, np.int32))
-            combined_confidences.append(np.full((len(seg.points_m),), conf, np.float32))
-
-        if combined_points:
-            points_out = np.concatenate(combined_points, axis=0)
-            colors_out = np.concatenate(combined_colors, axis=0)
-            pixels_out = np.concatenate(combined_pixels, axis=0)
-            instance_ids_out = np.concatenate(combined_instance_ids, axis=0)
-            class_ids_out = np.concatenate(combined_class_ids, axis=0)
-            confidences_out = np.concatenate(combined_confidences, axis=0)
-        else:
-            points_out = np.empty((0, 3), np.float64)
-            colors_out = np.empty((0, 3), np.uint8)
-            pixels_out = np.empty((0, 2), np.int32)
-            instance_ids_out = np.empty((0,), np.int32)
-            class_ids_out = np.empty((0,), np.int32)
-            confidences_out = np.empty((0,), np.float32)
-
-        return DetectSegments3D(
-            points_m=points_out,
-            colors_rgb=colors_out,
-            pixels_rgb=pixels_out,
-            instance_ids=instance_ids_out,
-            class_ids=class_ids_out,
-            confidences=confidences_out,
-            instance_map=instance_map,
-            segments=segments,
-            depth_rgb_m=depth_rgb_m,
-            disparity=disparity,
-            rectification=rectification,
-            output_frame=output_frame,
-        )
-
     def _ensure_ros2_publishers(self, params: Ros2PublishParams) -> dict[str, Any]:
         try:
             import rclpy
@@ -1353,14 +1095,14 @@ class PcdRunner:
         return result
 
     def _convert_to_pcd(self, params: ToPcdParams) -> ToPcdResult:
-        if Path(params.output_pcd_path).exists():
+        if Path(params.get_output_path()).exists():
             return ToPcdResult(
                 backend=self.backend_params.backend,
-                output_path=str(params.output_pcd_path),
+                output_path=str(params.get_output_path()),
                 point_count=-1,
                 color_count=-1,
                 size_bytes=-1,
-                error=f"output path already exists: {params.output_pcd_path}",
+                error=f"output path already exists: {params.get_output_path()}",
             )
 
         logger(
@@ -1369,7 +1111,7 @@ class PcdRunner:
                 "left_path": params.left_path,
                 "right_path": params.right_path,
                 "rgb_path": params.rgb_path,
-                "output_path": params.output_pcd_path,
+                "output_path": params.get_output_path(),
                 "backend_override": params.backend,
                 "output_frame": params.output_frame,
                 "stride": params.stride,
@@ -1379,7 +1121,7 @@ class PcdRunner:
         start_time = time.perf_counter()
 
         calibration = self._build_calibration(params.calibration)
-        output_path = Path(params.output_pcd_path).expanduser()
+        output_path = Path(params.get_output_path()).expanduser()
         output_suffix = output_path.suffix.lower()
 
         if output_suffix not in {".pcd", ".npz"}:
@@ -1401,26 +1143,29 @@ class PcdRunner:
             max_depth_m=params.max_depth_m,
             splat_px=1,
         )
-
+        logger(f"[{LOG_SERVICE}:{LOG_CONTROLLER}:depth:compute] _compute_rgb_aligned_depth complete")
         cloud = ColoredPointCloud(points_left, colors_rgb, disparity, rect)
 
+        logger(f"[{LOG_SERVICE}:{LOG_CONTROLLER}:depth:compute] ColoredPointCloud complete")
         if output_suffix == ".npz":
             _save_cloud_npz(output_path, cloud)
         else:
             save_point_cloud(output_path, points_left, colors_rgb, binary_pcd=params.save_binary_pcd)
-
-        depth_min_m, depth_max_m, depth_mean_m = _depth_statistics(cloud.points_m)
+        
+        logger(f"[{LOG_SERVICE}:{LOG_CONTROLLER}:depth:compute] save_point_cloud complete")
+        # depth_min_m, depth_max_m, depth_mean_m = _depth_statistics(cloud.points_m)
         disparity_height, disparity_width = (None, None) if cloud.disparity is None else cloud.disparity.shape[:2]
 
+        logger(f"[{LOG_SERVICE}:{LOG_CONTROLLER}:depth:compute] ToPcdResult complete")
         result = ToPcdResult(
             backend=backend.backend,
             output_path=str(output_path),
             point_count=int(cloud.points_m.shape[0]),
             color_count=int(cloud.colors_rgb.shape[0]),
             size_bytes=int(output_path.stat().st_size),
-            depth_min_m=depth_min_m,
-            depth_max_m=depth_max_m,
-            depth_mean_m=depth_mean_m,
+            # depth_min_m=depth_min_m,
+            # depth_max_m=depth_max_m,
+            # depth_mean_m=depth_mean_m,
             disparity_width=disparity_width,
             disparity_height=disparity_height,
             calibration=str(calibration),
@@ -1459,16 +1204,17 @@ class PcdRunner:
             running=self.is_running,
             queued=queued,
             queue_size=self.input_queue.qsize(),
-            requested_output_path=params.output_pcd_path if params is not None else None,
+            requested_output_path=params.get_output_path() if params is not None else None,
             current_output_path=current_output,
             last_result=last_result,
             error=error or runner_error,
         )
 
-    def submit_to_pcd(self, params: ToPcdParams) -> PcdAsyncResult:
+    def submit_to_pcd(self, params: ToPcdParams | ToYoloSegmentsParams) -> PcdAsyncResult:
         """Queue a conversion and return immediately."""
-        if not self.is_running:
-            self.start()
+        if not self.is_running: self.start()
+
+        output_path = params.get_output_path()
 
         try:
             self.input_queue.put_nowait(params)
@@ -1477,7 +1223,7 @@ class PcdRunner:
                 f"[{LOG_SERVICE}:{LOG_CONTROLLER}:queue:full] conversion queue is full",
                 level="warning",
                 extra={
-                    "output_path": params.output_pcd_path,
+                    "output_path": output_path,
                     "queue_size": self.input_queue.qsize(),
                     "queue_capacity": self.input_queue.maxsize,
                 },
@@ -1491,7 +1237,7 @@ class PcdRunner:
         logger(
             f"[{LOG_SERVICE}:{LOG_CONTROLLER}:queue:submit] conversion queued(size={qs})",
             extra={
-                "output_path": params.output_pcd_path,
+                "output_path": output_path,
                 "queue_size": qs,
                 "queue_capacity": self.input_queue.maxsize,
                 "backend_override": params.backend,
@@ -1521,9 +1267,10 @@ class PcdRunner:
 
     def convert_to_pcd_sync(self, params: ToPcdParams) -> ToPcdResult:
         """Run through the same complete processor without the queue."""
+        output_path = params.get_output_path()
         logger(
             f"[{LOG_SERVICE}:{LOG_CONTROLLER}:convert_sync] synchronous conversion requested",
-            extra={"output_path": params.output_pcd_path},
+            extra={"output_path": output_path},
         )
         try:
             with self._process_lock:
@@ -1531,11 +1278,13 @@ class PcdRunner:
         except Exception:
             logger(
                 f"[{LOG_SERVICE}:{LOG_CONTROLLER}:convert_sync:error] synchronous conversion failed",level="error",
-                extra={"output_path": params.output_pcd_path},
+                extra={"output_path": output_path},
             )
             raise
 
-    def _detect_segments_to_pcd(self, params: ToYoloSegmentsParams) -> ToDetectSegmentsResult:
+    def _detect_segments_to_pcd(self, params: ToYoloSegmentsParams):        
+        start_time = time.perf_counter()
+
         output_dir = Path(params.output_dir).expanduser()
         output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1563,7 +1312,6 @@ class PcdRunner:
             max_depth_m=params.max_depth_m,
             splat_px=params.splat_px,
         )
-
         manifest = split_cloud(
             points_left,
             colors_rgb,
@@ -1595,42 +1343,57 @@ class PcdRunner:
         #     _save_segments_npz(path, result)
         #     combined_npz_path = str(path)
 
-        ros2_result = None
-        if False: # params.ros2_publish:
-            ros2_result = self._publish_segments_ros2(
-                result,
-                Ros2PublishParams(
-                    ros2_node_name=params.ros2_node_name,
-                    ros2_topic_prefix=params.ros2_topic_prefix,
-                    ros2_frame_id=params.ros2_frame_id,
-                    ros2_include_depth=params.ros2_include_depth,
-                    ros2_include_markers=params.ros2_include_markers,
-                    ros2_pretty_json=params.ros2_pretty_json,
-                ),
-            )
+        # ros2_result = None
+        # if False: # params.ros2_publish:
+        #     ros2_result = self._publish_segments_ros2(
+        #         result,
+        #         Ros2PublishParams(
+        #             ros2_node_name=params.ros2_node_name,
+        #             ros2_topic_prefix=params.ros2_topic_prefix,
+        #             ros2_frame_id=params.ros2_frame_id,
+        #             ros2_include_depth=params.ros2_include_depth,
+        #             ros2_include_markers=params.ros2_include_markers,
+        #             ros2_pretty_json=params.ros2_pretty_json,
+        #         ),
+        #     )
 
-        depth_min_m, depth_max_m, depth_mean_m = _depth_statistics(points_left)
-        disparity_height, disparity_width = (None, None) if disparity is None else disparity.shape[:2]
+        # depth_min_m, depth_max_m, depth_mean_m = _depth_statistics(points_left)
+        # disparity_height, disparity_width = (None, None) if disparity is None else disparity.shape[:2] vpi.image bad 
 
-        return ToDetectSegmentsResult(
+        seconds_per_imag = elapsed = time.perf_counter() - start_time
+        logger(f"[{LOG_SERVICE}:{LOG_CONTROLLER}:seg_convert] conversion completed ({seconds_per_imag:.2f} sec/item)")
+        return ToPcdResult(
             backend=backend.backend,
-            # yolo_model_path=detections.yolo_config.model_name,
-            output_dir=str(output_dir),
-            frame_name=params.frame_name,
-            # output_frame=result.output_frame,
-            point_count=int(len(points_left)),
-            # segment_count=int(len(result.segments)),
-            # instance_map_path=instance_map_path,
-            # depth_rgb_path=depth_rgb_path,
-            # combined_npz_path=combined_npz_path,
-            disparity_width=disparity_width,
-            disparity_height=disparity_height,
-            depth_min_m=depth_min_m,
-            depth_max_m=depth_max_m,
-            depth_mean_m=depth_mean_m,
-            ros2=ros2_result,
-            # segments=_result_segments_to_summary(result.segments),
+            output_path=str(output_dir),
+            point_count=len(points_left),
+            color_count=len(points_left),
+            size_bytes=-1,
+            # depth_min_m=depth_min_m,
+            # depth_max_m=depth_max_m,
+            # depth_mean_m=depth_mean_m,
+            # disparity_width=disparity_width,
+            # disparity_height=disparity_height,
+            calibration=str(calibration),
         )
+        # return ToDetectSegmentsResult(
+        #     backend=backend.backend,
+        #     # yolo_model_path=detections.yolo_config.model_name,
+        #     output_dir=str(output_dir),
+        #     frame_name=params.frame_name,
+        #     # output_frame=result.output_frame,
+        #     point_count=int(len(points_left)),
+        #     # segment_count=int(len(result.segments)),
+        #     # instance_map_path=instance_map_path,
+        #     # depth_rgb_path=depth_rgb_path,
+        #     # combined_npz_path=combined_npz_path,
+        #     disparity_width=disparity_width,
+        #     disparity_height=disparity_height,
+        #     depth_min_m=depth_min_m,
+        #     depth_max_m=depth_max_m,
+        #     depth_mean_m=depth_mean_m,
+        #     # ros2=ros2_result,
+        #     # segments=_result_segments_to_summary(result.segments),
+        # )
 
     def detect_segments_to_pcd(self, params: ToYoloSegmentsParams) -> ToDetectSegmentsResult:
         logger(
@@ -1736,7 +1499,7 @@ class DepthController:
         logger(
             f"[{self.service_name}:{self.controller_name}:to_pcd] conversion requested",
             extra={
-                "output_path": params.output_pcd_path,
+                "output_path": params.get_output_path(),
                 "left_path": params.left_path,
                 "right_path": params.right_path,
                 "rgb_path": params.rgb_path,
@@ -1745,7 +1508,7 @@ class DepthController:
         )
         try:
             if has_db_record:
-                db_record = CustomRecord(**params.db_record)
+                db_record = params.db_record
             else:
                 db_record = CustomRecord.empty()
                 
@@ -1759,7 +1522,7 @@ class DepthController:
                 extra={
                     "conversion_count": len(derived_params),
                     "output_paths": [
-                        item.output_pcd_path for item in derived_params
+                        item.get_output_path() for item in derived_params
                     ],
                 },
             )
@@ -1770,7 +1533,7 @@ class DepthController:
         except Exception as e:
             logger(
                 f"[{self.service_name}:{self.controller_name}:to_pcd:error] conversion request failed, {e}",level="error",
-                extra={"output_path": params.output_pcd_path},
+                extra={"output_path": params.get_output_path()},
             )
             raise
 
@@ -1783,8 +1546,39 @@ class DepthController:
     def to_pcd_sync(self, params: ToPcdParams) -> ToPcdResult:
         return self.runner.convert_to_pcd_sync(params)
 
-    def detect_segments_to_pcd(self, params: ToYoloSegmentsParams) -> ToDetectSegmentsResult:
-        return self.runner.detect_segments_to_pcd(params)
+    def detect_segments_to_pcd(self, params: ToYoloSegmentsParams) -> ToDetectSegmentsResult:        
+        has_db_record = bool(params.db_record)
+        logger(f"[{self.service_name}:{self.controller_name}:detect_segments_to_pcd] conversion requested")
+
+        try:
+            if has_db_record:
+                db_record = params.db_record
+            else:
+                db_record = CustomRecord.empty()                
+            if db_record.is_empty():
+                return self.runner.submit_to_pcd(params)
+
+            derived_params = ToYoloSegmentsParams.from_db_record(db_record)
+
+            logger(
+                f"[{self.service_name}:{self.controller_name}:detect_segments_to_pcd] derived jobs({len(derived_params)})",
+                extra={
+                    "conversion_count": len(derived_params),
+                    "output_paths": [
+                        item.output_dir for item in derived_params
+                    ],
+                },
+            )
+            result = PcdAsyncResult()
+            for conversion_params in derived_params:
+                result = self.runner.submit_to_pcd(conversion_params)
+            return result
+        except Exception as e:
+            logger(
+                f"[{self.service_name}:{self.controller_name}:detect_segments_to_pcd:error] conversion request failed, {e}",level="error",
+                extra={"output_path": params.output_dir},
+            )
+            raise
 
     def publish_last_yolo_segments(self, params: Ros2PublishParams) -> Ros2PublishResult:
         return self.runner.publish_last_yolo_segments(params)
