@@ -1,11 +1,13 @@
 from datetime import datetime
 from typing import Any, Optional
+from fnmatch import fnmatchcase
+import time
 
 def logger(msg,
             level: str = "info",
             extra: Optional[dict[str, Any]] = None,):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    if extra is None:
+    if extra is not None:
         print(f"{timestamp} [{level.upper()}] {msg} ({extra})")
     else:
         print(f"{timestamp} [{level.upper()}] {msg}")
@@ -258,6 +260,116 @@ try:
 
     logger = RedisLogger()
     logger("[RedisLogger:init] start")
+
+
+    def tail_streams(
+        pattern: str = "*",
+        ignore_patterns: tuple[str, ...] = (),
+        redis_url: str = "redis://localhost:6379/0",
+        level: str | None = None,
+        discovery_interval: float = 1.0,
+    ) -> None:
+        client = redis.Redis.from_url(
+            redis_url,
+            decode_responses=True,
+            socket_connect_timeout=2,
+            socket_timeout=None,
+        )
+
+        last_ids: dict[str, str] = {}
+        wanted_level = level.upper() if level else None
+        next_discovery = 0.0
+
+        def is_ignored(stream: str) -> bool:
+            return any(
+                fnmatchcase(stream, ignored_pattern)
+                for ignored_pattern in ignore_patterns
+            )
+
+        def print_entry(
+            stream: str,
+            entry_id: str,
+            fields: dict[str, str],
+        ) -> None:
+            entry_level = fields.get("level", "").upper()
+
+            if wanted_level and entry_level != wanted_level:
+                return
+
+            print(
+                f"{entry_id} "
+                f"[{entry_level or '-'}] "
+                f"[{stream}] "
+                f"{fields.get('msg', '')}"
+            )
+
+        try:
+            while True:
+                now = time.monotonic()
+
+                if now >= next_discovery:
+                    discovered_streams = set(
+                        client.scan_iter(
+                            match=pattern,
+                            count=500,
+                            _type="stream",
+                        )
+                    )
+
+                    current_streams = {
+                        stream
+                        for stream in discovered_streams
+                        if not is_ignored(stream)
+                    }
+
+                    # Stop reading removed or newly ignored streams.
+                    for stream in set(last_ids) - current_streams:
+                        del last_ids[stream]
+
+                    # Begin reading newly discovered streams.
+                    for stream in sorted(current_streams - set(last_ids)):
+                        latest = client.xrevrange(stream, count=1)
+
+                        if latest:
+                            entry_id, fields = latest[0]
+                            print_entry(stream, entry_id, fields)
+                            last_ids[stream] = entry_id
+                        else:
+                            last_ids[stream] = "0-0"
+
+                    next_discovery = now + discovery_interval
+
+                if not last_ids:
+                    time.sleep(discovery_interval)
+                    continue
+
+                results = client.xread(
+                    streams=last_ids,
+                    count=100,
+                    block=max(100, int(discovery_interval * 1000)),
+                )
+
+                entries = []
+
+                for stream, stream_entries in results:
+                    for entry_id, fields in stream_entries:
+                        last_ids[stream] = entry_id
+                        entries.append((entry_id, stream, fields))
+
+                entries.sort(
+                    key=lambda item: tuple(
+                        int(part) for part in item[0].split("-", 1)
+                    )
+                )
+
+                for entry_id, stream, fields in entries:
+                    print_entry(stream, entry_id, fields)
+
+        except KeyboardInterrupt:
+            print("\nStopped.")
+
+        finally:
+            client.close()
 
 except:
     pass

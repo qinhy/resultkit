@@ -34,12 +34,20 @@ dev = [
     "omegaconf>=2.3.1",
     "triton-windows>=3.7.1.post27",
     "supervision>=0.29.1",
+    "gdown>=6.1.0",
+    "lightning>=2.6.5",
+    "nanodet",
+    "shapely>=2.1.2",
+    "fsspec>=2026.4.0",
+    "paramiko>=5.0.0",
+    "cupy>=14.2.0",
 ]
 
 [tool.uv.sources]
 torch = { index = "torch-cuda" }
 torchvision = { index = "torch-cuda" }
 pycuda = { path = "./pycuda" }
+nanodet = { path = "../nanodet/dist/nanodet-1.0.0-py3-none-any.whl" }
 
 [[tool.uv.index]]
 name = "torch-cuda"

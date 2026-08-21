@@ -1,0 +1,1452 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+<title>YOLO Debug Viewer</title>
+
+<style>
+    * {
+        box-sizing: border-box;
+    }
+
+    html, body {
+        margin: 0;
+        width: 100%;
+        height: 100%;
+        overflow: hidden;
+        font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        background: #111;
+        color: #eee;
+    }
+
+    body {
+        display: flex;
+        flex-direction: column;
+    }
+
+    #toolbar {
+        flex: 0 0 auto;
+        min-height: 48px;
+        padding: 6px 10px;
+
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        flex-wrap: wrap;
+
+        background: #222;
+        border-bottom: 1px solid #444;
+    }
+
+    #toolbar label {
+        display: flex;
+        align-items: center;
+        gap: 5px;
+        font-size: 13px;
+    }
+
+    button,
+    select,
+    input {
+        font: inherit;
+    }
+
+    button,
+    select {
+        background: #333;
+        color: #eee;
+        border: 1px solid #555;
+        border-radius: 4px;
+        padding: 5px 8px;
+    }
+
+    button:hover {
+        background: #444;
+    }
+
+    #confidence {
+        width: 140px;
+    }
+
+    #confidenceValue {
+        display: inline-block;
+        min-width: 38px;
+        font-family: monospace;
+    }
+
+    #main {
+        flex: 1 1 auto;
+        min-height: 0;
+
+        display: flex;
+    }
+
+    #viewer {
+        position: relative;
+        flex: 1 1 auto;
+        min-width: 0;
+        overflow: hidden;
+
+        background:
+            linear-gradient(45deg, #181818 25%, transparent 25%),
+            linear-gradient(-45deg, #181818 25%, transparent 25%),
+            linear-gradient(45deg, transparent 75%, #181818 75%),
+            linear-gradient(-45deg, transparent 75%, #181818 75%);
+
+        background-size: 20px 20px;
+        background-position:
+            0 0,
+            0 10px,
+            10px -10px,
+            -10px 0px;
+
+        cursor: grab;
+    }
+
+    #viewer.dragging {
+        cursor: grabbing;
+    }
+
+    #canvas {
+        position: absolute;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+    }
+
+    #sidebar {
+        flex: 0 0 340px;
+        width: 340px;
+
+        display: flex;
+        flex-direction: column;
+
+        background: #1d1d1d;
+        border-left: 1px solid #444;
+
+        overflow: hidden;
+    }
+
+    #summary {
+        flex: 0 0 auto;
+        padding: 10px;
+        font-size: 12px;
+        line-height: 1.5;
+
+        border-bottom: 1px solid #444;
+
+        white-space: pre-wrap;
+        word-break: break-all;
+    }
+
+    #detectionList {
+        flex: 1 1 auto;
+        min-height: 100px;
+        overflow: auto;
+        border-bottom: 1px solid #444;
+    }
+
+    .detection {
+        padding: 7px 10px;
+        border-bottom: 1px solid #333;
+        cursor: pointer;
+        font-size: 12px;
+    }
+
+    .detection:hover {
+        background: #292929;
+    }
+
+    .detection.selected {
+        background: #3b3b3b;
+    }
+
+    .detection.filtered {
+        opacity: 0.35;
+    }
+
+    .det-title {
+        font-weight: 600;
+    }
+
+    .det-details {
+        margin-top: 2px;
+        opacity: 0.75;
+        font-family: monospace;
+    }
+
+    #jsonPanel {
+        flex: 0 0 260px;
+        height: 260px;
+
+        padding: 8px;
+        margin: 0;
+
+        overflow: auto;
+
+        background: #111;
+        color: #ccc;
+
+        font-size: 11px;
+        line-height: 1.35;
+        font-family: "Consolas", "Courier New", monospace;
+
+        white-space: pre-wrap;
+        word-break: break-word;
+    }
+
+    #status {
+        margin-left: auto;
+        font-size: 12px;
+        color: #aaa;
+        white-space: nowrap;
+    }
+
+    .separator {
+        height: 24px;
+        border-left: 1px solid #555;
+    }
+
+    @media (max-width: 900px) {
+        #sidebar {
+            flex-basis: 280px;
+            width: 280px;
+        }
+    }
+</style>
+</head>
+
+<body>
+
+<div id="toolbar">
+
+    <label>
+        Record
+        <select id="recordSelect"></select>
+    </label>
+
+    <button id="reloadButton">Reload</button>
+    <button id="fitButton">Fit</button>
+    <button id="actualButton">100%</button>
+
+    <div class="separator"></div>
+
+    <label>
+        Confidence
+        <input
+            id="confidence"
+            type="range"
+            min="0"
+            max="1"
+            step="0.01"
+            value="0"
+        >
+        <span id="confidenceValue">0.00</span>
+    </label>
+
+    <label>
+        <input id="showBoxes" type="checkbox" checked>
+        Boxes
+    </label>
+
+    <label>
+        <input id="showMasks" type="checkbox" checked>
+        Masks
+    </label>
+
+    <label>
+        <input id="fillMasks" type="checkbox" checked>
+        Fill
+    </label>
+
+    <label>
+        <input id="showLabels" type="checkbox" checked>
+        Labels
+    </label>
+
+    <label>
+        <input id="showPoints" type="checkbox">
+        Points
+    </label>
+
+    <span id="status">Loading...</span>
+</div>
+
+<div id="main">
+
+    <div id="viewer">
+        <canvas id="canvas"></canvas>
+    </div>
+
+    <aside id="sidebar">
+
+        <div id="summary">
+            No data loaded.
+        </div>
+
+        <div id="detectionList"></div>
+
+        <pre id="jsonPanel">Click a detection to inspect it.</pre>
+
+    </aside>
+
+</div>
+
+<script>
+"use strict";
+
+/*
+|--------------------------------------------------------------------------
+| Configuration
+|--------------------------------------------------------------------------
+*/
+
+const API_RECORDS = "/debug/last_ai_records";
+const API_IMAGE   = "/debug/get_debug_file";
+
+
+/*
+|--------------------------------------------------------------------------
+| Elements
+|--------------------------------------------------------------------------
+*/
+
+const viewer = document.getElementById("viewer");
+const canvas = document.getElementById("canvas");
+const ctx = canvas.getContext("2d");
+
+const recordSelect = document.getElementById("recordSelect");
+const reloadButton = document.getElementById("reloadButton");
+const fitButton = document.getElementById("fitButton");
+const actualButton = document.getElementById("actualButton");
+
+const confidenceSlider = document.getElementById("confidence");
+const confidenceValue = document.getElementById("confidenceValue");
+
+const showBoxes = document.getElementById("showBoxes");
+const showMasks = document.getElementById("showMasks");
+const fillMasks = document.getElementById("fillMasks");
+const showLabels = document.getElementById("showLabels");
+const showPoints = document.getElementById("showPoints");
+
+const statusElement = document.getElementById("status");
+const summaryElement = document.getElementById("summary");
+const detectionListElement = document.getElementById("detectionList");
+const jsonPanel = document.getElementById("jsonPanel");
+
+
+/*
+|--------------------------------------------------------------------------
+| State
+|--------------------------------------------------------------------------
+*/
+
+let records = [];
+let currentRecordIndex = -1;
+let currentData = null;
+
+let image = null;
+
+let selectedDetectionIndex = -1;
+let hoveredDetectionIndex = -1;
+
+// View transform:
+// screen = image * zoom + offset
+let zoom = 1;
+let offsetX = 0;
+let offsetY = 0;
+
+let dragging = false;
+let dragStartX = 0;
+let dragStartY = 0;
+let dragStartOffsetX = 0;
+let dragStartOffsetY = 0;
+
+
+/*
+|--------------------------------------------------------------------------
+| Helpers
+|--------------------------------------------------------------------------
+*/
+
+/**
+ * Handles either:
+ *
+ * {
+ *   "data": {
+ *      "image_width": ...,
+ *      ...
+ *   }
+ * }
+ *
+ * or directly:
+ *
+ * {
+ *   "image_width": ...
+ * }
+ */
+function unwrapRecord(record) {
+    if (record && record.data && typeof record.data === "object") {
+        return record.data;
+    }
+
+    return record;
+}
+
+
+function getDetections() {
+    return currentData?.detections ?? [];
+}
+
+
+function confidenceThreshold() {
+    return Number(confidenceSlider.value);
+}
+
+
+function detectionVisible(det) {
+    return Number(det.confidence ?? 0) >= confidenceThreshold();
+}
+
+
+function setStatus(text) {
+    statusElement.textContent = text;
+}
+
+
+function clamp(value, min, max) {
+    return Math.max(min, Math.min(max, value));
+}
+
+
+/*
+|--------------------------------------------------------------------------
+| Colors
+|--------------------------------------------------------------------------
+|
+| Deterministic color per class id.
+|--------------------------------------------------------------------------
+*/
+
+function classColor(classId, alpha = 1) {
+    const id = Number(classId ?? 0);
+
+    // Golden-ratio-ish hue spacing
+    const hue = (id * 137.508) % 360;
+
+    return `hsla(${hue}, 90%, 60%, ${alpha})`;
+}
+
+
+/*
+|--------------------------------------------------------------------------
+| Canvas sizing
+|--------------------------------------------------------------------------
+*/
+
+function resizeCanvas() {
+    const rect = viewer.getBoundingClientRect();
+    const dpr = window.devicePixelRatio || 1;
+
+    const width = Math.max(1, Math.round(rect.width * dpr));
+    const height = Math.max(1, Math.round(rect.height * dpr));
+
+    if (canvas.width !== width || canvas.height !== height) {
+        canvas.width = width;
+        canvas.height = height;
+
+        canvas.style.width = `${rect.width}px`;
+        canvas.style.height = `${rect.height}px`;
+    }
+
+    draw();
+}
+
+
+window.addEventListener("resize", resizeCanvas);
+
+
+/*
+|--------------------------------------------------------------------------
+| Image coordinate transforms
+|--------------------------------------------------------------------------
+*/
+
+function screenToImage(screenX, screenY) {
+    return {
+        x: (screenX - offsetX) / zoom,
+        y: (screenY - offsetY) / zoom,
+    };
+}
+
+
+function imageToScreen(imageX, imageY) {
+    return {
+        x: imageX * zoom + offsetX,
+        y: imageY * zoom + offsetY,
+    };
+}
+
+
+/*
+|--------------------------------------------------------------------------
+| Fit / zoom
+|--------------------------------------------------------------------------
+*/
+
+function fitImage() {
+    if (!image) {
+        return;
+    }
+
+    const width = viewer.clientWidth;
+    const height = viewer.clientHeight;
+
+    if (width <= 0 || height <= 0) {
+        return;
+    }
+
+    zoom = Math.min(
+        width / image.naturalWidth,
+        height / image.naturalHeight
+    );
+
+    offsetX = (width - image.naturalWidth * zoom) / 2;
+    offsetY = (height - image.naturalHeight * zoom) / 2;
+
+    draw();
+}
+
+
+function actualSize() {
+    if (!image) {
+        return;
+    }
+
+    zoom = 1;
+
+    offsetX = (viewer.clientWidth - image.naturalWidth) / 2;
+    offsetY = (viewer.clientHeight - image.naturalHeight) / 2;
+
+    draw();
+}
+
+
+function zoomAt(screenX, screenY, factor) {
+    if (!image) {
+        return;
+    }
+
+    const before = screenToImage(screenX, screenY);
+
+    zoom = clamp(
+        zoom * factor,
+        0.01,
+        50
+    );
+
+    offsetX = screenX - before.x * zoom;
+    offsetY = screenY - before.y * zoom;
+
+    draw();
+}
+
+
+/*
+|--------------------------------------------------------------------------
+| Draw
+|--------------------------------------------------------------------------
+*/
+
+function draw() {
+    const dpr = window.devicePixelRatio || 1;
+
+    // Drawing coordinates below use CSS pixel units.
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+    ctx.clearRect(
+        0,
+        0,
+        canvas.width / dpr,
+        canvas.height / dpr
+    );
+
+    if (!image) {
+        return;
+    }
+
+    // Image
+    ctx.save();
+
+    ctx.translate(offsetX, offsetY);
+    ctx.scale(zoom, zoom);
+
+    ctx.imageSmoothingEnabled = true;
+    ctx.drawImage(image, 0, 0);
+
+    ctx.restore();
+
+    drawDetections();
+
+    const zoomPercent = (zoom * 100).toFixed(1);
+
+    const visibleCount = getDetections()
+        .filter(detectionVisible)
+        .length;
+
+    setStatus(
+        `${image.naturalWidth}×${image.naturalHeight} | ` +
+        `${visibleCount}/${getDetections().length} detections | ` +
+        `${zoomPercent}%`
+    );
+}
+
+
+function drawDetections() {
+    const detections = getDetections();
+
+    // Draw masks first so boxes/labels stay visible.
+    if (showMasks.checked) {
+        detections.forEach((det, index) => {
+            if (!detectionVisible(det)) {
+                return;
+            }
+
+            drawMask(det, index);
+        });
+    }
+
+    if (showBoxes.checked) {
+        detections.forEach((det, index) => {
+            if (!detectionVisible(det)) {
+                return;
+            }
+
+            drawBoundingBox(det, index);
+        });
+    }
+
+    if (showLabels.checked) {
+        detections.forEach((det, index) => {
+            if (!detectionVisible(det)) {
+                return;
+            }
+
+            drawLabel(det, index);
+        });
+    }
+}
+
+
+/*
+|--------------------------------------------------------------------------
+| Segmentation masks
+|--------------------------------------------------------------------------
+*/
+
+function drawMask(det, index) {
+    const polygons = det?.mask?.polygons;
+
+    if (!Array.isArray(polygons)) {
+        return;
+    }
+
+    const isSelected = index === selectedDetectionIndex;
+    const isHovered = index === hoveredDetectionIndex;
+
+    const strokeColor = isSelected
+        ? "white"
+        : classColor(det.class_id, 1);
+
+    const fillColor = isSelected
+        ? "rgba(255,255,255,0.25)"
+        : classColor(det.class_id, 0.22);
+
+    for (const polygon of polygons) {
+
+        const points = polygon?.points_xy;
+
+        if (!Array.isArray(points) || points.length < 2) {
+            continue;
+        }
+
+        ctx.beginPath();
+
+        points.forEach(([x, y], pointIndex) => {
+            const p = imageToScreen(x, y);
+
+            if (pointIndex === 0) {
+                ctx.moveTo(p.x, p.y);
+            } else {
+                ctx.lineTo(p.x, p.y);
+            }
+        });
+
+        ctx.closePath();
+
+        if (fillMasks.checked) {
+            ctx.fillStyle = fillColor;
+            ctx.fill();
+        }
+
+        ctx.strokeStyle = strokeColor;
+        ctx.lineWidth = isSelected
+            ? 3
+            : isHovered
+                ? 2.5
+                : 1.5;
+
+        ctx.stroke();
+
+        if (showPoints.checked) {
+            drawPolygonPoints(points, det, isSelected);
+        }
+    }
+}
+
+
+function drawPolygonPoints(points, det, isSelected) {
+    ctx.fillStyle = isSelected
+        ? "white"
+        : classColor(det.class_id);
+
+    for (const [x, y] of points) {
+        const p = imageToScreen(x, y);
+
+        ctx.beginPath();
+        ctx.arc(
+            p.x,
+            p.y,
+            isSelected ? 3.5 : 2,
+            0,
+            Math.PI * 2
+        );
+
+        ctx.fill();
+    }
+}
+
+
+/*
+|--------------------------------------------------------------------------
+| Bounding boxes
+|--------------------------------------------------------------------------
+*/
+
+function drawBoundingBox(det, index) {
+    if (!Array.isArray(det.bbox_xyxy) || det.bbox_xyxy.length < 4) {
+        return;
+    }
+
+    const [x1, y1, x2, y2] = det.bbox_xyxy;
+
+    const a = imageToScreen(x1, y1);
+    const b = imageToScreen(x2, y2);
+
+    const isSelected = index === selectedDetectionIndex;
+    const isHovered = index === hoveredDetectionIndex;
+
+    ctx.strokeStyle = isSelected
+        ? "white"
+        : classColor(det.class_id);
+
+    ctx.lineWidth = isSelected
+        ? 4
+        : isHovered
+            ? 3
+            : 2;
+
+    ctx.strokeRect(
+        a.x,
+        a.y,
+        b.x - a.x,
+        b.y - a.y
+    );
+}
+
+
+/*
+|--------------------------------------------------------------------------
+| Labels
+|--------------------------------------------------------------------------
+*/
+
+function drawLabel(det, index) {
+    if (!Array.isArray(det.bbox_xyxy)) {
+        return;
+    }
+
+    const [x1, y1] = det.bbox_xyxy;
+
+    const p = imageToScreen(x1, y1);
+
+    const confidence = Number(det.confidence ?? 0);
+
+    const text =
+        `${det.class_name ?? "class"} ` +
+        `${confidence.toFixed(3)}`;
+
+    const isSelected = index === selectedDetectionIndex;
+
+    const fontSize = 13;
+
+    ctx.font = `600 ${fontSize}px system-ui`;
+
+    const metrics = ctx.measureText(text);
+
+    const paddingX = 5;
+    const paddingY = 3;
+
+    const boxWidth = metrics.width + paddingX * 2;
+    const boxHeight = fontSize + paddingY * 2 + 2;
+
+    let labelX = p.x;
+    let labelY = p.y - boxHeight;
+
+    if (labelY < 0) {
+        labelY = p.y;
+    }
+
+    ctx.fillStyle = isSelected
+        ? "rgba(255,255,255,0.95)"
+        : classColor(det.class_id, 0.9);
+
+    ctx.fillRect(
+        labelX,
+        labelY,
+        boxWidth,
+        boxHeight
+    );
+
+    ctx.fillStyle = isSelected
+        ? "#000"
+        : "#111";
+
+    ctx.fillText(
+        text,
+        labelX + paddingX,
+        labelY + fontSize + paddingY
+    );
+}
+
+
+/*
+|--------------------------------------------------------------------------
+| Detection picking
+|--------------------------------------------------------------------------
+*/
+
+function findDetectionAt(imageX, imageY) {
+    const detections = getDetections();
+
+    // Iterate backwards to pick later/top-most detections first.
+    for (let i = detections.length - 1; i >= 0; i--) {
+
+        const det = detections[i];
+
+        if (!detectionVisible(det)) {
+            continue;
+        }
+
+        if (!Array.isArray(det.bbox_xyxy)) {
+            continue;
+        }
+
+        const [x1, y1, x2, y2] = det.bbox_xyxy;
+
+        if (
+            imageX >= x1 &&
+            imageX <= x2 &&
+            imageY >= y1 &&
+            imageY <= y2
+        ) {
+            return i;
+        }
+    }
+
+    return -1;
+}
+
+
+/*
+|--------------------------------------------------------------------------
+| Mouse
+|--------------------------------------------------------------------------
+*/
+
+viewer.addEventListener("wheel", event => {
+    event.preventDefault();
+
+    const rect = viewer.getBoundingClientRect();
+
+    const x = event.clientX - rect.left;
+    const y = event.clientY - rect.top;
+
+    const factor = event.deltaY < 0
+        ? 1.15
+        : 1 / 1.15;
+
+    zoomAt(x, y, factor);
+}, {
+    passive: false
+});
+
+
+viewer.addEventListener("mousedown", event => {
+    if (event.button !== 0) {
+        return;
+    }
+
+    dragging = true;
+    viewer.classList.add("dragging");
+
+    dragStartX = event.clientX;
+    dragStartY = event.clientY;
+
+    dragStartOffsetX = offsetX;
+    dragStartOffsetY = offsetY;
+});
+
+
+window.addEventListener("mousemove", event => {
+    const rect = viewer.getBoundingClientRect();
+
+    const sx = event.clientX - rect.left;
+    const sy = event.clientY - rect.top;
+
+    if (dragging) {
+        offsetX =
+            dragStartOffsetX +
+            (event.clientX - dragStartX);
+
+        offsetY =
+            dragStartOffsetY +
+            (event.clientY - dragStartY);
+
+        draw();
+        return;
+    }
+
+    if (
+        sx < 0 ||
+        sy < 0 ||
+        sx > rect.width ||
+        sy > rect.height
+    ) {
+        if (hoveredDetectionIndex !== -1) {
+            hoveredDetectionIndex = -1;
+            draw();
+        }
+
+        return;
+    }
+
+    const p = screenToImage(sx, sy);
+
+    const index = findDetectionAt(p.x, p.y);
+
+    if (index !== hoveredDetectionIndex) {
+        hoveredDetectionIndex = index;
+        draw();
+    }
+});
+
+
+window.addEventListener("mouseup", event => {
+    if (!dragging) {
+        return;
+    }
+
+    const movement = Math.hypot(
+        event.clientX - dragStartX,
+        event.clientY - dragStartY
+    );
+
+    dragging = false;
+    viewer.classList.remove("dragging");
+
+    // Treat very small movement as a click.
+    if (movement < 4) {
+        const rect = viewer.getBoundingClientRect();
+
+        const sx = event.clientX - rect.left;
+        const sy = event.clientY - rect.top;
+
+        const p = screenToImage(sx, sy);
+
+        const index = findDetectionAt(p.x, p.y);
+
+        selectDetection(index);
+    }
+});
+
+
+viewer.addEventListener("dblclick", event => {
+    const rect = viewer.getBoundingClientRect();
+
+    zoomAt(
+        event.clientX - rect.left,
+        event.clientY - rect.top,
+        2
+    );
+});
+
+
+/*
+|--------------------------------------------------------------------------
+| Detection selection / list
+|--------------------------------------------------------------------------
+*/
+
+function selectDetection(index) {
+    selectedDetectionIndex = index;
+
+    if (index >= 0) {
+        const det = getDetections()[index];
+
+        jsonPanel.textContent = JSON.stringify(
+            det,
+            null,
+            2
+        );
+    } else {
+        jsonPanel.textContent =
+            "Click a detection to inspect it.";
+    }
+
+    updateDetectionListSelection();
+    draw();
+}
+
+
+function buildDetectionList() {
+    const detections = getDetections();
+
+    detectionListElement.innerHTML = "";
+
+    detections.forEach((det, index) => {
+
+        const row = document.createElement("div");
+        row.className = "detection";
+        row.dataset.index = index;
+
+        if (!detectionVisible(det)) {
+            row.classList.add("filtered");
+        }
+
+        const title = document.createElement("div");
+        title.className = "det-title";
+
+        title.textContent =
+            `#${index} ` +
+            `${det.class_name ?? "unknown"} ` +
+            `${Number(det.confidence ?? 0).toFixed(4)}`;
+
+        const details = document.createElement("div");
+        details.className = "det-details";
+
+        if (Array.isArray(det.bbox_xyxy)) {
+            const [x1, y1, x2, y2] = det.bbox_xyxy;
+
+            const width = x2 - x1;
+            const height = y2 - y1;
+
+            details.textContent =
+                `class=${det.class_id} ` +
+                `bbox=${width.toFixed(1)}×${height.toFixed(1)}`;
+        }
+
+        row.appendChild(title);
+        row.appendChild(details);
+
+        row.addEventListener("click", () => {
+            selectDetection(index);
+            focusDetection(index);
+        });
+
+        detectionListElement.appendChild(row);
+    });
+
+    updateDetectionListSelection();
+}
+
+
+function updateDetectionListSelection() {
+    const rows =
+        detectionListElement.querySelectorAll(".detection");
+
+    rows.forEach(row => {
+        const index = Number(row.dataset.index);
+
+        row.classList.toggle(
+            "selected",
+            index === selectedDetectionIndex
+        );
+
+        const det = getDetections()[index];
+
+        row.classList.toggle(
+            "filtered",
+            !detectionVisible(det)
+        );
+    });
+}
+
+
+function focusDetection(index) {
+    const det = getDetections()[index];
+
+    if (!det || !Array.isArray(det.bbox_xyxy)) {
+        return;
+    }
+
+    const [x1, y1, x2, y2] = det.bbox_xyxy;
+
+    const boxWidth = Math.max(1, x2 - x1);
+    const boxHeight = Math.max(1, y2 - y1);
+
+    const availableWidth = viewer.clientWidth * 0.7;
+    const availableHeight = viewer.clientHeight * 0.7;
+
+    zoom = Math.min(
+        availableWidth / boxWidth,
+        availableHeight / boxHeight
+    );
+
+    zoom = clamp(zoom, 0.01, 20);
+
+    const cx = (x1 + x2) / 2;
+    const cy = (y1 + y2) / 2;
+
+    offsetX =
+        viewer.clientWidth / 2 -
+        cx * zoom;
+
+    offsetY =
+        viewer.clientHeight / 2 -
+        cy * zoom;
+
+    draw();
+}
+
+
+/*
+|--------------------------------------------------------------------------
+| Record summary
+|--------------------------------------------------------------------------
+*/
+
+function updateSummary() {
+    if (!currentData) {
+        summaryElement.textContent = "No data.";
+        return;
+    }
+
+    const detections = getDetections();
+
+    const classes = {};
+
+    for (const det of detections) {
+        const name = det.class_name ?? `class_${det.class_id}`;
+
+        classes[name] = (classes[name] ?? 0) + 1;
+    }
+
+    summaryElement.textContent =
+        `Image: ${currentData.image_width ?? "?"} × ${currentData.image_height ?? "?"}\n` +
+        `Task: ${currentData.task ?? "?"}\n` +
+        `Size mode: ${currentData.size_mode ?? "?"}\n` +
+        `CUDA: ${currentData.cuda_device ?? "?"}\n` +
+        `Detections: ${detections.length}\n\n` +
+        `Classes:\n` +
+        Object.entries(classes)
+            .map(([name, count]) => `  ${name}: ${count}`)
+            .join("\n") +
+        `\n\nPath:\n${currentData.input_jpg_path ?? "?"}`;
+}
+
+
+/*
+|--------------------------------------------------------------------------
+| API
+|--------------------------------------------------------------------------
+*/
+
+async function loadRecords() {
+    setStatus("Loading records...");
+
+    selectedDetectionIndex = -1;
+    hoveredDetectionIndex = -1;
+
+    try {
+        const response = await fetch(
+            API_RECORDS,
+            {
+                cache: "no-store"
+            }
+        );
+
+        if (!response.ok) {
+            throw new Error(
+                `HTTP ${response.status}: ${await response.text()}`
+            );
+        }
+
+        records = await response.json();
+
+        if (!Array.isArray(records)) {
+            throw new Error(
+                "Expected /debug/last_ai_records to return an array."
+            );
+        }
+
+        populateRecordSelect();
+
+        if (records.length > 0) {
+            await loadRecord(0);
+        } else {
+            currentData = null;
+            image = null;
+
+            summaryElement.textContent =
+                "No YOLO records returned.";
+
+            detectionListElement.innerHTML = "";
+
+            setStatus("No records");
+            draw();
+        }
+
+    } catch (error) {
+        console.error(error);
+
+        setStatus("ERROR");
+
+        summaryElement.textContent =
+            `Failed to load records:\n${error.message}`;
+    }
+}
+
+
+function populateRecordSelect() {
+    recordSelect.innerHTML = "";
+
+    records.forEach((record, index) => {
+        const data = unwrapRecord(record);
+
+        const option = document.createElement("option");
+
+        option.value = index;
+
+        const filename =
+            getFilename(data?.input_jpg_path ?? "");
+
+        const detections =
+            data?.detections?.length ?? 0;
+
+        option.textContent =
+            `${index}: ${filename || "record"} (${detections})`;
+
+        recordSelect.appendChild(option);
+    });
+}
+
+
+function getFilename(path) {
+    if (!path) {
+        return "";
+    }
+
+    // Works with both \ and /
+    return path.split(/[\\/]/).pop();
+}
+
+
+async function loadRecord(index) {
+    if (index < 0 || index >= records.length) {
+        return;
+    }
+
+    currentRecordIndex = index;
+
+    recordSelect.value = String(index);
+
+    currentData = unwrapRecord(records[index]);
+
+    selectedDetectionIndex = -1;
+    hoveredDetectionIndex = -1;
+
+    jsonPanel.textContent =
+        "Click a detection to inspect it.";
+
+    updateSummary();
+    buildDetectionList();
+
+    await loadImage(currentData?.input_jpg_path);
+}
+
+
+async function loadImage(path) {
+    image = null;
+    draw();
+
+    if (!path) {
+        setStatus("No input_jpg_path");
+        return;
+    }
+
+    setStatus("Loading image...");
+
+    const url =
+        `${API_IMAGE}?path=${encodeURIComponent(path)}`;
+
+    const newImage = new Image();
+
+    newImage.onload = () => {
+        image = newImage;
+
+        resizeCanvas();
+        fitImage();
+
+        // Helpful sanity warning.
+        if (
+            currentData?.image_width &&
+            currentData?.image_height &&
+            (
+                currentData.image_width !== image.naturalWidth ||
+                currentData.image_height !== image.naturalHeight
+            )
+        ) {
+            console.warn(
+                "YOLO dimensions do not match actual image:",
+                {
+                    yolo: [
+                        currentData.image_width,
+                        currentData.image_height
+                    ],
+                    actual: [
+                        image.naturalWidth,
+                        image.naturalHeight
+                    ]
+                }
+            );
+        }
+    };
+
+    newImage.onerror = error => {
+        console.error("Image load failed", error);
+
+        setStatus("Image load failed");
+
+        summaryElement.textContent +=
+            `\n\nIMAGE LOAD FAILED:\n${url}`;
+    };
+
+    newImage.src = url;
+}
+
+
+/*
+|--------------------------------------------------------------------------
+| Controls
+|--------------------------------------------------------------------------
+*/
+
+recordSelect.addEventListener("change", async () => {
+    await loadRecord(
+        Number(recordSelect.value)
+    );
+});
+
+
+reloadButton.addEventListener("click", async () => {
+    await loadRecords();
+});
+
+
+fitButton.addEventListener("click", () => {
+    fitImage();
+});
+
+
+actualButton.addEventListener("click", () => {
+    actualSize();
+});
+
+
+confidenceSlider.addEventListener("input", () => {
+    confidenceValue.textContent =
+        Number(confidenceSlider.value).toFixed(2);
+
+    updateDetectionListSelection();
+    draw();
+});
+
+
+[
+    showBoxes,
+    showMasks,
+    fillMasks,
+    showLabels,
+    showPoints
+].forEach(element => {
+    element.addEventListener("change", draw);
+});
+
+
+/*
+|--------------------------------------------------------------------------
+| Keyboard shortcuts
+|--------------------------------------------------------------------------
+*/
+
+window.addEventListener("keydown", event => {
+
+    if (event.key === "f" || event.key === "F") {
+        fitImage();
+    }
+
+    if (event.key === "0") {
+        actualSize();
+    }
+
+    if (event.key === "Escape") {
+        selectDetection(-1);
+    }
+
+    if (event.key === "+" || event.key === "=") {
+        zoomAt(
+            viewer.clientWidth / 2,
+            viewer.clientHeight / 2,
+            1.25
+        );
+    }
+
+    if (event.key === "-") {
+        zoomAt(
+            viewer.clientWidth / 2,
+            viewer.clientHeight / 2,
+            1 / 1.25
+        );
+    }
+});
+
+
+/*
+|--------------------------------------------------------------------------
+| Start
+|--------------------------------------------------------------------------
+*/
+
+confidenceValue.textContent =
+    Number(confidenceSlider.value).toFixed(2);
+
+resizeCanvas();
+loadRecords();
+
+</script>
+
+</body>
+</html>
