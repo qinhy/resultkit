@@ -228,6 +228,10 @@ class _DepthAIPoeRGBStereoMjpegCapture:
         left_cam = pipeline.create(dai.node.Camera).build(left_socket)
         right_cam = pipeline.create(dai.node.Camera).build(right_socket)
 
+        if owner.max_exposure_us:
+            for camera in (rgb_cam, left_cam, right_cam):
+                camera.initialControl.setAutoExposureLimit(owner.max_exposure_us)
+
         rgb_frame = rgb_cam.requestOutput(
             (owner.rgb_width, owner.rgb_height),
             self._img_frame_type(owner.rgb_mjpeg_input_type),
@@ -316,6 +320,7 @@ class _DepthAIPoeRGBStereoMjpegCapture:
         self._log("status", f"  RGB size: {owner.rgb_width}x{owner.rgb_height}")
         self._log("status", f"  Stereo size: {owner.stereo_width}x{owner.stereo_height}")
         self._log("status", f"  Capture FPS: {owner.capture_fps}")
+        self._log("status", f"  Max exposure us: {owner.max_exposure_us}")
         self._log("status", "  OAK encoder: MJPEG")
         self._log("status", f"  RGB MJPEG quality: {owner.rgb_mjpeg_quality}")
         self._log("status", f"  Stereo MJPEG quality: {owner.stereo_mjpeg_quality}")
@@ -673,6 +678,7 @@ class DepthAIPoeRGBStereoMjpegGenerator:
     """
 
     capture_fps: float = 15.0
+    max_exposure_us: int = 0
 
     rgb_width: int = 4032
     rgb_height: int = 3040
@@ -707,6 +713,7 @@ class DepthAIPoeRGBStereoMjpegGenerator:
 
     _config_fields = (
         "capture_fps",
+        "max_exposure_us",
         "rgb_width",
         "rgb_height",
         "stereo_width",

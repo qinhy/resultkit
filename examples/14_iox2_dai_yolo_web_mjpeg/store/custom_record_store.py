@@ -49,7 +49,7 @@ import numpy as np
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator, model_validator
 
 
-RecordMode = Literal["dual_rgb", "rgb_stereo"]
+RecordMode = Literal["dual_rgb", "rgbd_hand"]
 ImageStream = Literal["rgb", "left", "right"]
 PCDKind = Literal["file", "folder"]
 PCDEncoding = Literal["ascii", "binary"]
@@ -62,7 +62,7 @@ JST = timezone(timedelta(hours=9), name="JST")
 CAMERA_IMAGE_EXTENSION = ".jpg"
 CAMERA_IMAGE_ENCODING = "mjpeg"
 JPEG_LIKE_SUFFIXES = frozenset({".jpg", ".jpeg", ".mjpg", ".mjpeg"})
-VALID_MODES = frozenset({"dual_rgb", "rgb_stereo"})
+VALID_MODES = frozenset({"dual_rgb", "rgbd_hand"})
 VALID_IMAGE_STREAMS = frozenset({"rgb", "left", "right"})
 
 RECORD_ID_RE = re.compile(
@@ -1023,7 +1023,7 @@ class ArmRecord(RecordModel):
     __positional_fields__ = ("parent", "kind", "suffix")
 
     parent: CustomRecord = Field(repr=False, exclude=True)
-    kind: str = "pose"
+    kind: str = "arm_result"
     suffix: str = ".json"
 
     @field_validator("kind")
@@ -1039,9 +1039,6 @@ class ArmRecord(RecordModel):
     def expected_root_path(self) -> RecordPath:
         return self.parent.expected_arm_path
 
-    def expected_path(self) -> RecordPath:
-        return self.expected_root_path() / f"{self.kind}{self.suffix}"
-
     def exists(self) -> bool:
         return self.expected_path().is_file()
 
@@ -1050,14 +1047,37 @@ class ArmRecord(RecordModel):
         path.mkdir(parents=True, exist_ok=True)
         return path
 
-    def write(self, data: Any) -> RecordPath:
-        path = self.expected_path()
+    def add_result(self, run_id: str, data: Dict):
+        run_dir = self.expected_root_path() / run_id
+        run_dir.mkdir(parents=True, exist_ok=True)
+        path = run_dir / f"{run_id}_{self.kind}{self.suffix}"
         _write_json(path, data)
-        return path
 
-    def load(self) -> Any:
-        return _read_json(self.expected_path())
+    def get_result(self, run_id: str) -> Dict:
+        path = (
+            self.expected_root_path()
+            / run_id
+            / f"{run_id}_{self.kind}{self.suffix}"
+        )
+        return _read_json(path)
 
+
+    def list_results(self) -> List[Dict]:
+        root = self.expected_root_path()
+        results = []
+        if not root.exists(): return results
+
+        for run_dir in sorted(root.iterdir()):
+            if not run_dir.is_dir(): continue
+
+            run_id = run_dir.name
+            result_path = run_dir / f"{run_id}_{self.kind}{self.suffix}"
+            if not result_path.is_file(): continue
+
+            results.append(self.get_result(run_id))
+
+        return results
+    
 
 PCD_SEGMENT_RE = re.compile(
     r"^(?P<obj_id>\d+)"
@@ -1704,12 +1724,9 @@ class CustomRecord(RecordModel):
         
     def get_gnss(self, kind: str = "baselink"):
         return GnssRecord(parent=self, kind=kind).load()
-        
-    def add_arm(self, data: Any, kind: str = "pose") -> RecordPath:
-        return ArmRecord(parent=self, kind=kind).write(data)
-    
-    def get_arm(self, kind: str = "pose"):
-        return ArmRecord(parent=self, kind=kind).load()                
+            
+    def get_arm(self):
+        return ArmRecord(parent=self)
 
     def add_image(self, camera_id: str, stream: ImageStream, image: Any) -> RecordPath:
         if stream not in VALID_IMAGE_STREAMS:

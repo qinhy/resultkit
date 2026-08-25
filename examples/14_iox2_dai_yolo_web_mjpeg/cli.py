@@ -53,169 +53,6 @@ def create_fastapi_app():
     )
 
 
-def make_cuda_image_endpoint(image_topic,height,width, is_pub: bool=False, device="cuda:0"):
-    import pycuda.gpuarray as gpuarray
-    if not hasattr(Model4Mat, "ImageMatCUDAPubSub"):
-        raise RuntimeError("Model4Mat.ImageMatCUDAPubSub is not available in this resultkit build")
-    try:
-        data = gpuarray.empty((int(height), int(width), 3), dtype=np.uint8)
-    except Exception as e:
-        print(e)
-        raise ValueError(
-            "PyCUDA context is trying to allocate GPU memory, but probably no current one. "
-            "There are maybe muti-context exits."
-        )
-
-    img = Model4Mat.ImageMatCUDAPubSub(
-        color_format=ColorFormat.RGB,
-        shape_type=ImageShapeType.HWC,
-        dtype=DataType.UINT8,
-        device=device,
-        data=data,
-    )
-    img.set_id(image_topic).init()
-
-    # Some resultkit versions use is_pub, some infer it from pub/sub calls.
-    try:
-        img.is_pub = bool(is_pub)
-    except Exception:
-        pass
-
-    return img
-
-
-_CUDA_LOCK = threading.Lock()
-_CUDA_CTX = None
-def get_cuda_context(device: int = 0):
-    global _CUDA_CTX
-    import pycuda.driver as cuda
-
-    cuda.init()
-
-    if _CUDA_CTX is None:
-        # Use CUDA primary context instead of making/detaching a new user context
-        # for every HTTP request.
-        _CUDA_CTX = cuda.Device(int(device)).retain_primary_context()
-
-    return _CUDA_CTX
-
-
-@contextmanager
-def pycuda_context(device: int):
-    import pycuda.driver as cuda
-
-    ctx = get_cuda_context(device)
-    ctx.push()
-    try:
-        yield
-        cuda.Context.synchronize()
-    finally:
-        cuda.Context.pop()
-
-
-def numpy_image_to_png_bytes(arr) -> bytes:
-    # Remove batch dimension if present
-    if arr.ndim == 4:
-        arr = arr[0]
-
-    # Convert CHW -> HWC if needed
-    if arr.ndim == 3 and arr.shape[0] in (1, 3, 4):
-        arr = np.transpose(arr, (1, 2, 0))
-
-    # Convert float image to uint8
-    if arr.dtype != np.uint8:
-        if arr.max() <= 1.0:
-            arr = arr * 255.0
-        arr = np.clip(arr, 0, 255).astype(np.uint8)
-
-    # Grayscale with trailing channel
-    if arr.ndim == 3 and arr.shape[2] == 1:
-        arr = arr[:, :, 0]
-
-    image = Image.fromarray(arr)
-
-    buffer = io.BytesIO()
-    image.save(buffer, format="PNG")
-    return buffer.getvalue()
-
-
-async def imgstream(
-    stream_type: str,
-    stream_name: str,
-    width: int = Query(default=4032, gt=0),
-    height: int = Query(default=3040, gt=0),
-    step: int = Query(default=10, gt=0),
-):
-    img = None
-    topic = f"{stream_type}:{stream_name}"
-
-    try:
-        with pycuda_context(0):
-            img = make_cuda_image_endpoint(topic, height, width)
-
-            while True:
-                with _CUDA_LOCK:
-                    img.sub()
-
-                    # rgb
-                    tensor = img.get_data_torch(copy=False)
-
-                    # Downsample on GPU before moving to CPU.
-                    # Assumes image layout is H x W x C or H x W.
-                    if step > 1:
-                        tensor = tensor[::step, ::step, ...].contiguous()
-                    else:
-                        tensor = tensor.contiguous()
-
-                    # Move data fully to CPU while CUDA context and img are still alive.
-                    arr = tensor.detach().cpu().numpy().copy()[:,:,::-1] # to bgr
-
-                # Encode outside the lock.
-                ok, encoded = cv2.imencode(".jpg", arr)
-                if not ok:
-                    continue
-
-                frame = encoded.tobytes()
-
-                yield (
-                    b"--frame\r\n"
-                    b"Content-Type: image/jpeg\r\n"
-                    b"Content-Length: " + str(len(frame)).encode() + b"\r\n"
-                    b"\r\n" + frame + b"\r\n"
-                )
-
-                await asyncio.sleep(0.001)
-
-    except asyncio.CancelledError:
-        # Client disconnected. Let FastAPI/Starlette handle cancellation.
-        raise
-
-    finally:
-        if img is not None:
-            try:
-                img.close()
-            except Exception:
-                pass
-
-
-async def stream_res(
-    stream_type: str,
-    stream_name: str,
-    width: int = Query(default=4032, gt=0),
-    height: int = Query(default=3040, gt=0),
-    step: int = Query(default=10, gt=0),
-):
-    return StreamingResponse(
-        imgstream(stream_type, stream_name, width, height, step),
-        media_type="multipart/x-mixed-replace; boundary=frame",
-        headers={
-            "Cache-Control": "no-cache",
-            "Pragma": "no-cache",
-            "Connection": "close",
-        },
-    )
-
-
 def call_localhost(controller: str, method: str, params: dict = None) -> dict | None:
     if params is None:
         params = {}
@@ -231,11 +68,22 @@ def call_localhost(controller: str, method: str, params: dict = None) -> dict | 
         return None
     
 
-def last_capture_record()->CustomRecord:
-    store_status = call_localhost("store","status")
+def last_capture_record(store_name:str="store_dual")->CustomRecord:
+    store_status = call_localhost(store_name,"status")
     res = store_status["last_capture"]["captures"][-1]["db_record"]
     return CustomRecord(**res)
 
+def last_capture_record_rgb(store_name:str="store_dual"):
+    store_status = call_localhost(store_name,"status")
+    res = store_status["last_capture"]["captures"][-1]["db_record"]
+    res = CustomRecord(**res)
+    file_path = str(res.listup_rgb_image_paths[-1])
+    if not Path(file_path).is_file():
+        raise HTTPException(
+            status_code=404,
+            detail=f"File not found: {file_path}",
+        )
+    return FileResponse(file_path)
 
 def last_ai_records()->List[Dict]:
     store_status = call_localhost("store","status")
@@ -268,11 +116,12 @@ def run_api(host: str, port: int, reload: bool = False) -> None:
     # Import here so existing non-HTTP modes work without uvicorn installed.
     import uvicorn
     app = create_fastapi_app()
-    app.add_api_route("/imgstream/{stream_type}/{stream_name}",
-        stream_res, methods=["GET"], name="imgstream", tags=["image"],)
 
     app.add_api_route("/debug/last_capture_record",
         last_capture_record,methods=["GET"], name="debug", tags=["debug"],)
+    
+    app.add_api_route("/debug/last_capture_record_rgb",
+        last_capture_record_rgb,methods=["GET"], name="debug", tags=["debug"],)
     
     app.add_api_route("/debug/last_ai_records",
         last_ai_records,methods=["GET"], name="debug", tags=["debug"],)

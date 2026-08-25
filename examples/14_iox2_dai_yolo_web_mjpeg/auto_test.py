@@ -61,7 +61,7 @@ def store_watch(sts=[
 def store_capture(sts=[
         "rgbd_left",
         "rgbd_right"
-    ],to_yolo=True,to_pcd=False):
+    ],to_yolo=False,to_pcd=False):
     logging.info("\n=== store.capture ===")
     params = {
         "service": "jrpc",

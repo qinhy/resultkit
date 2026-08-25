@@ -39,6 +39,7 @@ parser = argparse.ArgumentParser(description="Run the rgb_stereo multi-stream re
 parser.add_argument("--service-name", default="jrpc")
 parser.add_argument("--controller-name", default="store")
 parser.add_argument("--store-root", default="recording")
+parser.add_argument("--record-mode", default="rgb_stereo")
 parser.add_argument("--camera-service-name", default=None)
 parser.add_argument("--rgbd-controller", type=str, default=DEFAULT_CONTROLLER, help="comma-separated controllers, e.g. rgbd_left,rgbd_right")
 parser.add_argument("--rgbd-stream", type=str, default=None, help="comma-separated stream IDs aligned with controllers")
@@ -50,7 +51,7 @@ args = parser.parse_args()
 def csv(text: str | None) -> list[str]:
     return [x.strip() for x in str(text or "").split(",") if x.strip()]
 
-
+RECORD_MODE = args.record_mode
 CONTROLLERS = csv(args.rgbd_controller) or [DEFAULT_CONTROLLER]
 STREAM_IDS = csv(args.rgbd_stream) or CONTROLLERS
 CAMERA_SERVICE = args.camera_service_name or args.service_name
@@ -109,7 +110,7 @@ class StatusResult(StoreModel):
     streams: dict[str, str]
     subscribed_streams: list[str]
     last_error: str | None = None
-    last_capture: dict[str, Any] | None = None
+    last_capture: CaptureResult | None = None
 
 
 class WatchResult(StoreModel):
@@ -407,7 +408,7 @@ class StoreController:
     _lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False)
     _subs: dict[str, Subscriber] = field(default_factory=dict, init=False, repr=False)
     _last_error: str | None = field(default=None, init=False, repr=False)
-    _last_capture: dict[str, Any] | None = field(default=None, init=False, repr=False)
+    _last_capture: CaptureResult | None = field(default=None, init=False, repr=False)
     _calibration_dicts: dict[str, dict] = field(default_factory=dict, init=False, repr=False)
     _hooks: HookDispatcher = field(default_factory=HookDispatcher,init=False,repr=False)
 
@@ -642,7 +643,7 @@ class StoreController:
                 ok = all(x.ok for x in captures)
                 error = None if ok else "\n".join(f"{x.stream_id}: {x.error}" for x in captures if not x.ok)
                 result = CaptureResult(ok=ok, stream_ids=stream_ids, field_id=field_id, captures=captures, error=error)
-                self._last_capture = dump_model(result)
+                self._last_capture = result
                 self._last_error = error
                 logger(f"[{args.service_name}:{args.controller_name}:capture] capture completed",
                     level="info" if ok else "warning",

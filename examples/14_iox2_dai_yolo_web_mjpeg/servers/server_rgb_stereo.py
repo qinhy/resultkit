@@ -64,6 +64,7 @@ class CameraConfig(CameraBaseModel):
     stereo_width: int = 1280
     stereo_height: int = 800
     capture_fps: int = 15
+    max_exposure_us: int = 60000
 
     rgb_camera_socket: str = "CAM_A"
     left_camera_socket: str = "CAM_B"
@@ -417,6 +418,7 @@ def build_dai_generator(config: CameraConfig) -> DepthAIPoeRGBStereoMjpegGenerat
         stereo_width=config.stereo_width,
         stereo_height=config.stereo_height,
         capture_fps=config.capture_fps,
+        max_exposure_us=config.max_exposure_us,
         rgb_camera_socket=config.rgb_camera_socket,
         left_camera_socket=config.left_camera_socket,
         right_camera_socket=config.right_camera_socket,

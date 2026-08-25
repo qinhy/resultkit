@@ -90,7 +90,7 @@ def build_rgb_indexed_cloud_vpi(
     rectifier = calibration.get_rectifier(alpha)
     left_rect, right_rect, rect = rectifier.rectify(left_image, right_image)
 
-    disparity, confidence_u16 = predictor.predict(left_rect, right_rect)
+    disparity,confidence_u16 = predictor.predict(left_rect, right_rect)
     points_rect, _ = rect.disparity_to_points_rectified(
         disparity,
         confidence_u16,
