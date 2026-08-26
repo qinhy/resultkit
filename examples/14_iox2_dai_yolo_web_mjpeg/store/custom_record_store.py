@@ -28,17 +28,19 @@ The data-model classes use Pydantic v2 models while still representing a live
 filesystem object graph. Parent/child references and filesystem connection objects
 are excluded from normal model serialization to avoid recursive wire payloads.
 """
-
 from __future__ import annotations
 
 import calendar
+import contextlib
+import errno
 import json
 import os
 import posixpath
 import re
+import threading
 from datetime import date, datetime, timedelta, timezone
-from io import BytesIO
 from functools import total_ordering
+from io import BytesIO
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Any, ClassVar, Dict, Iterator, List, Literal, Mapping, Sequence, cast
@@ -122,47 +124,154 @@ class FrozenRecordModel(RecordModel):
 # ---------------------------------------------------------------------------
 
 
+class _ConnState:
+    def __init__(self) -> None:
+        self.lock = threading.RLock()
+        self.generation = 0
+
+
 class RecordFS:
-    """Filesystem adapter used by all record objects.
-
-    ``root_url`` may be a normal local directory or any fsspec URL such as
-    ``s3://bucket/prefix``.  S3-compatible services (for example MinIO) are
-    configured through ``storage_options`` and s3fs' ``endpoint_url`` option.
-    """
-
     def __init__(
         self,
         root_url: str | Path,
         storage_options: Mapping[str, Any] | None = None,
+        *,
+        keepalive: int = 30,
     ) -> None:
         self.storage_options = dict(storage_options or {})
-        root_text = str(root_url)
-        if "://" not in root_text:
-            root_text = str(Path(root_text).absolute())
+        self.keepalive = keepalive
+        self._state = _ConnState()
 
-        self.fs, root_key = fsspec.core.url_to_fs(root_text, **self.storage_options)
-        self.root_key = root_key.rstrip("/")
-        protocol = self.fs.protocol
-        if isinstance(protocol, (tuple, list)):
-            protocols = set(protocol)
-        else:
-            protocols = {protocol}
+        url = str(root_url)
+        if "://" not in url:
+            url = str(Path(url).absolute())
+
+        if url.split("://", 1)[0] in {"sftp", "ssh"}:
+            self.storage_options.setdefault("skip_instance_cache", True)
+
+        self.fs, root = fsspec.core.url_to_fs(url, **self.storage_options)
+        self.root_key = root.rstrip("/")
+
+        protocols = self._protocols()
         self.is_local = bool({"file", "local"} & protocols) or bool(
             getattr(self.fs, "local_file", False)
         )
-        self.root_url = (
-            str(Path(self.root_key))
-            if self.is_local
-            else self._display_remote(self.root_key)
+        self.root_url = self.display(self.root_key)
+        self._configure()
+
+    def _protocols(self) -> set[str]:
+        p = self.fs.protocol
+        return set(map(str, p)) if isinstance(p, (tuple, list, set)) else {str(p)}
+
+    @property
+    def _is_sftp(self) -> bool:
+        return bool({"sftp", "ssh"} & self._protocols())
+
+    def _configure(self) -> None:
+        if not self._is_sftp:
+            return
+        transport = self.fs.client.get_transport()
+        if transport and self.keepalive > 0:
+            transport.set_keepalive(self.keepalive)
+
+    @staticmethod
+    def _connection_error(exc: BaseException) -> bool:
+        errnos = {
+            errno.EPIPE,
+            errno.ECONNRESET,
+            errno.ECONNABORTED,
+            errno.ENOTCONN,
+            errno.ETIMEDOUT,
+        }
+        messages = (
+            "socket is closed",
+            "socket closed",
+            "connection reset",
+            "connection lost",
+            "broken pipe",
+            "server connection dropped",
+            "session is not active",
+            "channel closed",
+            "transport is not active",
         )
 
+        while exc:
+            if isinstance(exc, EOFError):
+                return True
+            if isinstance(exc, OSError) and exc.errno in errnos:
+                return True
+            if any(x in str(exc).lower() for x in messages):
+                return True
+            exc = exc.__cause__ or exc.__context__
+
+        return False
+
+    def _reconnect(self, generation: int | None = None) -> None:
+        if not self._is_sftp:
+            return
+
+        with self._state.lock:
+            if generation is not None and generation != self._state.generation:
+                return
+
+            with contextlib.suppress(Exception):
+                self.fs.ftp.close()
+            with contextlib.suppress(Exception):
+                self.fs.client.close()
+
+            self.fs._connect()
+            self._configure()
+            self._state.generation += 1
+
+    def reconnect(self) -> None:
+        self._reconnect()
+
+    def _call(self, method: str, *args: Any, **kwargs: Any) -> Any:
+        fn = getattr(self.fs, method)
+
+        if not self._is_sftp:
+            return fn(*args, **kwargs)
+
+        generation = self._state.generation
+
+        try:
+            return fn(*args, **kwargs)
+        except Exception as exc:
+            if not self._connection_error(exc):
+                raise
+
+        self._reconnect(generation)
+        return getattr(self.fs, method)(*args, **kwargs)
+
+    def read_bytes(self, key: str) -> bytes:
+        return self._call("cat_file", key)
+
+    def info(self, key: str) -> dict[str, Any]:
+        return self._call("info", key)
+
+    def exists(self, key: str) -> bool:
+        try:
+            self.info(key)
+            return True
+        except (FileNotFoundError,):
+            return False
+        except OSError as exc:
+            if exc.errno == errno.ENOENT:
+                return False
+            raise
+
+    def ls(self, key: str, **kwargs: Any) -> Any:
+        return self._call("ls", key, **kwargs)
+
+    def glob(self, pattern: str, **kwargs: Any) -> Any:
+        return self._call("glob", pattern, **kwargs)
+
+    def find(self, key: str, **kwargs: Any) -> Any:
+        return self._call("find", key, **kwargs)
+
     def _join_key(self, *parts: str) -> str:
-        cleaned = [str(part).strip("/") for part in parts if str(part)]
-        if not cleaned:
-            return self.root_key
-        if not self.root_key:
-            return posixpath.join(*cleaned)
-        return posixpath.join(self.root_key, *cleaned)
+        parts = [str(x).strip("/") for x in parts if str(x)]
+        return posixpath.join(self.root_key, *parts) if self.root_key else posixpath.join(*parts)
 
     def path(self, *parts: str) -> "RecordPath":
         return RecordPath(self, self._join_key(*parts))
@@ -171,40 +280,25 @@ class RecordFS:
         return RecordPath(self, key.rstrip("/"))
 
     def subtree(self, root_key: str) -> "RecordFS":
-        """Return a cheap view sharing the same filesystem connection."""
         clone = RecordFS.__new__(RecordFS)
         clone.fs = self.fs
+        clone._state = self._state
         clone.root_key = root_key.rstrip("/")
         clone.storage_options = dict(self.storage_options)
+        clone.keepalive = self.keepalive
         clone.is_local = self.is_local
         clone.root_url = clone.display(clone.root_key)
         return clone
 
     def _display_remote(self, key: str) -> str:
-        """Return a connection-complete URL for a remote filesystem path.
-
-        ``AbstractFileSystem.unstrip_protocol()`` only restores the protocol.
-        For host-based filesystems such as SFTP it therefore produces values
-        like ``sftp:///data/recording`` and loses the host/port.  Rebuild the
-        SFTP authority from the live filesystem connection instead.
-        """
-        protocol = self.fs.protocol
-        protocols = list(protocol) if isinstance(protocol, (tuple, list)) else [protocol]
-        primary = str(protocols[0])
-
-        if primary in {"sftp", "ssh"} and hasattr(self.fs, "host"):
-            host = str(self.fs.host)
-            ssh_kwargs = getattr(self.fs, "ssh_kwargs", {}) or {}
-            port = ssh_kwargs.get("port")
-            authority = f"{host}:{port}" if port is not None else host
+        if self._is_sftp and hasattr(self.fs, "host"):
+            port = (getattr(self.fs, "ssh_kwargs", {}) or {}).get("port")
+            authority = f"{self.fs.host}:{port}" if port else str(self.fs.host)
             return f"sftp://{authority}/{key.lstrip('/')}"
-
         return self.fs.unstrip_protocol(key)
 
     def display(self, key: str) -> str:
-        if self.is_local:
-            return str(Path(key))
-        return self._display_remote(key)
+        return str(Path(key)) if self.is_local else self._display_remote(key)
 
 
 @total_ordering
@@ -1664,6 +1758,48 @@ class CustomRecord(RecordModel):
 
     def rel(self, path: RecordPath | Path) -> str:
         return _rel(path, self.path)
+
+    @property
+    def is_remote(self) -> bool:
+        return not self._storage.is_local
+    
+    def bind_as_sftp(self, host: str, prefix: str = "",
+        storage_options: Mapping[str, Any] | None = None,
+    ) -> "CustomRecord":
+        """Return the same logical record bound to an SFTP backend."""
+        if self.is_remote:return self
+        # is_win = str(self.root_path).contains(":\\")
+
+        host = host.removeprefix("sftp://").rstrip("/")
+        prefix = prefix.strip("/")
+        local_root = str(self.root_path).lstrip("/")
+        parts = [p for p in (prefix, local_root) if p]
+        remote_root = "/".join(parts)
+        root_url = f"sftp://{host}/{remote_root}"
+
+        return CustomRecord(
+            root_path=root_url,
+            mode=self.mode,
+            field_id=self.field_id,
+            record_id=self.record_id,
+            timestamp_ns_utc=self.timestamp_ns_utc,
+            date_utc=self.date_utc,
+            storage_options=dict(storage_options or {}),
+        )
+    
+    def bind_as_local(self) -> "CustomRecord":
+        """Return the same logical record bound to a local filesystem."""
+        if not self.is_remote: return self        
+        remote_path = self.root_path
+        local_root = "/" + "/".join(remote_path.split("://")[1].split("/")[1:])
+        return CustomRecord(root_path=local_root,
+            mode=self.mode,
+            field_id=self.field_id,
+            record_id=self.record_id,
+            timestamp_ns_utc=self.timestamp_ns_utc,
+            date_utc=self.date_utc,
+            storage_options={},
+        )
 
     def commit(self) -> RecordPath:
         """Mark the record complete after all component uploads succeed.

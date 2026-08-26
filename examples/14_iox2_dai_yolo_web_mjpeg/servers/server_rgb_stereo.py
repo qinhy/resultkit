@@ -913,7 +913,9 @@ class CameraController:
     def close(self, params: EmptyParams) -> CameraStatusResult:
         with self._state_lock:
             self._stop_worker_unlocked()
-            return self._status_unlocked()
+            res = self._status_unlocked()
+            self.opened = False
+            return res
 
     def status(self, params: EmptyParams) -> CameraStatusResult:
         with self._state_lock:

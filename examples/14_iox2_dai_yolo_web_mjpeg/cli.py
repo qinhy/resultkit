@@ -26,10 +26,6 @@ sys.path.append(os.path.dirname(os.path.dirname(Path(__file__).absolute().parent
 
 from store.custom_record_store import CustomRecord,YoloRecord
 
-from resultkit.MatModel import ColorFormat, ImageShapeType, Model4Mat
-from resultkit.mat import DataType
-
-
 def print_json(value: Any) -> str:
     if isinstance(value, BaseModel):
         return value.model_dump_json(indent=2)
