@@ -82,7 +82,7 @@ class StartYoloParams(YoloBaseModel):
 
     size_mode: SizeMode = "tiling"
     cuda_device: int = 0
-    db_record: CustomRecord = CustomRecord.empty()
+    db_record: CustomRecord = field(default_factory=CustomRecord.empty)
     input_jpg_paths: List[str] = [] # field(default_factory=list)
     output_json_paths: List[str] = [] # field(default_factory=list)
 
