@@ -2186,4 +2186,14 @@ def jst_datetime_to_time_ns(date_str: str, time_str: str) -> int:
 
 
 if __name__ == "__main__":
+    # fs = RecordFS(
+    #     "sftp://localhost:2222/",
+    #     storage_options={
+    #         "username": "myuser",
+    #         "password": "mypassword",
+    #     },
+    #     keepalive=30,
+    # )
+
+    # print(fs.ls(fs.root_key))
     pass
