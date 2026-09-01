@@ -1377,7 +1377,7 @@ class CustomRecord(RecordModel):
         "timestamp_ns_utc",
         "date_utc",
         "storage_options",
-        "_storage",
+        # "_storage",
     )
 
     root_path: Path | str

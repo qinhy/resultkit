@@ -303,8 +303,9 @@
 |--------------------------------------------------------------------------
 */
 
+
+const API_GET_FILE   = "/debug/get_debug_file";
 const API_RECORDS = "/debug/last_ai_records";
-const API_IMAGE   = "/debug/get_debug_file";
 
 
 /*
@@ -1205,7 +1206,7 @@ async function loadRecords() {
         populateRecordSelect();
 
         if (records.length > 0) {
-            await loadRecord(0);
+            await loadYoloRecord(0);
         } else {
             currentData = null;
             image = null;
@@ -1264,7 +1265,7 @@ function getFilename(path) {
 }
 
 
-async function loadRecord(index) {
+async function loadYoloRecord(index) {
     if (index < 0 || index >= records.length) {
         return;
     }
@@ -1300,7 +1301,7 @@ async function loadImage(path) {
     setStatus("Loading image...");
 
     const url =
-        `${API_IMAGE}?path=${encodeURIComponent(path)}`;
+        `${API_GET_FILE}?path=${encodeURIComponent(path)}`;
 
     const newImage = new Image();
 
@@ -1355,7 +1356,7 @@ async function loadImage(path) {
 */
 
 recordSelect.addEventListener("change", async () => {
-    await loadRecord(
+    await loadYoloRecord(
         Number(recordSelect.value)
     );
 });
