@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
 from queue import Empty, Queue
@@ -121,6 +122,14 @@ class YoloSettings(YoloBaseModel):
 
     model_name: str = "yolo11l-seg.pt"
 
+    # Number of already-loaded model weights to keep in the in-memory LRU cache.
+    # A value of 1 behaves similarly to the old single-model implementation.
+    model_cache_size: int = Field(default=4, ge=1)
+    # False: inactive cached models are moved to CPU/float32 to conserve VRAM.
+    # True: keep models on their last device/dtype for the fastest switching,
+    #       at the cost of additional GPU memory usage.
+    model_cache_keep_on_device: bool = True
+
     imgsz: int = Field(default=1280, gt=0)
     confidence: float = Field(default=0.25, ge=0.0, le=1.0)
     iou: float = Field(default=0.45, ge=0.0, le=1.0)
@@ -237,29 +246,29 @@ class YoloDetectResult(BaseModel):
         return json.dumps(self.model_dump(mode="json", exclude_none=True), ensure_ascii=False, indent=indent)
 
 
+@dataclass
+class _YoloModelCacheEntry:
+    """One loaded YOLO model plus metadata needed by the raw forward path."""
+
+    model: Any
+    names: dict[int, str]
+    nc: int
+    mask_coeff_count: int
+    is_segment_model: bool
+    device: Any
+    dtype: Any
+
+
 class YoloDetector:
     """High-throughput Torch-first wrapper around Ultralytics YOLO weights.
 
-    Performance-oriented changes compared with the original implementation:
+    Model weights are cached in an in-memory LRU cache. Switching back to a
+    previously-used ``model_name`` therefore avoids re-reading and rebuilding
+    the model from disk.
 
-    * JPEG files are decoded with ``torchvision.io.decode_jpeg``. On CUDA this
-      uses nvJPEG and returns a CHW uint8 tensor directly on the GPU.
-    * The model is moved/cast only when the requested device or precision
-      changes, instead of once per image or tile.
-    * Letterbox resize, normalization, padding, and tile crops stay in Torch.
-    * Tiles are submitted to the model in batches. Configure the batch size by
-      adding ``tile_batch_size`` to ``YoloSettings``; otherwise it defaults to 8.
-    * Detection tensors are copied to CPU in bulk instead of synchronizing once
-      for every scalar.
-    * Masks remain compact RLE internally for tiled merging, then default to
-      simplified polygon points in final JSON output. Set ``mask_format`` to
-      ``"rle"`` to preserve the previous external representation.
-
-    This class assumes the same project-level dependencies and data models as
-    the original class: ``YoloSettings``, ``StartYoloParams``,
-    ``YoloDetectResult``, ``YoloDetection``, ``YoloInstanceMask``, ``YoloTile``,
-    ``YOLO``, ``logger``, ``DEFAULT_SERVICE_NAME``, and
-    ``DEFAULT_CONTROLLER_NAME``.
+    By default inactive cached models are moved to CPU/float32 to reduce VRAM
+    pressure. Set ``model_cache_keep_on_device=True`` for the fastest possible
+    model switching when enough GPU memory is available.
     """
 
     def __init__(
@@ -272,6 +281,8 @@ class YoloDetector:
         self.controller_name = controller_name
         self.settings = settings or YoloSettings()
 
+        # Active model view. These fields describe whichever cache entry is
+        # currently selected for inference.
         self._model: Any | None = None
         self._model_name_loaded: str | None = None
         self._model_device: Any | None = None
@@ -282,6 +293,9 @@ class YoloDetector:
         self._mask_coeff_count: int = 0
         self._is_segment_model: bool = False
 
+        # OrderedDict order is LRU -> MRU.
+        self._model_cache: OrderedDict[str, _YoloModelCacheEntry] = OrderedDict()
+
         self._lock = Lock()
         self._nvjpeg_fallback_warning_emitted = False
 
@@ -289,6 +303,10 @@ class YoloDetector:
             f"[{self.service_name}:{self.controller_name}:detector:init] detector initialized",
             extra={
                 "model_name": self.settings.model_name,
+                "model_cache_size": self._model_cache_limit(),
+                "model_cache_keep_on_device": bool(
+                    self.settings.model_cache_keep_on_device
+                ),
                 "imgsz": self.settings.imgsz,
                 "confidence": self.settings.confidence,
                 "iou": self.settings.iou,
@@ -299,24 +317,30 @@ class YoloDetector:
         )
 
     def change_settings(self, settings: YoloSettings) -> None:
+        """Apply runtime settings without discarding already-loaded models."""
         with self._lock:
             previous_model_name = self.settings.model_name
-            reload_model = settings.model_name != previous_model_name
+            switch_model = settings.model_name != previous_model_name
 
             logger(
                 f"[{self.service_name}:{self.controller_name}:detector:settings] applying detector settings",
                 extra={
                     "previous_model_name": previous_model_name,
                     "model_name": settings.model_name,
-                    "reload_model": reload_model,
+                    "switch_model": switch_model,
+                    "model_cached": settings.model_name in self._model_cache,
+                    "cached_model_names": list(self._model_cache.keys()),
+                    "model_cache_size": max(1, int(settings.model_cache_size)),
+                    "model_cache_keep_on_device": bool(
+                        settings.model_cache_keep_on_device
+                    ),
                     "imgsz": settings.imgsz,
                     "confidence": settings.confidence,
                     "iou": settings.iou,
                     "max_detections": settings.max_detections,
                     "include_masks": settings.include_masks,
                     "mask_format": str(
-                        getattr(settings, "mask_format", "polygon")
-                        or "polygon"
+                        getattr(settings, "mask_format", "polygon") or "polygon"
                     ).lower(),
                     "polygon_epsilon": float(
                         getattr(settings, "polygon_epsilon", 1.0) or 0.0
@@ -333,7 +357,53 @@ class YoloDetector:
 
             self.settings = settings
 
-            if reload_model:
+            # Do NOT destroy the active model when model_name changes. _load_model()
+            # will either activate a cached entry or load a new one on the next
+            # inference. Keeping the current active entry here also avoids moving a
+            # model while another thread may still be finishing a forward pass.
+            if (
+                not switch_model
+                and self._model_name_loaded == self.settings.model_name
+            ):
+                self._trim_model_cache_locked()
+
+            logger(
+                f"[{self.service_name}:{self.controller_name}:detector:settings] detector settings applied",
+                extra={
+                    "model_name": self.settings.model_name,
+                    "switch_model": switch_model,
+                    "cached_model_names": list(self._model_cache.keys()),
+                },
+            )
+
+    def _tile_batch_size(self) -> int:
+        """Return a safe tile batch size without requiring a schema change."""
+        return max(1, int(getattr(self.settings, "tile_batch_size", 8) or 8))
+
+    def _model_cache_limit(self) -> int:
+        return max(1, int(getattr(self.settings, "model_cache_size", 2) or 2))
+
+    def cached_model_names(self) -> list[str]:
+        """Return cached model names in LRU -> MRU order."""
+        with self._lock:
+            return list(self._model_cache.keys())
+
+    def clear_model_cache(self, *, keep_active: bool = True) -> None:
+        """Clear cached weights, optionally retaining the active model.
+
+        This is useful if a model file on disk has been replaced and must be
+        force-reloaded even though its ``model_name`` string did not change.
+        """
+        with self._lock:
+            active_name = self._model_name_loaded if keep_active else None
+            victims = [
+                name for name in self._model_cache.keys()
+                if name != active_name
+            ]
+            for name in victims:
+                self._evict_cache_entry_locked(name)
+
+            if not keep_active:
                 self._model = None
                 self._model_name_loaded = None
                 self._model_device = None
@@ -343,40 +413,182 @@ class YoloDetector:
                 self._mask_coeff_count = 0
                 self._is_segment_model = False
 
-            logger(
-                f"[{self.service_name}:{self.controller_name}:detector:settings] detector settings applied",
-                extra={
-                    "model_name": self.settings.model_name,
-                    "reload_model": reload_model,
-                },
-            )
+    @staticmethod
+    def _model_placement(model: Any) -> tuple[Any, Any]:
+        """Inspect a module's current device and floating-point dtype."""
+        try:
+            parameter = next(model.parameters())
+            return parameter.device, parameter.dtype
+        except StopIteration:
+            return torch.device("cpu"), torch.float32
 
-    def _tile_batch_size(self) -> int:
-        """Return a safe tile batch size without requiring a schema change."""
-        return max(1, int(getattr(self.settings, "tile_batch_size", 8) or 8))
+    def _build_cache_entry(self, yolo: Any, model: Any) -> _YoloModelCacheEntry:
+        names = (
+            getattr(yolo, "names", None)
+            or getattr(model, "names", {})
+            or {}
+        )
+        if isinstance(names, dict):
+            parsed_names = {int(k): str(v) for k, v in names.items()}
+        else:
+            parsed_names = {
+                idx: str(name) for idx, name in enumerate(names)
+            }
+
+        head = None
+        try:
+            head = model.model[-1]
+        except Exception:
+            head = None
+
+        nc = int(getattr(head, "nc", len(parsed_names) or 0) or 0)
+        if nc and not parsed_names:
+            parsed_names = {idx: str(idx) for idx in range(nc)}
+
+        mask_coeff_count = int(getattr(head, "nm", 0) or 0)
+        is_segment_model = bool(
+            mask_coeff_count
+            or getattr(yolo, "task", None) == "segment"
+            or getattr(model, "task", None) == "segment"
+            or (
+                head is not None
+                and "Segment" in head.__class__.__name__
+            )
+        )
+        device, dtype = self._model_placement(model)
+
+        return _YoloModelCacheEntry(
+            model=model,
+            names=parsed_names,
+            nc=nc,
+            mask_coeff_count=mask_coeff_count,
+            is_segment_model=is_segment_model,
+            device=device,
+            dtype=dtype,
+        )
+
+    def _offload_cache_entry_locked(
+        self,
+        model_name: str,
+        entry: _YoloModelCacheEntry,
+    ) -> None:
+        """Move an inactive cached model to CPU/float32 to release VRAM."""
+        if getattr(entry.device, "type", str(entry.device)) == "cpu" and entry.dtype == torch.float32:
+            return
+
+        entry.model.to(device=torch.device("cpu"), dtype=torch.float32)
+        entry.model.eval()
+        entry.device = torch.device("cpu")
+        entry.dtype = torch.float32
+
+        logger(
+            f"[{self.service_name}:{self.controller_name}:model:cache] inactive model moved to CPU",
+            extra={"model_name": model_name},
+        )
+
+    def _evict_cache_entry_locked(self, model_name: str) -> None:
+        entry = self._model_cache.pop(model_name, None)
+        if entry is None:
+            return
+
+        # Explicitly move an evicted GPU model to CPU before dropping our
+        # reference, so its CUDA allocation can be released promptly.
+        if getattr(entry.device, "type", str(entry.device)) == "cuda":
+            entry.model.to(device=torch.device("cpu"), dtype=torch.float32)
+
+        logger(
+            f"[{self.service_name}:{self.controller_name}:model:cache] model evicted",
+            extra={
+                "model_name": model_name,
+                "cached_model_names": list(self._model_cache.keys()),
+            },
+        )
+
+    def _trim_model_cache_locked(self) -> None:
+        limit = self._model_cache_limit()
+        while len(self._model_cache) > limit:
+            victim_name = next(
+                (
+                    name for name in self._model_cache.keys()
+                    if name != self._model_name_loaded
+                ),
+                None,
+            )
+            if victim_name is None:
+                break
+            self._evict_cache_entry_locked(victim_name)
+
+    def _activate_cache_entry_locked(
+        self,
+        model_name: str,
+        entry: _YoloModelCacheEntry,
+    ) -> None:
+        previous_name = self._model_name_loaded
+
+        if (
+            previous_name is not None
+            and previous_name != model_name
+            and not bool(self.settings.model_cache_keep_on_device)
+        ):
+            previous_entry = self._model_cache.get(previous_name)
+            if previous_entry is not None:
+                self._offload_cache_entry_locked(previous_name, previous_entry)
+
+        self._model = entry.model
+        self._model_name_loaded = model_name
+        self._model_device = entry.device
+        self._model_dtype = entry.dtype
+        self._names = dict(entry.names)
+        self._nc = int(entry.nc)
+        self._mask_coeff_count = int(entry.mask_coeff_count)
+        self._is_segment_model = bool(entry.is_segment_model)
+
+        self._model_cache.move_to_end(model_name)
 
     def _load_model(self) -> Any:
-        """Load the underlying PyTorch module from Ultralytics weights."""
+        """Activate a cached model or load/fuse it once and cache it."""
+        target_name = self.settings.model_name
+
         if (
             self._model is not None
-            and self._model_name_loaded == self.settings.model_name
+            and self._model_name_loaded == target_name
         ):
             return self._model
 
         with self._lock:
             if (
                 self._model is not None
-                and self._model_name_loaded == self.settings.model_name
+                and self._model_name_loaded == target_name
             ):
+                self._model_cache.move_to_end(target_name)
                 return self._model
+
+            cached = self._model_cache.get(target_name)
+            if cached is not None:
+                self._activate_cache_entry_locked(target_name, cached)
+                self._trim_model_cache_locked()
+
+                logger(
+                    f"[{self.service_name}:{self.controller_name}:model:cache] cache hit",
+                    extra={
+                        "model_name": target_name,
+                        "device": str(cached.device),
+                        "dtype": str(cached.dtype),
+                        "cached_model_names": list(self._model_cache.keys()),
+                    },
+                )
+                return cached.model
 
             logger(
                 f"[{self.service_name}:{self.controller_name}:model:load] loading YOLO model",
-                extra={"model_name": self.settings.model_name},
+                extra={
+                    "model_name": target_name,
+                    "cached_model_names": list(self._model_cache.keys()),
+                },
             )
 
             try:
-                yolo = YOLO(self.settings.model_name)
+                yolo = YOLO(target_name)
                 model = yolo.model
                 model.eval()
 
@@ -387,79 +599,39 @@ class YoloDetector:
                         f"[{self.service_name}:{self.controller_name}:model:fuse] model fuse skipped",
                         level="warning",
                         extra={
-                            "model_name": self.settings.model_name,
+                            "model_name": target_name,
                             "error": str(exc),
                         },
                     )
 
-                names = (
-                    getattr(yolo, "names", None)
-                    or getattr(model, "names", {})
-                    or {}
-                )
-                if isinstance(names, dict):
-                    self._names = {int(k): str(v) for k, v in names.items()}
-                else:
-                    self._names = {
-                        idx: str(name) for idx, name in enumerate(names)
-                    }
-
-                head = None
-                try:
-                    head = model.model[-1]
-                except Exception:
-                    head = None
-
-                self._nc = int(
-                    getattr(head, "nc", len(self._names) or 0) or 0
-                )
-                if self._nc and not self._names:
-                    self._names = {
-                        idx: str(idx) for idx in range(self._nc)
-                    }
-
-                self._mask_coeff_count = int(
-                    getattr(head, "nm", 0) or 0
-                )
-                self._is_segment_model = bool(
-                    self._mask_coeff_count
-                    or getattr(yolo, "task", None) == "segment"
-                    or getattr(model, "task", None) == "segment"
-                    or (
-                        head is not None
-                        and "Segment" in head.__class__.__name__
-                    )
-                )
+                entry = self._build_cache_entry(yolo, model)
             except Exception:
                 logger(
                     f"[{self.service_name}:{self.controller_name}:model:load:error] failed to load YOLO model",
                     level="error",
-                    extra={"model_name": self.settings.model_name},
+                    extra={"model_name": target_name},
                 )
                 raise
 
-            self._model = model
-            self._model_name_loaded = self.settings.model_name
-            self._model_device = None
-            self._model_dtype = None
+            self._model_cache[target_name] = entry
+            self._activate_cache_entry_locked(target_name, entry)
+            self._trim_model_cache_locked()
 
             logger(
-                f"[{self.service_name}:{self.controller_name}:model:load] YOLO model loaded ({self._model_name_loaded})",
+                f"[{self.service_name}:{self.controller_name}:model:load] YOLO model loaded and cached ({target_name})",
                 extra={
-                    "model_name": self.settings.model_name,
+                    "model_name": target_name,
                     "class_count": self._nc,
                     "mask_coeff_count": self._mask_coeff_count,
-                    "task": (
-                        "segment" if self._is_segment_model else "detect"
-                    ),
+                    "task": "segment" if self._is_segment_model else "detect",
+                    "cached_model_names": list(self._model_cache.keys()),
                 },
             )
 
             return self._model
 
     def _prepare_model(self, device: Any) -> tuple[Any, Any]:
-        """Move/cast the model only when device or precision changes."""
-
+        """Move/cast only the active cached model when placement changes."""
         model = self._load_model()
         use_half = bool(self.settings.half and device.type == "cuda")
         dtype = torch.float16 if use_half else torch.float32
@@ -472,6 +644,14 @@ class YoloDetector:
                     self._model_device = device
                     self._model_dtype = dtype
 
+                    active_name = self._model_name_loaded
+                    if active_name is not None:
+                        entry = self._model_cache.get(active_name)
+                        if entry is not None and entry.model is model:
+                            entry.device = device
+                            entry.dtype = dtype
+                            self._model_cache.move_to_end(active_name)
+
                     if device.type == "cuda":
                         # Letterboxed model inputs have a stable spatial size.
                         torch.backends.cudnn.benchmark = True
@@ -479,8 +659,10 @@ class YoloDetector:
                     logger(
                         f"[{self.service_name}:{self.controller_name}:model:prepare] model prepared",
                         extra={
+                            "model_name": self._model_name_loaded,
                             "device": str(device),
                             "dtype": str(dtype),
+                            "cached_model_names": list(self._model_cache.keys()),
                         },
                     )
 
