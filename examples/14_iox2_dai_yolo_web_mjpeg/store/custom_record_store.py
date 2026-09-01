@@ -2195,5 +2195,5 @@ if __name__ == "__main__":
     #     keepalive=30,
     # )
 
-    # print(fs.ls(fs.root_key))
+    # print(fs.ls("/"))
     pass
