@@ -82,11 +82,10 @@ def last_capture_record_rgb(store_name:str="store_dual"):
     return FileResponse(file_path)
 
 def last_ai_records()->List[Dict]:
-    store_status = call_localhost("store","status")
-    res = store_status["last_capture"]["captures"][-1]["db_record"]
-    res = CustomRecord(**res)
-    res = [r.model_dump() for r in res.get_yolo_list()]
-    return res
+    store_status = call_localhost("yolo","status")
+    res = store_status["last_output_json_path"]    
+    res = json.loads(Path(res).read_text())
+    return [res]
 
 
 def get_debug_file(path: str):

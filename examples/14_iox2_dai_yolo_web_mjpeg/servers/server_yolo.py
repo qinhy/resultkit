@@ -8,7 +8,7 @@ from pathlib import Path
 from queue import Empty, Queue
 from threading import Event, Lock, Thread
 import time
-from typing import Any, List, Literal
+from typing import Any, List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -82,7 +82,7 @@ class StartYoloParams(YoloBaseModel):
 
     size_mode: SizeMode = "tiling"
     cuda_device: int = 0
-    db_record: CustomRecord = field(default_factory=CustomRecord.empty)
+    db_record: Optional[CustomRecord] = field(default_factory=CustomRecord.empty)
     input_jpg_paths: List[str] = [] # field(default_factory=list)
     output_json_paths: List[str] = [] # field(default_factory=list)
 
@@ -98,6 +98,9 @@ class StartYoloParams(YoloBaseModel):
 
     
     def model_post_init(self, context):
+        if self.db_record is None:
+            self.db_record = CustomRecord.empty()
+
         if not self.db_record.is_empty():
             input_jpg_paths = [p for p in self.db_record.listup_rgb_image_paths]
             # jpg_parent_names = [p.parent.name for p in input_jpg_paths]
