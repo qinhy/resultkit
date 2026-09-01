@@ -24,7 +24,7 @@ from typing import Any, Mapping
 import numpy as np
 import requests
 
-from common import EmptyParams, HookDispatcher, RpcModel, openapi_doc, CustomStore, RecordPath
+from common import EmptyParams, HookDispatcher, RpcModel, openapi_doc, CustomStore, RecordPath, CustomRecord
 from resultkit.MatModel import CodecFormat, ColorFormat, Model4Mat
 from server_rgb_stereo import BUNDLE_MAGIC, BUNDLE_VERSION, BUNDLE_FORMAT, BUNDLE_HEADER, BUNDLE_PREFIX, BUNDLE_TYPE
 # from store.custom_record_store import RGB_STEREO_CAM_NAME
@@ -93,7 +93,7 @@ class StreamsParams(StoreModel):
 
 class CaptureParams(StreamsParams):
     field_id: str = "field_all"
-    gnss: Any | None = None
+    gnss: dict = field(default_factory=dict)
     capture_timeout_s: float | None = None
     fresh_frame: bool = True
     # hook_urls:list[list[str]] = [[]]
@@ -294,23 +294,16 @@ def write_json(path: RecordPath, payload: Any) -> None:
     logger(f"[{args.service_name}:{args.controller_name}:write_json] wrote JSON file", extra={"path": path.as_posix()})
 
 
-def add_gnss(record: Any, gnss: Any | None) -> None:
-    if gnss is None:
-        return
+def add_gnss(record: CustomRecord, gnss: dict, kind: str = "baselink") -> None:
+    if gnss is None or len(gnss)==0: return
     logger(f"[{args.service_name}:{args.controller_name}:add_gnss] saving GIS data",
         extra={"record_id": getattr(record, "record_id", None), "mapping": isinstance(gnss, Mapping)},
     )
-    if isinstance(gnss, Mapping):
-        for kind in ("location", "pose", "coordinate_system", "geofences", "map_notes"):
-            if kind in gnss:
-                record.add_gnss(kind, gnss[kind])
-        write_json(record.path / "gnss" / "request.json", gnss)
-    else:
-        write_json(record.path / "gnss" / "request.json", {"value": gnss})
-
+    record.add_gnss(gnss, kind)
+    
 
 def save_frame(cam_name:str, store: CustomStore, frame: Frame, field_id: str,
-               ts, gnss: Any | None, calib: Any | None) -> StreamCapture:    
+               ts, gnss: dict, calib: Any | None) -> StreamCapture:    
     # ts = time.time_ns()
     logger(f"[{args.service_name}:{args.controller_name}:save_frame] saving frame",
         extra={
