@@ -93,7 +93,7 @@ class StreamsParams(StoreModel):
 
 class CaptureParams(StreamsParams):
     field_id: str = "field_all"
-    gnss: dict = field(default_factory=dict)
+    meta: dict = field(default_factory=dict)
     capture_timeout_s: float | None = None
     fresh_frame: bool = True
     # hook_urls:list[list[str]] = [[]]
@@ -102,6 +102,9 @@ class CaptureParams(StreamsParams):
              "http://localhost:8000/controllers/pcd/to_pcd"
             ],
     ]
+    how_to_use_meta:str="""{{ "key1":{{data1 ...}} }}, 
+        {{ "gnss":{{ ... }},
+        "arm":{{ "run_id":{{...}}, "data":{{...}} }}, }}"""
 
 
 class StatusResult(StoreModel):
@@ -294,16 +297,8 @@ def write_json(path: RecordPath, payload: Any) -> None:
     logger(f"[{args.service_name}:{args.controller_name}:write_json] wrote JSON file", extra={"path": path.as_posix()})
 
 
-def add_gnss(record: CustomRecord, gnss: dict, kind: str = "baselink") -> None:
-    if gnss is None or len(gnss)==0: return
-    logger(f"[{args.service_name}:{args.controller_name}:add_gnss] saving GIS data",
-        extra={"record_id": getattr(record, "record_id", None), "mapping": isinstance(gnss, Mapping)},
-    )
-    record.add_gnss(gnss, kind)
-    
-
 def save_frame(cam_name:str, store: CustomStore, frame: Frame, field_id: str,
-               ts, gnss: dict, calib: Any | None) -> StreamCapture:    
+               ts, meta: dict, calib: Any | None) -> StreamCapture:    
     # ts = time.time_ns()
     logger(f"[{args.service_name}:{args.controller_name}:save_frame] saving frame",
         extra={
@@ -332,7 +327,26 @@ def save_frame(cam_name:str, store: CustomStore, frame: Frame, field_id: str,
         },
     )
 
-    add_gnss(record, gnss)
+    if "gnss" in meta:
+        gnss:dict = meta["gnss"]
+        if gnss is None or len(gnss)==0: return
+        logger(f"[{args.service_name}:{args.controller_name}:add_gnss] saving GIS data",
+            extra={"record_id": getattr(record, "record_id", None), "mapping": isinstance(gnss, Mapping)},
+        )
+        record.add_gnss(gnss, kind="baselink")
+        
+    if "arm" in meta:
+        arm:dict = meta["arm"]
+        if arm is None or len(arm)==0: return
+        logger(f"[{args.service_name}:{args.controller_name}:add_arm] saving GIS data",
+            extra={"record_id": getattr(record, "record_id", None), "mapping": isinstance(arm, Mapping)},
+        )
+        if arm.get("run_id",None) is None:
+            logger(f"[{args.service_name}:{args.controller_name}:add_arm:error] arm data has no run_id")
+        else:
+            data = arm.get("data",arm)
+            record.get_arm().add_result(arm["run_id"],data)
+
     images = []
     for name, data in (("rgb", frame.bundle.rgb), ("left", frame.bundle.left), ("right", frame.bundle.right)):
         record.add_image(cam_name, name, data)
@@ -615,7 +629,7 @@ class StoreController:
                     try:
                         calib = self._calibration_dicts.get(stream_id)
                         captures.append(save_frame(stream_id, store, frames[stream_id],
-                                                    field_id, ts, params.gnss,
+                                                    field_id, ts, params.meta,
                                                     calib))
                         logger(f"[{args.service_name}:{args.controller_name}:capture] stream capture saved ({stream_id})",
                             extra={
