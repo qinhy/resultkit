@@ -1267,4 +1267,4 @@ if __name__ == "__main__":
     #     left, right, rgb, disparity_predictor=predictor, output_path="rgb_res_cloud.pcd",
     #     input_color_order="BGR", model_scale=0.5, splat_px=1, output_frame="left", max_depth_m=2.0,
     # )
-    
+    pass

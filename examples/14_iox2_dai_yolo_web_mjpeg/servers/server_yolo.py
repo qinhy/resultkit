@@ -85,7 +85,14 @@ class StartYoloParams(YoloBaseModel):
     input_jpg_paths: List[str] = [] # field(default_factory=list)
     output_json_paths: List[str] = [] # field(default_factory=list)
 
-    input_jpg_blindmask_paths: List[str] = [] # field(default_factory=list)
+    # Optional inference ROI in absolute original-image XYXY coordinates.
+    # None means detect on the full image. Values are clipped to image bounds.
+    detection_bbox_xyxy: list[float] | None = Field(
+        default=None,
+        min_length=4,
+        max_length=4,
+    )
+
     hook_urls:list[list[str]] = [[]]
 
     
@@ -215,7 +222,8 @@ class YoloDetectResult(BaseModel):
     tile_size: int | None = None
     tile_overlap: int | None = None
     tile_count: int | None = None
-    blindmask_jpg_path: str | None = None
+    # Effective ROI after clipping to the source image. Omitted for full-image inference.
+    detection_bbox_xyxy: list[int] | None = None
 
 
     def model_post_init(self, context: Any) -> None:
@@ -481,18 +489,12 @@ class YoloDetector:
     def detect(self, params: StartYoloParams) -> YoloDetectResult:
         input_count = len(params.input_jpg_paths)
         output_count = len(params.output_json_paths)
-        blindmask_count = len(params.input_jpg_blindmask_paths)
 
         if input_count == 0:
             raise ValueError("At least one input JPEG path is required")
         if input_count != output_count:
             raise ValueError(
                 "input_jpg_paths and output_json_paths must have equal lengths: "
-                f"{input_count} != {output_count}"
-            )
-        if blindmask_count>0 and (input_count != blindmask_count):
-            raise ValueError(
-                "input_jpg_paths and input_jpg_blindmask_paths must have equal lengths: "
                 f"{input_count} != {output_count}"
             )
 
@@ -506,6 +508,7 @@ class YoloDetector:
                 "model_name": self.settings.model_name,
                 "tile_batch_size": self._tile_batch_size(),
                 "mask_format": self._mask_format(),
+                "detection_bbox_xyxy": params.detection_bbox_xyxy,
             },
         )
 
@@ -517,20 +520,12 @@ class YoloDetector:
         device = self._device(params.cuda_device)
         self._prepare_model(device)
 
-        if blindmask_count==0:
-            group = zip(
-                params.input_jpg_paths,
-                params.output_json_paths,
-                [None for i in params.input_jpg_paths],
-            )
-        else:
-            group = zip(
-                params.input_jpg_paths,
-                params.output_json_paths,
-                params.input_jpg_blindmask_paths,
-            )
+        group = zip(
+            params.input_jpg_paths,
+            params.output_json_paths,
+        )
 
-        for image_path_value, output_json_path_value, blindmask_path_value in group:
+        for image_path_value, output_json_path_value in group:
             image_path = Path(image_path_value)
             output_json_path = Path(output_json_path_value)
 
@@ -541,6 +536,7 @@ class YoloDetector:
                     "output_json_path": output_json_path.as_posix(),
                     "size_mode": params.size_mode,
                     "cuda_device": params.cuda_device,
+                    "detection_bbox_xyxy": params.detection_bbox_xyxy,
                 },
             )
 
@@ -558,19 +554,18 @@ class YoloDetector:
                 image_payload = self._detect_tiled(
                     image_path,
                     params.cuda_device,
-                    blindmask_path=blindmask_path_value,
+                    detection_bbox_xyxy=params.detection_bbox_xyxy,
                 )
             else:
                 image_payload = self._detect_resized(
                     image_path,
                     params.cuda_device,
-                    blindmask_path=blindmask_path_value,
+                    detection_bbox_xyxy=params.detection_bbox_xyxy,
                 )
 
             result = YoloDetectResult(
                 input_jpg_path=str(image_path),
                 output_json_path=str(output_json_path),
-                blindmask_jpg_path=blindmask_path_value,
                 size_mode=params.size_mode,
                 cuda_device=params.cuda_device,
                 yolo_config=self.settings,
@@ -593,22 +588,24 @@ class YoloDetector:
                     "num_detections": result.num_detections,
                     "has_masks": result.has_masks,
                     "tile_count": result.tile_count,
+                    "detection_bbox_xyxy": result.detection_bbox_xyxy,
                 },
             )
 
         elapsed = time.perf_counter() - start_time
-        # assert result is not None
-        seconds_per_imag = elapsed/processed_count if processed_count else 0
+        seconds_per_imag = elapsed / processed_count if processed_count else 0
         logger(
             f"[{self.service_name}:{self.controller_name}:detect] "
-            f"inference {input_count} item completed ({seconds_per_imag:.2f} sec/item)"
-            ,
+            f"inference {input_count} item completed ({seconds_per_imag:.2f} sec/item)",
             extra={
                 "processed_count": processed_count,
-                "last_output_json_path": result.output_json_path,
+                "last_output_json_path": result.output_json_path if result is not None else None,
                 "seconds_per_image": seconds_per_imag,
             },
         )
+
+        if result is None:
+            raise RuntimeError("YOLO inference completed without producing a result")
         return result
 
     def _device(self, cuda_device: int) -> Any:
@@ -884,31 +881,108 @@ class YoloDetector:
             )
         return converted
 
+    @staticmethod
+    def _resolve_detection_bbox(
+        bbox_xyxy: list[float] | None,
+        image_width: int,
+        image_height: int,
+    ) -> tuple[int, int, int, int]:
+        """Clip an optional original-image ROI and return integer XYXY bounds.
+
+        ``None`` selects the full image. The left/top edges are floored and
+        right/bottom edges are ceiled so a fractional caller ROI does not lose
+        border pixels.
+        """
+        if bbox_xyxy is None:
+            return 0, 0, int(image_width), int(image_height)
+
+        if len(bbox_xyxy) != 4:
+            raise ValueError(
+                "detection_bbox_xyxy must contain exactly four values: "
+                "[x1, y1, x2, y2]"
+            )
+
+        values = [float(value) for value in bbox_xyxy]
+        if not all(math.isfinite(value) for value in values):
+            raise ValueError("detection_bbox_xyxy values must be finite numbers")
+
+        x1 = math.floor(values[0])
+        y1 = math.floor(values[1])
+        x2 = math.ceil(values[2])
+        y2 = math.ceil(values[3])
+
+        x1 = max(0, min(x1, int(image_width)))
+        y1 = max(0, min(y1, int(image_height)))
+        x2 = max(0, min(x2, int(image_width)))
+        y2 = max(0, min(y2, int(image_height)))
+
+        if x2 <= x1 or y2 <= y1:
+            raise ValueError(
+                "detection_bbox_xyxy has no positive area after clipping to "
+                f"image bounds: {[x1, y1, x2, y2]} for "
+                f"image {image_width}x{image_height}"
+            )
+
+        return x1, y1, x2, y2
+
     def _detect_resized(
         self,
         image_path: Path,
         cuda_device: int,
-        blindmask_path: Path = None,
+        detection_bbox_xyxy: list[float] | None = None,
     ) -> dict[str, Any]:
         device = self._device(cuda_device)
         image = self._decode_jpeg(image_path, device)
-        if blindmask_path:
-            blindmask = self._decode_jpeg(blindmask_path, device)
-            image = image * (blindmask>0)
 
-        height = int(image.shape[-2])
-        width = int(image.shape[-1])
-        detections = self._predict_batch([image], cuda_device)[0]
+        full_height = int(image.shape[-2])
+        full_width = int(image.shape[-1])
+        roi_left, roi_top, roi_right, roi_bottom = self._resolve_detection_bbox(
+            detection_bbox_xyxy,
+            image_width=full_width,
+            image_height=full_height,
+        )
+
+        # Tensor slicing is a view, so the decoded full image is not copied here.
+        roi_image = image[:, roi_top:roi_bottom, roi_left:roi_right]
+        detections = self._predict_batch([roi_image], cuda_device)[0]
+
+        shifted_detections: list[YoloDetection] = []
+        for det in detections:
+            x1, y1, x2, y2 = det.bbox_xyxy
+            mask = (
+                self._shift_mask_origin(det.mask, roi_left, roi_top)
+                if det.mask is not None
+                else None
+            )
+            shifted_detections.append(
+                det.model_copy(
+                    update={
+                        "bbox_xyxy": [
+                            x1 + roi_left,
+                            y1 + roi_top,
+                            x2 + roi_left,
+                            y2 + roi_top,
+                        ],
+                        "mask": mask,
+                    }
+                )
+            )
+
         detections = self._convert_detection_masks_for_output(
-            detections,
-            image_width=width,
-            image_height=height,
+            shifted_detections,
+            image_width=full_width,
+            image_height=full_height,
         )
 
         return {
             "task": "segment" if self._is_segment_model else "detect",
-            "image_width": width,
-            "image_height": height,
+            "image_width": full_width,
+            "image_height": full_height,
+            "detection_bbox_xyxy": (
+                [roi_left, roi_top, roi_right, roi_bottom]
+                if detection_bbox_xyxy is not None
+                else None
+            ),
             "detections": detections,
             "has_masks": any(det.mask is not None for det in detections),
             "num_detections": len(detections),
@@ -918,16 +992,24 @@ class YoloDetector:
         self,
         image_path: Path,
         cuda_device: int,
-        blindmask_path: Path = None,
+        detection_bbox_xyxy: list[float] | None = None,
     ) -> dict[str, Any]:
         device = self._device(cuda_device)
         image = self._decode_jpeg(image_path, device)
-        if blindmask_path:
-            blindmask = self._decode_jpeg(blindmask_path, device)
-            image = image * (blindmask>0)
 
-        height = int(image.shape[-2])
-        width = int(image.shape[-1])
+        full_height = int(image.shape[-2])
+        full_width = int(image.shape[-1])
+        roi_left, roi_top, roi_right, roi_bottom = self._resolve_detection_bbox(
+            detection_bbox_xyxy,
+            image_width=full_width,
+            image_height=full_height,
+        )
+
+        # Work only inside the requested ROI. All final coordinates are shifted
+        # back to the original full-image coordinate system below.
+        image = image[:, roi_top:roi_bottom, roi_left:roi_right]
+        roi_height = int(image.shape[-2])
+        roi_width = int(image.shape[-1])
 
         tile_size = self._make_divisible(
             self.settings.imgsz,
@@ -947,8 +1029,14 @@ class YoloDetector:
             f"[{self.service_name}:{self.controller_name}:detect:tiling] tiled inference started",
             extra={
                 "input_jpg_path": image_path.as_posix(),
-                "image_width": width,
-                "image_height": height,
+                "image_width": full_width,
+                "image_height": full_height,
+                "roi_left": roi_left,
+                "roi_top": roi_top,
+                "roi_right": roi_right,
+                "roi_bottom": roi_bottom,
+                "roi_width": roi_width,
+                "roi_height": roi_height,
                 "tile_size": tile_size,
                 "tile_overlap": overlap,
                 "step": step,
@@ -957,6 +1045,7 @@ class YoloDetector:
         )
 
         pending_images: list[Any] = []
+        # Tile bounds here are ROI-local until flush_tile_batch shifts them.
         pending_tiles: list[tuple[int, int, int, int]] = []
 
         def flush_tile_batch() -> None:
@@ -975,12 +1064,20 @@ class YoloDetector:
                 batch_detections,
             ):
                 left, top, right, bottom = tile_bounds
+                global_left = roi_left + left
+                global_top = roi_top + top
+                global_right = roi_left + right
+                global_bottom = roi_top + bottom
                 tile_count += 1
 
                 for det in tile_detections:
                     x1, y1, x2, y2 = det.bbox_xyxy
                     mask = (
-                        self._shift_mask_origin(det.mask, left, top)
+                        self._shift_mask_origin(
+                            det.mask,
+                            global_left,
+                            global_top,
+                        )
                         if det.mask is not None
                         else None
                     )
@@ -989,16 +1086,16 @@ class YoloDetector:
                         det.model_copy(
                             update={
                                 "bbox_xyxy": [
-                                    x1 + left,
-                                    y1 + top,
-                                    x2 + left,
-                                    y2 + top,
+                                    x1 + global_left,
+                                    y1 + global_top,
+                                    x2 + global_left,
+                                    y2 + global_top,
                                 ],
                                 "tile": YoloTile(
-                                    left=left,
-                                    top=top,
-                                    right=right,
-                                    bottom=bottom,
+                                    left=global_left,
+                                    top=global_top,
+                                    right=global_right,
+                                    bottom=global_bottom,
                                 ),
                                 "mask": mask,
                             }
@@ -1008,10 +1105,10 @@ class YoloDetector:
             pending_images.clear()
             pending_tiles.clear()
 
-        for top in self._tile_positions(height, tile_size, step):
-            for left in self._tile_positions(width, tile_size, step):
-                right = min(left + tile_size, width)
-                bottom = min(top + tile_size, height)
+        for top in self._tile_positions(roi_height, tile_size, step):
+            for left in self._tile_positions(roi_width, tile_size, step):
+                right = min(left + tile_size, roi_width)
+                bottom = min(top + tile_size, roi_height)
 
                 # This is a GPU tensor view; the JPEG is not decoded again and
                 # no pixel data is copied until preprocessing creates the batch.
@@ -1032,8 +1129,8 @@ class YoloDetector:
             if self.settings.merge_tiled_masks:
                 merged = self._merge_tiled_instances(
                     all_detections,
-                    image_width=width,
-                    image_height=height,
+                    image_width=full_width,
+                    image_height=full_height,
                     iou_threshold=self.settings.iou,
                     iom_threshold=self.settings.tile_merge_iom,
                 )
@@ -1045,8 +1142,8 @@ class YoloDetector:
                             "tile": None,
                             "mask": self._mask_to_full_image_rle(
                                 det.mask,
-                                image_width=width,
-                                image_height=height,
+                                image_width=full_width,
+                                image_height=full_height,
                             )
                             if det.mask is not None
                             else None,
@@ -1061,8 +1158,8 @@ class YoloDetector:
 
         merged = self._convert_detection_masks_for_output(
             merged,
-            image_width=width,
-            image_height=height,
+            image_width=full_width,
+            image_height=full_height,
         )
 
         logger(
@@ -1072,13 +1169,23 @@ class YoloDetector:
                 "tile_count": tile_count,
                 "raw_detection_count": len(all_detections),
                 "merged_detection_count": len(merged),
+                "detection_bbox_xyxy": (
+                    [roi_left, roi_top, roi_right, roi_bottom]
+                    if detection_bbox_xyxy is not None
+                    else None
+                ),
             },
         )
 
         return {
             "task": "segment" if self._is_segment_model else "detect",
-            "image_width": width,
-            "image_height": height,
+            "image_width": full_width,
+            "image_height": full_height,
+            "detection_bbox_xyxy": (
+                [roi_left, roi_top, roi_right, roi_bottom]
+                if detection_bbox_xyxy is not None
+                else None
+            ),
             "tile_size": tile_size,
             "tile_overlap": overlap,
             "tile_count": tile_count,

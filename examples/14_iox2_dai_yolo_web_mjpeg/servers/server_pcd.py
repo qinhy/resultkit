@@ -20,7 +20,7 @@ from iox2_jsonrpc import EmptyParams, RpcModel
 from store.custom_record_store import CustomRecord
 from resultkit.logger import logger
 
-PCD_BACKEND:Literal["cpu","cuda","vpi"] = "cpu"
+PCD_BACKEND:Literal["cpu","cuda","vpi"] = "cuda"
 
 LOG_SERVICE = "jrpc"
 LOG_CONTROLLER = "pcd"
@@ -35,56 +35,57 @@ for path in (
     if path_text not in sys.path:
         sys.path.append(path_text)
 
-# if PCD_BACKEND=="cpu":
-#     from pcd_utils import (
-#         ColoredPointCloud,
-#         SGBMDisparityPredictor,
-#         StereoRgbCalibration as StereoRgbCalibrationCpu,
-#         points_left_to_rgb_depth,
-#         read_image,
-#         rectified_left_to_original_left,
-#         rgb8,
-#         rgb_depth_to_points_rgb,
-#         save_point_cloud,
-#         transform_points,
-#     )
-#     from pcd_yolo_utils import split_cloud
+if PCD_BACKEND=="cpu":
+    from pcd_utils import (
+        ColoredPointCloud,
+        SGBMDisparityPredictor,
+        StereoRgbCalibration as StereoRgbCalibrationCpu,
+        points_left_to_rgb_depth,
+        read_image,
+        rectified_left_to_original_left,
+        rgb8,
+        rgb_depth_to_points_rgb,
+        save_point_cloud,
+        transform_points,
+    )
+    _image_gpu = lambda img:img
+    from pcd_yolo_utils import split_cloud
 
-# elif PCD_BACKEND=="cuda":
-#     from pcd_cuda_utils import (
-#         ColoredPointCloudCuda as ColoredPointCloud,
-#         StereoRgbCalibrationCpu,
-#         StereoRgbCalibrationCuda as StereoRgbCalibration,
-#         SGBMDisparityPredictorCuda as SGBMDisparityPredictor,
-#         points_left_to_rgb_depth,
-#         read_image,
-#         rectified_left_to_original_left,
-#         rgb8_cuda as rgb8,
-#         _image_cuda,
-#         rgb_depth_to_points_rgb,
-#         save_point_cloud,
-#         transform_points,
-#     )
-#     _image_gpu = _image_cuda
-#     from pcd_yolo_cuda_utils import split_cloud_cuda as split_cloud
+elif PCD_BACKEND=="cuda":
+    from pcd_cuda_utils import (
+        ColoredPointCloudCuda as ColoredPointCloud,
+        StereoRgbCalibrationCpu,
+        StereoRgbCalibrationCuda as StereoRgbCalibration,
+        SGBMDisparityPredictorCuda as SGBMDisparityPredictor,
+        points_left_to_rgb_depth,
+        read_image,
+        rectified_left_to_original_left,
+        rgb8_cuda as rgb8,
+        _image_cuda,
+        rgb_depth_to_points_rgb,
+        save_point_cloud,
+        transform_points,
+    )
+    _image_gpu = _image_cuda
+    from pcd_yolo_cuda_utils import split_cloud_cuda as split_cloud
 
-# elif PCD_BACKEND=="vpi":
-from pcd_vpi_utils import (
-    ColoredPointCloud,
-    StereoRgbCalibration as StereoRgbCalibrationCpu,
-    VPIStereoDisparityGPU as SGBMDisparityPredictor,
-    points_left_to_rgb_depth,
-    rectified_left_to_original_left,
-    rgb_depth_to_points_rgb,
-    transform_points,
-    read_image,
-    _image_cupy,
-    rgb8,
-    save_point_cloud,
-)
-_image_gpu = _image_cupy
-import cupy as cp
-from pcd_yolo_vpi_utils import split_cloud_vpi as split_cloud
+elif PCD_BACKEND=="vpi":
+    from pcd_vpi_utils import (
+        ColoredPointCloud,
+        StereoRgbCalibration as StereoRgbCalibrationCpu,
+        VPIStereoDisparityGPU as SGBMDisparityPredictor,
+        points_left_to_rgb_depth,
+        rectified_left_to_original_left,
+        rgb_depth_to_points_rgb,
+        transform_points,
+        read_image,
+        _image_cupy,
+        rgb8,
+        save_point_cloud,
+    )
+    _image_gpu = _image_cupy
+    import cupy as cp
+    from pcd_yolo_vpi_utils import split_cloud_vpi as split_cloud
 
 
 try:  # noqa: E402
