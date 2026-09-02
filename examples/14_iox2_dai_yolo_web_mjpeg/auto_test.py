@@ -6,11 +6,11 @@ import time
 import requests
 
 
-EXAMPLE_DIR = Path(__file__).absolute().parent/"servers"
-if EXAMPLE_DIR not in sys.path:
-    sys.path.append(str(EXAMPLE_DIR))
-from servers.server_pcd import ToPcdParams, ToYoloSegmentsParams
-from store.custom_record_store import CustomRecord, jst_datetime_to_time_ns
+# EXAMPLE_DIR = Path(__file__).absolute().parent/"servers"
+# if EXAMPLE_DIR not in sys.path:
+#     sys.path.append(str(EXAMPLE_DIR))
+# from servers.server_pcd import ToPcdParams, ToYoloSegmentsParams
+# from store.custom_record_store import CustomRecord, jst_datetime_to_time_ns
 # from iox2redis import redis_for
 
 API_URL = "http://127.0.0.1:8000"
@@ -42,32 +42,36 @@ def opencam(name):
     logging.info(f"\n=== {name}.open ===")
     call_method(name, "open", {})
 
+def closecam(name):
+    logging.info(f"\n=== {name}.close ===")
+    call_method(name, "close", {})
+
 def checkcam(name):
     logging.info(f"\n=== {name}.status ===")
     status = call_method(name, "status", {})
     return status.get("opened",False)
 
-def store_watch(sts=[
+def store_watch(sn="store_dual",sts=[
         "rgbd_left",
         "rgbd_right"
     ]):
-    logging.info("\n=== store.watch ===")
-    store_watch = call_method("store", "watch", {
+    logging.info(f"\n=== {sn}.watch ===")
+    store_watch = call_method(sn, "watch", {
     "service": "jrpc",
     "stream_ids":sts
     })
     logging.info(store_watch)
 
-def store_capture(sts=[
+def store_capture(sn="store_dual",sts=[
         "rgbd_left",
         "rgbd_right"
     ],to_yolo=False,to_pcd=False):
-    logging.info("\n=== store.capture ===")
+    logging.info(f"\n=== {sn}.capture ===")
     params = {
         "service": "jrpc",
         "stream_ids": sts,
         "field_id": "field_all",
-        "gnss": None,
+        "meta": {},
         "capture_timeout_s": None,
         "fresh_frame": True,
         "hook_urls": [[]]
@@ -81,8 +85,30 @@ def store_capture(sts=[
             # "http://localhost:8000/controllers/pcd/to_pcd"
             "http://localhost:8000/controllers/pcd/detect_segments_to_pcd"
         )
-    store_capture = call_method("store", "capture", params)
+    store_capture = call_method(sn, "capture", params)
     logging.info(store_capture)
+
+def store_dual_watch():
+    store_watch(sn="store_dual",sts=[
+        "rgbd_left",
+        "rgbd_right"
+    ])
+
+def store_dual_capture():    
+    store_capture(sn="store_dual",sts=[
+        "rgbd_left",
+        "rgbd_right"
+    ],to_yolo=True,to_pcd=False)
+
+def store_hand_watch():
+    store_watch(sn="store_hand",sts=[
+        "rgbd_hand"
+    ])
+
+def store_hand_capture():    
+    store_capture(sn="store_hand",sts=[
+        "rgbd_hand"
+    ],to_yolo=True,to_pcd=True)
 
 def yolo_start(params=
   {"db_record": {
@@ -136,6 +162,31 @@ def pcd_detect_segments_to_pcd(params):
     res = call_method("pcd", "detect_segments_to_pcd", params)
     logging.info(res)
 
+def open_cams(sts = ["rgbd_left","rgbd_right"]):
+    for s in sts:
+        opencam(s)    
+    for s in sts:
+        while not checkcam(s):
+            time.sleep(2)
+
+def close_cams(sts = ["rgbd_left","rgbd_right"]):
+    for s in sts:
+        closecam(s)    
+    for s in sts:
+        while checkcam(s):
+            time.sleep(2)
+
+def open_dual_cam():
+    open_cams(["rgbd_left","rgbd_right"])
+
+def close_dual_cam():
+    close_cams(["rgbd_left","rgbd_right"])
+
+def open_hand_cam():
+    open_cams(["rgbd_hand"])
+
+def close_hand_cam():
+    close_cams(["rgbd_hand"])
 
 def main() -> None:
     logging.basicConfig(
@@ -146,10 +197,7 @@ def main() -> None:
     time.sleep(5)
     refleshapi()
 
-    sts = [
-        "rgbd_left",
-        "rgbd_right"
-    ]
+    sts = ["rgbd_left","rgbd_right"]
     for s in sts:
         opencam(s)
     
@@ -213,9 +261,17 @@ def main() -> None:
 
 if __name__ == "__main__":
     # main()
-    # set_sgbm_pcd()
-    # set_dnn_pcd()
-    for i in range(100):
-        store_capture(to_yolo=True,to_pcd=False)
+    # # set_sgbm_pcd()
+    # # set_dnn_pcd()
+    # for i in range(100):
+    #     store_dual_capture()
+    #     time.sleep(0.1)
+
+    refleshapi()
+    set_sgbm_pcd()
+    open_hand_cam()
+    store_hand_watch()
+    for i in range(10):
+        store_hand_capture()
         time.sleep(0.1)
     pass

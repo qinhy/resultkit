@@ -139,7 +139,7 @@ class YoloSettings(YoloBaseModel):
     max_detections: int = Field(default=100, gt=0)
     
     stride: int = Field(default=32, gt=0)
-    tile_overlap: int = Field(default=256, ge=0)
+    tile_overlap: int = Field(default=416, ge=0) # good for image of 3872 × 3008
     tile_batch_size: int = Field(default=4, ge=0)
 
     half: bool = True
