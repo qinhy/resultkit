@@ -628,14 +628,17 @@ def decode_yolo_predictions(
     gain: float,
     pad: tuple[int, int],
 ) -> tuple[Any, Any, Any, Any | None]:
-    """Decode common raw YOLO detection/segmentation tensor layouts."""
+    """Decode YOLO raw and YOLO26 end-to-end detection/segmentation outputs."""
+
     pred = predictions[0] if predictions.ndim == 3 else predictions
+
     if pred.ndim != 2:
         raise RuntimeError(
             f"Unexpected YOLO output shape: {tuple(predictions.shape)}"
         )
 
     nc = int(class_count or class_name_count or 0)
+
     proto_mask_dim = (
         int(proto.shape[0])
         if proto is not None and getattr(proto, "ndim", 0) == 3
@@ -643,30 +646,123 @@ def decode_yolo_predictions(
         if proto is not None and getattr(proto, "ndim", 0) == 4
         else 0
     )
+
     mask_dim = int(mask_coeff_count or proto_mask_dim or 0)
 
-    possible_channels = {6}
-    if nc:
-        possible_channels.update({4 + nc, 5 + nc})
-        if mask_dim:
-            possible_channels.update(
-                {4 + nc + mask_dim, 5 + nc + mask_dim}
+    rows = int(pred.shape[0])
+    cols = int(pred.shape[1])
+
+    # -------------------------------------------------------------
+    # YOLO26 END-TO-END
+    #
+    # Detection:
+    #   [300, 6]
+    #   x1, y1, x2, y2, conf, cls
+    #
+    # Segmentation:
+    #   [300, 6 + nm]
+    #   x1, y1, x2, y2, conf, cls, mask_coeffs...
+    #
+    # Important: determine this BEFORE doing any transpose.
+    # -------------------------------------------------------------
+
+    end2end_detect = (
+        rows > cols
+        and cols == 6
+    )
+
+    end2end_segment = (
+        rows > cols
+        and mask_dim > 0
+        and cols == 6 + mask_dim
+    )
+
+    if end2end_detect or end2end_segment:
+        boxes = pred[:, :4].clone()       # already xyxy
+        scores = pred[:, 4]
+        class_ids = pred[:, 5].long()
+
+        mask_coefficients = None
+
+        if end2end_segment:
+            mask_coefficients = pred[:, 6 : 6 + mask_dim]
+
+        keep = torch.isfinite(scores)
+        keep &= scores >= float(confidence_threshold)
+
+        if nc:
+            keep &= class_ids >= 0
+            keep &= class_ids < nc
+
+        boxes = boxes[keep]
+        scores = scores[keep]
+        class_ids = class_ids[keep]
+
+        if mask_coefficients is not None:
+            mask_coefficients = mask_coefficients[keep]
+
+        if boxes.numel() == 0:
+            return (
+                boxes.reshape(0, 4),
+                scores,
+                class_ids,
+                mask_coefficients,
             )
 
+        boxes = scale_boxes_from_letterbox(
+            boxes,
+            original_width=original_width,
+            original_height=original_height,
+            gain=gain,
+            pad=pad,
+        )
+
+        return boxes, scores, class_ids, mask_coefficients
+
+    # -------------------------------------------------------------
+    # TRADITIONAL / RAW YOLO
+    #
+    # Typical YOLO11:
+    #
+    #   [4 + nc, N]
+    #   [4 + nc + nm, N]
+    #
+    # or older objectness-based layouts:
+    #
+    #   [5 + nc, N]
+    # -------------------------------------------------------------
+
+    possible_channels: set[int] = set()
+
+    if nc:
+        possible_channels.update({
+            4 + nc,
+            5 + nc,
+        })
+
+        if mask_dim:
+            possible_channels.update({
+                4 + nc + mask_dim,
+                5 + nc + mask_dim,
+            })
+
     channels_first_raw = (
-        pred.shape[0] in possible_channels
-        and pred.shape[1] not in possible_channels
+        rows in possible_channels
+        and cols not in possible_channels
     )
+
     unknown_names_channels_first = (
-        nc == 0
-        and pred.shape[0] < pred.shape[1]
-        and pred.shape[0] <= 512
+        not possible_channels
+        and rows < cols
+        and rows <= 512
     )
+
     if channels_first_raw or unknown_names_channels_first:
         pred = pred.transpose(0, 1).contiguous()
 
-    channels = int(pred.shape[-1])
-    if channels < 6:
+    channels = int(pred.shape[1])
+
+    if channels < 5:
         empty = torch.empty((0,), device=pred.device)
         return (
             torch.empty((0, 4), device=pred.device),
@@ -676,47 +772,92 @@ def decode_yolo_predictions(
         )
 
     mask_coefficients = None
+
+    # YOLO11 / modern raw segmentation:
+    #
+    # cx, cy, w, h, class scores..., mask coeffs...
     if nc and mask_dim and channels == 4 + nc + mask_dim:
         boxes = xywh_to_xyxy(pred[:, :4])
-        scores, class_ids = pred[:, 4 : 4 + nc].max(dim=1)
-        mask_coefficients = pred[:, 4 + nc : 4 + nc + mask_dim]
+
+        scores, class_ids = pred[
+            :, 4 : 4 + nc
+        ].max(dim=1)
+
+        mask_coefficients = pred[
+            :, 4 + nc : 4 + nc + mask_dim
+        ]
+
+    # Older objectness-based segmentation:
+    #
+    # cx, cy, w, h, obj, classes..., masks...
     elif nc and mask_dim and channels == 5 + nc + mask_dim:
         boxes = xywh_to_xyxy(pred[:, :4])
-        class_scores, class_ids = pred[:, 5 : 5 + nc].max(dim=1)
+
+        class_scores, class_ids = pred[
+            :, 5 : 5 + nc
+        ].max(dim=1)
+
         scores = pred[:, 4] * class_scores
-        mask_coefficients = pred[:, 5 + nc : 5 + nc + mask_dim]
+
+        mask_coefficients = pred[
+            :, 5 + nc : 5 + nc + mask_dim
+        ]
+
+    # YOLO11 / modern raw detection
     elif nc and channels == 4 + nc:
         boxes = xywh_to_xyxy(pred[:, :4])
-        scores, class_ids = pred[:, 4:].max(dim=1)
+
+        scores, class_ids = pred[
+            :, 4 : 4 + nc
+        ].max(dim=1)
+
+    # Older objectness-based detection
     elif nc and channels == 5 + nc:
         boxes = xywh_to_xyxy(pred[:, :4])
-        class_scores, class_ids = pred[:, 5:].max(dim=1)
+
+        class_scores, class_ids = pred[
+            :, 5 : 5 + nc
+        ].max(dim=1)
+
         scores = pred[:, 4] * class_scores
-    elif channels == 6:
-        boxes = pred[:, :4].clone()
-        scores = pred[:, 4]
-        class_ids = pred[:, 5].long()
+
+    # Infer class count only as a fallback.
     elif mask_dim and channels > 4 + mask_dim:
         inferred_nc = channels - 4 - mask_dim
+
         boxes = xywh_to_xyxy(pred[:, :4])
-        scores, class_ids = pred[:, 4 : 4 + inferred_nc].max(dim=1)
+
+        scores, class_ids = pred[
+            :, 4 : 4 + inferred_nc
+        ].max(dim=1)
+
         mask_coefficients = pred[
-            :, 4 + inferred_nc : 4 + inferred_nc + mask_dim
+            :,
+            4 + inferred_nc : 4 + inferred_nc + mask_dim,
         ]
+
     else:
         boxes = xywh_to_xyxy(pred[:, :4])
         scores, class_ids = pred[:, 4:].max(dim=1)
 
-    keep = scores < 1.0
+    # Raw predictions need confidence filtering.
+    keep = torch.isfinite(scores)
     keep &= scores >= float(confidence_threshold)
+
     boxes = boxes[keep]
     scores = scores[keep]
     class_ids = class_ids[keep].long()
+
     if mask_coefficients is not None:
         mask_coefficients = mask_coefficients[keep]
 
     if boxes.numel() == 0:
-        return boxes.reshape(0, 4), scores, class_ids, mask_coefficients
+        return (
+            boxes.reshape(0, 4),
+            scores,
+            class_ids,
+            mask_coefficients,
+        )
 
     boxes = scale_boxes_from_letterbox(
         boxes,
@@ -725,6 +866,7 @@ def decode_yolo_predictions(
         gain=gain,
         pad=pad,
     )
+
     return boxes, scores, class_ids, mask_coefficients
 
 
