@@ -707,7 +707,8 @@ def decode_yolo_predictions(
         boxes = xywh_to_xyxy(pred[:, :4])
         scores, class_ids = pred[:, 4:].max(dim=1)
 
-    keep = scores >= float(confidence_threshold)
+    keep = scores < 1.0
+    keep &= scores >= float(confidence_threshold)
     boxes = boxes[keep]
     scores = scores[keep]
     class_ids = class_ids[keep].long()

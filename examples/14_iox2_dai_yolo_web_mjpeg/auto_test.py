@@ -124,7 +124,12 @@ def yolo_start(params=
     res = call_method("yolo", "start", params)
     logging.info(res)
 
-def yolo_set_model(params={"model_name": "weed_yolo_seg_1280.pt",}):
+def yolo_set_model(params={"model_name": "yolo11l-seg.pt",
+    #Width:  1280 + 3×864 = 3872
+    #Height: 1280 + 2×864 = 3008
+    # 1280,2144,3008,3872
+    # "detection_bbox_xyxy" : [0,0,0,0]
+    }):
     res = call_method("yolo", "set_model", params)
     logging.info(res)
 
@@ -267,7 +272,13 @@ if __name__ == "__main__":
     #     store_dual_capture()
     #     time.sleep(0.1)
 
-    refleshapi()
+    # refleshapi()
+    yolo_set_model({"model_name": "yolo11l-seg.pt",
+        # 0,864,1728,2592                
+        # 1280,2144,3008,38720
+        # "detection_bbox_xyxy" : [0,0,2144,2144]
+        # "detection_bbox_xyxy" : [1728,1728,3872,3008]
+    })
     pcd_set_backend(backend="dnn")
     open_hand_cam()
     store_hand_watch()

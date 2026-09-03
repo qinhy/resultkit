@@ -157,6 +157,14 @@ class YoloSettings(YoloBaseModel):
     
     polygon_epsilon: float = 1.0
     polygon_min_area: float = 1.0
+    
+    # Optional inference ROI in absolute original-image XYXY coordinates.
+    # None means detect on the full image. Values are clipped to image bounds.
+    detection_bbox_xyxy: list[float] | None = Field(
+        default=None,
+        min_length=4,
+        max_length=4,
+    )
 
 
 class YoloResult(StartYoloParams):
@@ -342,6 +350,7 @@ class YoloDetector:
                     "iou": settings.iou,
                     "max_detections": settings.max_detections,
                     "include_masks": settings.include_masks,
+                    "detection_bbox_xyxy": settings.detection_bbox_xyxy,
                     "mask_format": str(
                         getattr(settings, "mask_format", "polygon") or "polygon"
                     ).lower(),
@@ -682,6 +691,8 @@ class YoloDetector:
                 "input_jpg_paths and output_json_paths must have equal lengths: "
                 f"{input_count} != {output_count}"
             )
+        if params.detection_bbox_xyxy is None and self.settings.detection_bbox_xyxy is not None:
+            params.detection_bbox_xyxy = self.settings.detection_bbox_xyxy
 
         logger(
             f"[{self.service_name}:{self.controller_name}:detect] inference request started",
@@ -721,7 +732,6 @@ class YoloDetector:
                     "output_json_path": output_json_path.as_posix(),
                     "size_mode": params.size_mode,
                     "cuda_device": params.cuda_device,
-                    "detection_bbox_xyxy": params.detection_bbox_xyxy,
                 },
             )
 
