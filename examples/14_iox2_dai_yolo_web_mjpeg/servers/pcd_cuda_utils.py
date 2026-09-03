@@ -321,7 +321,16 @@ class StereoRgbCalibrationCuda:
     def from_dict(cls, d: dict[str, Any], source_translation_unit: Literal["m", "cm", "mm"] = "cm"):
         res:StereoRgbCalibrationCpu = StereoRgbCalibrationCpu.from_dict(d,source_translation_unit)
         return res.to_cuda()
-        
+            
+    @classmethod
+    def from_cpu(cls,calib:StereoRgbCalibrationCpu):
+        return StereoRgbCalibrationCpu(
+            calib.rgb_resolution, calib.left_resolution, calib.right_resolution,
+            calib.rgb_intrinsics, calib.left_intrinsics, calib.right_intrinsics,
+            calib.rgb_distortion, calib.left_distortion, calib.right_distortion,
+            calib.left_to_right, calib.left_to_rgb, calib.source_translation_unit,
+        ).to_cuda()
+
     @classmethod
     def default(cls):
         return cls.from_dict(DEFAULT_CALIBRATION)

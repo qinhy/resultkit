@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from functools import lru_cache
+import importlib
 import json
 import os
 import sys
@@ -13,14 +15,13 @@ from typing import Any, Dict, Literal
 import numpy as np
 from pydantic import BaseModel, Field
 import torch
-from common import *
+import cupy as cp
 
+from common import *
 from common import HookDispatcher
 from iox2_jsonrpc import EmptyParams, RpcModel
 from store.custom_record_store import CustomRecord
 from resultkit.logger import logger
-
-PCD_BACKEND:Literal["cpu","cuda","vpi"] = "cuda"
 
 LOG_SERVICE = "jrpc"
 LOG_CONTROLLER = "pcd"
@@ -34,59 +35,23 @@ for path in (
     path_text = str(path)
     if path_text not in sys.path:
         sys.path.append(path_text)
+        
+from pcd_utils import StereoRgbCalibration as StereoRgbCalibrationCpu
 
-if PCD_BACKEND=="cpu":
-    from pcd_utils import (
-        ColoredPointCloud,
-        SGBMDisparityPredictor,
-        StereoRgbCalibration as StereoRgbCalibrationCpu,
-        points_left_to_rgb_depth,
-        read_image,
-        rectified_left_to_original_left,
-        rgb8,
-        rgb_depth_to_points_rgb,
-        save_point_cloud,
-        transform_points,
-    )
-    _image_gpu = lambda img:img
-    from pcd_yolo_utils import split_cloud
+PCD_BACKEND_MODULES = {
+    "cpu": "pcd_backend_cpu",
+    "cuda": "pcd_backend_cuda",
+    "vpi": "pcd_backend_vpi",
+}
 
-elif PCD_BACKEND=="cuda":
-    from pcd_cuda_utils import (
-        ColoredPointCloudCuda as ColoredPointCloud,
-        StereoRgbCalibrationCpu,
-        StereoRgbCalibrationCuda as StereoRgbCalibration,
-        SGBMDisparityPredictorCuda as SGBMDisparityPredictor,
-        points_left_to_rgb_depth,
-        read_image,
-        rectified_left_to_original_left,
-        rgb8_cuda as rgb8,
-        _image_cuda,
-        rgb_depth_to_points_rgb,
-        save_point_cloud,
-        transform_points,
-    )
-    _image_gpu = _image_cuda
-    from pcd_yolo_cuda_utils import split_cloud_cuda as split_cloud
+@lru_cache(maxsize=None)
+def load_pcd_backend(name):
+    try:
+        module_name = PCD_BACKEND_MODULES[name]
+    except KeyError:
+        raise ValueError(f"Unsupported backend: {name}")
 
-elif PCD_BACKEND=="vpi":
-    from pcd_vpi_utils import (
-        ColoredPointCloud,
-        StereoRgbCalibration as StereoRgbCalibrationCpu,
-        VPIStereoDisparityGPU as SGBMDisparityPredictor,
-        points_left_to_rgb_depth,
-        rectified_left_to_original_left,
-        rgb_depth_to_points_rgb,
-        transform_points,
-        read_image,
-        _image_cupy,
-        rgb8,
-        save_point_cloud,
-    )
-    _image_gpu = _image_cupy
-    import cupy as cp
-    from pcd_yolo_vpi_utils import split_cloud_vpi as split_cloud
-
+    return importlib.import_module(module_name)
 
 try:  # noqa: E402
     from pcd_dnn_utils import FastFoundationStereoDisparity
@@ -106,7 +71,7 @@ logger(
 
 Resolution = tuple[int, int]
 ColorOrder = Literal["RGB", "BGR"]
-DepthBackend = Literal["sgbm", "dnn"]
+DepthBackend = Literal["sgbm", "dnn", "vpi"]
 OutputFrame = Literal["left", "left_rectified"]
 SegmentOutputFrame = Literal["rgb", "left"]
 TranslationUnit = Literal["m", "cm", "mm"]
@@ -172,8 +137,9 @@ def _read_image_or_npy(path: str | Path, *, color: bool) -> np.ndarray:
                 )
 
         return np.ascontiguousarray(array)
-
-    return read_image(image_path, color=color)
+    
+    pcd_backend = load_pcd_backend(os.getenv("PCD_BACKEND","cpu"))
+    return pcd_backend.read_image(image_path, color=color)
 
 
 def _save_cloud_npz(path: str | Path, cloud: Any) -> Path:
@@ -513,7 +479,7 @@ class PcdRunner:
     backend_params: BackendParams = field(default_factory=BackendParams)
     hook_dispatcher: HookDispatcher = field(default_factory=HookDispatcher, repr=False)
 
-    _dnn_predictor: FastFoundationStereoDisparity | None = field(default=None, init=False, repr=False)
+    _dnn_predictor: Any | None = field(default=None, init=False, repr=False)
     _dnn_predictor_key: tuple[Any, ...] | None = field(default=None, init=False, repr=False)
     _yolo_model: Any | None = field(default=None, init=False, repr=False)
     _yolo_model_key: tuple[Any, ...] | None = field(default=None, init=False, repr=False)
@@ -699,7 +665,7 @@ class PcdRunner:
         )
         return calibration
 
-    def _calibration_result(self, calibration: StereoRgbCalibration) -> SetDepthCalibrationResult:
+    def _calibration_result(self, calibration: StereoRgbCalibrationCpu) -> SetDepthCalibrationResult:
         result_fields = (
             "source_translation_unit",
             "rgb_resolution",
@@ -814,13 +780,18 @@ class PcdRunner:
                 "splat_px": splat_px,
             },
         )
+        pcd_backend = load_pcd_backend(os.getenv("PCD_BACKEND","cpu"))
         height, width = left_image.shape[:2]
+        calibration_cpu = calibration
+        calibration = pcd_backend.StereoRgbCalibration.from_cpu(calibration_cpu)
+
         rectifier = calibration.get_rectifier(alpha=alpha)
+        rectifier.calibration = calibration_cpu
         left_rect, right_rect, rect = rectifier.rectify(left_image, right_image)
         
         confidence_u16 = None
-        if backend.backend == "sgbm":   
-            predictor = SGBMDisparityPredictor( width=width,height=height,
+        if backend.backend == "sgbm" or backend.backend == "vpi":   
+            predictor = pcd_backend.SGBMDisparityPredictor( width=width,height=height,
                                                 num_disparities=num_disparities,
                                                 min_disparity=min_disparity,
                                                 block_size=block_size,
@@ -834,7 +805,7 @@ class PcdRunner:
             if isinstance(disparity,tuple):
                 disparity,confidence_u16 = disparity
         elif backend.backend == "dnn":
-            predictor:FastFoundationStereoDisparity = self._get_dnn_predictor(backend)
+            predictor = self._get_dnn_predictor(backend) # FastFoundationStereoDisparity
             disparity = predictor.predict(left_rect, right_rect, input_color_order=input_color_order)
             
         else:
@@ -856,26 +827,27 @@ class PcdRunner:
                 return torch.full((rgb_h, rgb_w), np.nan, np.float64), disparity, rect
             else:
                 return np.full((rgb_h, rgb_w), np.nan, np.float64), disparity, rect
-        
-
         if isinstance(points_rect,torch.Tensor):
-            rgb_image = _image_gpu(rgb_image)
-            left_to_rgb_inv = np.linalg.inv(calibration.left_to_rgb)
-            calibration = calibration.to_cuda()
+            rgb_image = pcd_backend.image_gpu(rgb_image)
+            left_to_rgb_inv = torch.linalg.inv(calibration.left_to_rgb)
         elif isinstance(points_rect,cp.ndarray):
-            rgb_image = _image_gpu(rgb_image)
-            calibration = calibration.to_cupy()
+            rgb_image = pcd_backend.image_gpu(rgb_image)
             left_to_rgb_inv = cp.linalg.inv(calibration.left_to_rgb)
+        elif isinstance(points_rect,np.ndarray):
+            rgb_image = pcd_backend.image_gpu(rgb_image)
+            left_to_rgb_inv = np.linalg.inv(calibration.left_to_rgb)
+        else:
+            raise ValueError(f"Unsupported : {type(points_rect)}")
         
-        points_left = rectified_left_to_original_left(points_rect, rect)
-        depth_rgb_m, _valid_depth_rgb = points_left_to_rgb_depth(
+        points_left = pcd_backend.rectified_left_to_original_left(points_rect, rect)
+        depth_rgb_m, _valid_depth_rgb = pcd_backend.points_left_to_rgb_depth(
             points_left,
             rgb_image,
             calibration,
             rgb_image_is_undistorted=rgb_image_is_undistorted,
             splat_px=splat_px,
         )
-        points_rgb, pixel_xy = rgb_depth_to_points_rgb(
+        points_rgb, pixel_xy = pcd_backend.rgb_depth_to_points_rgb(
             depth_rgb_m, calibration, rgb_image_is_undistorted=rgb_image_is_undistorted
         )
         if not len(points_rgb):
@@ -892,9 +864,10 @@ class PcdRunner:
             },
         )
         
-        points_left = transform_points(points_rgb, left_to_rgb_inv)
+        points_left = pcd_backend.transform_points(points_rgb, left_to_rgb_inv)
         x, y = pixel_xy.T
-        res = points_left, rgb8(rgb_image[y, x, :3], order=input_color_order), pixel_xy, depth_rgb_m, disparity, rect
+        res = (points_left, pcd_backend.rgb8(rgb_image[y, x, :3], order=input_color_order),
+               pixel_xy, depth_rgb_m, disparity, rect)
         return res
     
     def _ensure_ros2_publishers(self, params: Ros2PublishParams) -> dict[str, Any]:
@@ -1061,6 +1034,11 @@ class PcdRunner:
                 "max_disp": params.max_disp,
             },
         )
+        # pcd_backend = load_pcd_backend(os.getenv("PCD_BACKEND","cpu"))
+        # Literal["sgbm", "dnn", "vpi"]
+        os.environ["PCD_BACKEND"] = {"sgbm":"cpu","dnn":"cuda",
+                                     "vpi":"vpi",}[params.backend]
+                    
         with self._process_lock:
             with self._config_lock:
                 old_cache_key = self._dnn_cache_key(self.backend_params)
@@ -1144,14 +1122,15 @@ class PcdRunner:
             max_depth_m=params.max_depth_m,
             splat_px=1,
         )
+        pcd_backend = load_pcd_backend(os.getenv("PCD_BACKEND","cpu"))
         logger(f"[{LOG_SERVICE}:{LOG_CONTROLLER}:depth:compute] _compute_rgb_aligned_depth complete")
-        cloud = ColoredPointCloud(points_left, colors_rgb, disparity, rect)
+        cloud = pcd_backend.ColoredPointCloud(points_left, colors_rgb, disparity, rect)
 
         logger(f"[{LOG_SERVICE}:{LOG_CONTROLLER}:depth:compute] ColoredPointCloud complete")
         if output_suffix == ".npz":
             _save_cloud_npz(output_path, cloud)
         else:
-            save_point_cloud(output_path, points_left, colors_rgb, binary_pcd=params.save_binary_pcd)
+            pcd_backend.save_point_cloud(output_path, points_left, colors_rgb, binary_pcd=params.save_binary_pcd)
         
         logger(f"[{LOG_SERVICE}:{LOG_CONTROLLER}:depth:compute] save_point_cloud complete")
         # depth_min_m, depth_max_m, depth_mean_m = _depth_statistics(cloud.points_m)
@@ -1313,7 +1292,9 @@ class PcdRunner:
             max_depth_m=params.max_depth_m,
             splat_px=params.splat_px,
         )
-        manifest = split_cloud(
+        
+        pcd_backend = load_pcd_backend(os.getenv("PCD_BACKEND","cpu"))
+        manifest = pcd_backend.split_cloud(
             points_left,
             colors_rgb,
             pixel_xy,

@@ -143,9 +143,9 @@ def set_dnn_pcd():
         "remove_invisible": True
     }))
     
-def set_sgbm_pcd():
+def pcd_set_backend(backend="sgbm"):
     logging.info(call_method("pcd", "set_backend",{
-        "backend": "sgbm",
+        "backend": backend,
         "valid_iters": 8,
         "max_disp": 192,
         "hiera": False,
@@ -261,14 +261,14 @@ def main() -> None:
 
 if __name__ == "__main__":
     # main()
-    # # set_sgbm_pcd()
+    # # pcd_set_backend(backend="sgbm")
     # # set_dnn_pcd()
     # for i in range(100):
     #     store_dual_capture()
     #     time.sleep(0.1)
 
     refleshapi()
-    set_sgbm_pcd()
+    pcd_set_backend(backend="dnn")
     open_hand_cam()
     store_hand_watch()
     for i in range(10):

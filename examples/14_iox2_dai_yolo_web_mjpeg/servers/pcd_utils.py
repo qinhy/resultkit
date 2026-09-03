@@ -227,6 +227,10 @@ class StereoRgbCalibration:
         )
 
     @classmethod
+    def from_cpu(cls,calib:StereoRgbCalibration):
+        return calib
+    
+    @classmethod
     def default(cls):
         return cls.from_dict(DEFAULT_CALIBRATION)
 

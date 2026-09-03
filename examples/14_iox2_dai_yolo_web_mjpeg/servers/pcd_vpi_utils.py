@@ -120,6 +120,22 @@ class StereoRgbCalibration:
     @property
     def left_to_rgb_translation_m(self): return self.left_to_rgb[:3, 3:4].copy()
 
+    @classmethod
+    def from_cpu(cls,calib:StereoRgbCalibration):
+        return cls(
+            rgb_resolution=calib.rgb_resolution,
+            left_resolution=calib.left_resolution,
+            right_resolution=calib.right_resolution,
+            rgb_intrinsics=cp.asarray(calib.rgb_intrinsics, dtype=cp.float32),
+            left_intrinsics=cp.asarray(calib.left_intrinsics, dtype=cp.float32),
+            right_intrinsics=cp.asarray(calib.right_intrinsics, dtype=cp.float32),
+            rgb_distortion=cp.asarray(calib.rgb_distortion, dtype=cp.float32),
+            left_distortion=cp.asarray(calib.left_distortion, dtype=cp.float32),
+            right_distortion=cp.asarray(calib.right_distortion, dtype=cp.float32),
+            left_to_right=cp.asarray(calib.left_to_right, dtype=cp.float32),
+            left_to_rgb=cp.asarray(calib.left_to_rgb, dtype=cp.float32),
+            source_translation_unit=calib.source_translation_unit,
+        )
 
     def to_cupy(self):
         return StereoRgbCalibration(
