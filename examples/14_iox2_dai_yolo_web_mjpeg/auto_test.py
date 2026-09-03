@@ -1,3 +1,4 @@
+import argparse
 import logging
 import os
 from pathlib import Path
@@ -49,7 +50,7 @@ def closecam(name):
 def checkcam(name):
     logging.info(f"\n=== {name}.status ===")
     status = call_method(name, "status", {})
-    return status.get("opened",False)
+    return bool(status and status.get("opened", False))
 
 def store_watch(sn="store_dual",sts=[
         "rgbd_left",
@@ -71,7 +72,10 @@ def store_capture(sn="store_dual",sts=[
         "service": "jrpc",
         "stream_ids": sts,
         "field_id": "field_all",
-        "meta": {},
+        "meta": {
+            # "gnss":{"the_data":"xxxxxxxxx"},
+            # "arm":{"run_id":"UUIDXXXX","data":"xxxxxxxxx"}
+        },
         "capture_timeout_s": None,
         "fresh_frame": True,
         "hook_urls": [[]]
@@ -193,96 +197,236 @@ def open_hand_cam():
 def close_hand_cam():
     close_cams(["rgbd_hand"])
 
-def main() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s - %(levelname)s - %(message)s"
-    )
+def init_dual_mode():
+    open_dual_cam()
+    store_dual_watch()
 
-    time.sleep(5)
-    refleshapi()
-
-    sts = ["rgbd_left","rgbd_right"]
-    for s in sts:
-        opencam(s)
-    
-    for s in sts:
-        while not checkcam(s):
-            time.sleep(5)
-
-    store_watch()
-    time.sleep(3)
-
-    store_capture(to_yolo=True,to_pcd=True)
-
-    # # get decodepub status
-    # logging.info("\n=== decodepub.status ===")
-    # res_decode_status = call_method("decodepub", "status")
-    # logging.info(res_decode_status)
-
-    # # start yolo
-    # logging.info("\n=== yolo.start ===")
-    # res_yolo_start = call_method("yolo", "start", {})
-    # logging.info(res_yolo_start)
-
-    # time.sleep(5)
-
-    # # get yolo status
-    # logging.info("\n=== yolo.status ===")
-    # res_yolo_status = call_method("yolo", "status")
-    # logging.info(res_yolo_status)
-
-    # # change yolo model
-    # logging.info("\n=== yolo.set_model ===")
-    # r = redis_for(host="/iox2redis/", decode_responses=True)
-    # while not r.ping():
-    #     time.sleep(1)
-    #     logging.info("Waiting for iox2redis...")
-
-    # default_yolo_settings = {
-    #     "model_name": "yolov8s.pt",  # changing to a different model as an example
-    #     "confidence": 0.9,
-    #     "iou": 0.45,
-    #     "max_detections": 100,
-    #     "stride": 32,
-    # }
-    # last_yolo_settings = r.get_json("yolo_settings")
-    # if last_yolo_settings is None:
-    #     last_yolo_settings = default_yolo_settings
-        
-    # res_yolo_model = call_method("yolo", "set_model", last_yolo_settings)
-    # logging.info(res_yolo_model)
-
-    # time.sleep(5)
-
-    # # get yolo status
-    # logging.info("\n=== yolo.status ===")
-    # res_yolo_status2 = call_method("yolo", "status")
-    # logging.info(res_yolo_status2)
-
-    # # wait for quit
-    # input("Press Enter to quit...")
-    
-
-if __name__ == "__main__":
-    # main()
-    # # pcd_set_backend(backend="sgbm")
-    # # set_dnn_pcd()
-    # for i in range(100):
-    #     store_dual_capture()
-    #     time.sleep(0.1)
-
-    # refleshapi()
-    yolo_set_model({"model_name": "yolo11l-seg.pt",
-        # 0,864,1728,2592                
-        # 1280,2144,3008,38720
-        # "detection_bbox_xyxy" : [0,0,2144,2144]
-        # "detection_bbox_xyxy" : [1728,1728,3872,3008]
-    })
-    pcd_set_backend(backend="dnn")
+def init_hand_mode():
+    pcd_set_backend(backend="sgbm")
     open_hand_cam()
     store_hand_watch()
-    for i in range(10):
-        store_hand_capture()
-        time.sleep(0.1)
+
+def close_all_cams():
+    close_cams(["rgbd_left","rgbd_right","rgbd_hand"])
+
+def capture_for_seconds(capture_func, duration, delay=0):
+    if delay > 0:
+        logging.info(f"Waiting {delay} seconds before capture...")
+        time.sleep(delay)
+
+    logging.info(f"Starting capture for {duration} seconds")
+    start_time = time.monotonic()
+    for i in range(duration):
+        target_time = start_time + i
+
+        # Wait until the scheduled capture time
+        sleep_time = target_time - time.monotonic()
+        if sleep_time > 0:
+            time.sleep(sleep_time)
+
+        logging.info(f"Capture {i + 1}/{duration}")
+        capture_func()
+
+    logging.info("Capture finished")
+
+
+def capture_dual_for_seconds(duration, delay=0):
+    capture_for_seconds(
+        store_dual_capture,
+        duration=duration,
+        delay=delay
+    )
+
+
+def capture_hand_for_seconds(duration, delay=0):
+    capture_for_seconds(
+        store_hand_capture,
+        duration=duration,
+        delay=delay
+    )
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="OAK AI PCD test")
+
+    parser.add_argument(
+        "--close",
+        action="store_true",
+        help="Close all cameras"
+    )
+
+    parser.add_argument(
+        "--dual",
+        action="store_true",
+        help="Initialize dual camera mode"
+    )
+
+    parser.add_argument(
+        "--hand",
+        action="store_true",
+        help="Initialize hand camera mode"
+    )
+
+    parser.add_argument(
+        "--duration",
+        type=int,
+        default=1,
+        help="Capture duration in seconds (1 capture per second)"
+    )
+
+    parser.add_argument(
+        "--delay",
+        type=float,
+        default=0,
+        help="Delay before starting capture in seconds"
+    )
+
+    parser.add_argument(
+        "--capture-dual",
+        action="store_true",
+        help="Capture dual cameras"
+    )
+
+    parser.add_argument(
+        "--capture-hand",
+        action="store_true",
+        help="Capture hand camera"
+    )
+
+    parser.add_argument(
+        "--refresh",
+        action="store_true",
+        help="Refresh API gateway controllers"
+    )
+
+    parser.add_argument(
+        "--backend",
+        choices=["sgbm", "dnn"],
+        default=None,
+        help="Set PCD backend"
+    )
+
+    parser.add_argument(
+        "--model",
+        type=str,
+        default=None,
+        help="Set YOLO model, for example yolo11l-seg.pt"
+    )
+
+    parser.add_argument(
+        "--count",
+        type=int,
+        default=1,
+        help="Number of captures"
+    )
+
+    parser.add_argument(
+        "--interval",
+        type=float,
+        default=0.1,
+        help="Interval between captures in seconds"
+    )
+
+    args = parser.parse_args()
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s"
+    )
+
+    if args.refresh:
+        refleshapi()
+
+    if args.backend:
+        if args.backend == "dnn":
+            set_dnn_pcd()
+        else:
+            pcd_set_backend(args.backend)
+
+    if args.model:
+        yolo_set_model({
+            "model_name": args.model
+        })
+
+    if args.dual:
+        init_dual_mode()
+
+    if args.hand:
+        init_hand_mode()
+
+    if args.capture_dual:
+        capture_dual_for_seconds(
+            duration=args.duration,
+            delay=args.delay
+        )
+
+    if args.capture_hand:
+        capture_hand_for_seconds(
+            duration=args.duration,
+            delay=args.delay
+        )
+
+    if args.close:
+        close_all_cams()
+
+#     # main()
+#     # # pcd_set_backend(backend="sgbm")
+#     # # set_dnn_pcd()
+#     # for i in range(100):
+#     #     store_dual_capture()
+#     #     time.sleep(0.1)
+
+#     # refleshapi()
+#     yolo_set_model({"model_name": "yolo11l-seg.pt",
+#         "tile_batch_size":6,
+
+#         # 0,864,1728,2592                
+#         # 1280,2144,3008,3872
+#         "detection_bbox_xyxy" : [864,0,3008,3008],
+#         # "detection_bbox_xyxy" : [1728,1728,3872,3008],
+#         # "tile_batch_size":3,
+#     })
+#     pcd_set_backend(backend="sgbm")
+#     open_hand_cam()
+#     store_hand_watch()
+#     for i in range(10):
+#         store_hand_capture()
+#         time.sleep(0.1)
     pass
+
+
+# # 1. Reset everything
+# python3 auto_test --refresh
+
+# # 2. Refresh API
+# python3 auto_test --close
+
+# # 3. Set YOLO model
+# python3 auto_test --model yolo11l-seg.pt
+
+# # 4. Initialize dual camera mode
+# python3 auto_test --dual
+
+# # 5. Dual camera basic capture test
+# python3 auto_test --capture-dual --duration 5
+
+# # 6. Dual camera delayed capture test
+# python3 auto_test --capture-dual --delay 3 --duration 10
+
+# # 7. Close cameras before switching mode
+# python3 auto_test --close
+
+# # 8. Initialize hand camera with SGBM
+# python3 auto_test --backend sgbm --hand
+
+# # 9. Hand camera basic capture test
+# python3 auto_test --capture-hand --duration 5
+
+# # 10. Hand camera delayed capture test
+# python3 auto_test --capture-hand --delay 3 --duration 10
+
+# # 11. Longer hand capture test
+# python3 auto_test --capture-hand --duration 30
+
+# # 12. Final cleanup
+# python3 auto_test --close
