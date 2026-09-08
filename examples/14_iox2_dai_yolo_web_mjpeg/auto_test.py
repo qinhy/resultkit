@@ -41,7 +41,14 @@ def refleshapi():
 
 def opencam(name):
     logging.info(f"\n=== {name}.open ===")
-    call_method(name, "open", {})
+    call_method(name, "open", {
+        "rgb_width": 3872,
+        "rgb_height": 3008,
+        "capture_fps": 13,
+        "max_exposure_us": 16667, # 60FPS        
+        "rgb_mjpeg_quality": 95,
+        "stereo_mjpeg_quality": 90,
+    })
 
 def closecam(name):
     logging.info(f"\n=== {name}.close ===")
