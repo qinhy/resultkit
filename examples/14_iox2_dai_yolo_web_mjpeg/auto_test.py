@@ -129,10 +129,10 @@ def yolo_start(params=
     logging.info(res)
 
 def yolo_set_model(params={"model_name": "yolo11l-seg.pt",
-    #Width:  1280 + 3×864 = 3872
-    #Height: 1280 + 2×864 = 3008
-    # 1280,2144,3008,3872
-    # "detection_bbox_xyxy" : [0,0,0,0]
+    #Width:  1280 + 3×880 = 3920
+    #Height: 1280 + 2×880 = 3040
+    # 1280,2144,3040,3920
+    # "detection_bbox_xyxy": [0,0,0,0]
     }):
     res = call_method("yolo", "set_model", params)
     logging.info(res)
@@ -202,8 +202,9 @@ def init_dual_mode():
     store_dual_watch()
     yolo_set_model({
         "model_name": os.getenv("YOLO_MODEL","yolo11l-seg.pt"),
-        "tile_batch_size":4,
-        "detection_bbox_xyxy" : [864,864,3008,3008],
+        "tile_overlap": 400,
+        "tile_batch_size": 4,
+        "detection_bbox_xyxy": [880,880,3040,3040],
     })
 
 
@@ -213,8 +214,9 @@ def init_hand_mode():
     store_hand_watch()
     yolo_set_model({
         "model_name": os.getenv("YOLO_MODEL","yolo11l-seg.pt"),
-        "tile_batch_size":4,
-        "detection_bbox_xyxy" : [0,0,3872,3008-864],
+        "tile_overlap": 400,
+        "tile_batch_size": 4,
+        "detection_bbox_xyxy": [0,0,3920,3040-880],
     })
 
 def close_all_cams():
@@ -392,10 +394,10 @@ if __name__ == "__main__":
 #     yolo_set_model({"model_name": "yolo11l-seg.pt",
 #         "tile_batch_size":6,
 
-#         # 0,864,1728,2592                
-#         # 1280,2144,3008,3872
-#         "detection_bbox_xyxy" : [864,0,3008,3008],
-#         # "detection_bbox_xyxy" : [1728,1728,3872,3008],
+#         # 0,880,1728,2592                
+#         # 1280,2144,3040,3920
+#         "detection_bbox_xyxy": [880,0,3040,3040],
+#         # "detection_bbox_xyxy": [1728,1728,3920,3040],
 #         # "tile_batch_size":3,
 #     })
 #     pcd_set_backend(backend="sgbm")
