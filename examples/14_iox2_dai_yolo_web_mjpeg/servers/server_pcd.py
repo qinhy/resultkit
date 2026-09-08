@@ -276,7 +276,7 @@ class ToPcdParams(BackendOverrides):
     input_color_order: ColorOrder = "BGR"
     rgb_image_is_undistorted: bool = False
     alpha: float = 0.0
-    max_depth_m: float | None = 5.0
+    max_depth_m: float | None = 2.0
     stride: int = Field(default=1, ge=1)
     output_frame: OutputFrame = "left"
     save_binary_pcd: bool = True
@@ -394,7 +394,7 @@ class ToYoloSegmentsParams(BackendOverrides):
 
     # Depth parameters
     alpha: float = 0.0
-    max_depth_m: float | None = 10.0
+    max_depth_m: float | None = 2.0
     output_frame: SegmentOutputFrame = "rgb"
     save_binary_pcd: bool = True
     min_disparity: int = 0

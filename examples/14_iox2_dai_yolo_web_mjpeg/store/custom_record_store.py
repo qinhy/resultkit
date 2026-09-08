@@ -282,10 +282,11 @@ class RecordFS:
     def subtree(self, root_key: str) -> "RecordFS":
         clone = RecordFS.__new__(RecordFS)
         clone.fs = self.fs
-        clone._state = self._state
+        if hasattr(self,"_state"):
+            clone._state = self._state
+            clone.keepalive = self.keepalive
         clone.root_key = root_key.rstrip("/")
         clone.storage_options = dict(self.storage_options)
-        clone.keepalive = self.keepalive
         clone.is_local = self.is_local
         clone.root_url = clone.display(clone.root_key)
         return clone

@@ -200,11 +200,22 @@ def close_hand_cam():
 def init_dual_mode():
     open_dual_cam()
     store_dual_watch()
+    yolo_set_model({
+        "model_name": os.getenv("YOLO_MODEL","yolo11l-seg.pt"),
+        "tile_batch_size":4,
+        "detection_bbox_xyxy" : [864,864,3008,3008],
+    })
+
 
 def init_hand_mode():
     pcd_set_backend(backend="sgbm")
     open_hand_cam()
     store_hand_watch()
+    yolo_set_model({
+        "model_name": os.getenv("YOLO_MODEL","yolo11l-seg.pt"),
+        "tile_batch_size":4,
+        "detection_bbox_xyxy" : [0,0,3872,3008-864],
+    })
 
 def close_all_cams():
     close_cams(["rgbd_left","rgbd_right","rgbd_hand"])
@@ -347,6 +358,7 @@ if __name__ == "__main__":
         yolo_set_model({
             "model_name": args.model
         })
+        os.environ["YOLO_MODEL"] = args.model
 
     if args.dual:
         init_dual_mode()
