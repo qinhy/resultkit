@@ -59,8 +59,8 @@ class CameraConfig(CameraBaseModel):
     uuid: str = f"{args.service_name}:{args.controller_name}"
     sources: list[str] = [args.device]
 
-    rgb_width: int = 3920 # max 4056
-    rgb_height: int = 3040 # max 3040
+    rgb_width: int = 3872 # max 4056
+    rgb_height: int = 3008 # max 3040
     stereo_width: int = 1280
     stereo_height: int = 800
     capture_fps: int = 13
