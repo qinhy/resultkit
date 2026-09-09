@@ -16,7 +16,7 @@ import numpy as np
 from common import EmptyParams, RpcModel, openapi_doc
 from resultkit.MatModel import CodecFormat, ColorFormat, Model4Mat
 from resultkit.dai.rgb_stereo_mjpeg_generator import DepthAIPoeRGBStereoMjpegGenerator
-from pcd_utils import StereoRgbCalibration
+from pcd_calculation import StereoRgbCalibration
 
 class Args:
     service_name="jrpc"
