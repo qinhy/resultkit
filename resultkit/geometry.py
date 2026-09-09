@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple
 import numpy as np
 from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator
 
-from .arrays import as_box_array, as_points_array, to_jsonable
+# from .arrays import as_box_array, as_points_array, to_jsonable
 
 
 class BoxFormat(str, enum.Enum):

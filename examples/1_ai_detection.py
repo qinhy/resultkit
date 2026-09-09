@@ -2,8 +2,10 @@
 import os
 import sys
 import numpy as np
+
+from resultkit.geometry import ScaleFormat
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from resultkit.MatModel import ColorFormat, Model4Mat, MatStore
+from resultkit.MatModel import BboxAxisFormat, ColorFormat, Model4Mat, MatStore
 
 store = MatStore.build()
 BoundingBox = Model4Mat.BoundingBox
@@ -15,8 +17,8 @@ person_bbox = store.add_new_obj(BoundingBox(data=np.array([[10, 20, 220, 440]], 
                                           labels=['person'],
                                           labels_id=np.array([0], dtype=np.int32),
                                           scores=np.array([0.98], dtype=np.float32),
-                                          scale=BoundingBox.ScaleFormat.RAW,
-                                          format=BoundingBox.AxisFormat.XYWH,
+                                          scale=ScaleFormat.RAW,
+                                          format=BboxAxisFormat.XYWH,
                                           image_size=img.size()))
 
 face_bbox = store.add_new_obj(person_bbox.model_copy())

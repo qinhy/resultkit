@@ -11,6 +11,8 @@ from PIL import Image
 from io import BytesIO
 import iceoryx2 as iox2
 
+from .geometry import ScaleFormat
+
 try:    
     from cuda import ImageMatCUDAPubSub, EncodedImageMatCUDAPubSub
     from mat import to_ctypes_type, to_np_type
@@ -402,7 +404,7 @@ class Model4Mat:
 
 
         def safe_update_data(self,data:Union[np.ndarray,torch.Tensor]):
-            model = self.__class__(**{'color_format':ColorFormat.UNKNOWN,'data':data})
+            model = self.__class__(**{'color_format':ColorFormat.UNKNOWN,'data':data,'shape_type':self.shape_type})
             return self.controller.update(**{**model.model_dump(),'data':model.data}).model
         
         def init(self):
@@ -525,19 +527,19 @@ class Model4Mat:
             if self.lib == MatLib.NUMPY:return self
             B,C,H,W = self.BCHW
             data = (self.data*255.0).to(dtype=torch.uint8).detach().cpu()
-            shape_type = self.ShapeType.UNKNOWN
+            shape_type = ImageShapeType.UNKNOWN
             if C==1:
                 data = data.squeeze(1)
-                shape_type = self.ShapeType.BHW
+                shape_type = ImageShapeType.BHW
                 if data.shape[0]==1:
                     data = data.squeeze(0)
-                    shape_type = self.ShapeType.HW
+                    shape_type = ImageShapeType.HW
             else:
                 data = data.permute(0,2,3,1)
-                shape_type = self.ShapeType.BHWC
+                shape_type = ImageShapeType.BHWC
                 if data.shape[0]==1:
                     data = data.squeeze(0)
-                    shape_type = self.ShapeType.HWC
+                    shape_type = ImageShapeType.HWC
 
             data = data.numpy()
             if not tmp:
@@ -550,20 +552,20 @@ class Model4Mat:
             if self.lib == MatLib.TORCH:return self
             B,C,H,W = self.BCHW
             data = torch.from_numpy(self.data.copy()).to(device=device).div(255.0).to(dtype=dtype)
-            if self.shape_type == self.ShapeType.HWC:
+            if self.shape_type == ImageShapeType.HWC:
                 data = data.permute(2,0,1).unsqueeze(0)
-            elif self.shape_type == self.ShapeType.BHWC:
+            elif self.shape_type == ImageShapeType.BHWC:
                 data = data.permute(0,3,1,2)
-            elif self.shape_type == self.ShapeType.BHW:
+            elif self.shape_type == ImageShapeType.BHW:
                 data = data.unsqueeze(1)
-            elif self.shape_type == self.ShapeType.HW:
+            elif self.shape_type == ImageShapeType.HW:
                 data = data.unsqueeze(0).unsqueeze(0)
             
             if not tmp:
-                self.shape_type = self.ShapeType.BCHW
+                self.shape_type = ImageShapeType.BCHW
                 return self.safe_update_data(data)
             else:
-                return self.model_copy(update={'data':data, 'shape_type':self.ShapeType.BCHW})
+                return self.model_copy(update={'data':data, 'shape_type':ImageShapeType.BCHW})
             
         @staticmethod
         def from_url(url:str,color_format=ColorFormat.RGB):
@@ -1076,9 +1078,9 @@ class Model4Mat:
             if shape[1] != 4: raise ValueError(f"Expected bounding box shape is (n, 4), got {shape}")
             mi = self.get_ops().min(self.get_ops().flatten(self.data))
             ma = self.get_ops().max(self.get_ops().flatten(self.data))
-            if self.scale==self.ScaleFormat.ZERO_ONE and (mi < 0.0 or ma > 1.0):
+            if self.scale==ScaleFormat.ZERO_ONE and (mi < 0.0 or ma > 1.0):
                 raise ValueError(f"Expected bounding box values in [0, 1], got {mi}~{ma}")
-            if self.scale==self.ScaleFormat.RAW and ma <= 1.0:
+            if self.scale==ScaleFormat.RAW and ma <= 1.0:
                 raise ValueError(f"Expected bounding box values in raw pixels, got {mi}~{ma}")
                 
         def get_raw_abcd(self, data, type):
@@ -1087,9 +1089,9 @@ class Model4Mat:
             a,b,c,d = getattr(ops,f"from_{self.format.value}_to_{type.value}")(data)
             return ops.stack([a,b,c,d],dim=1)
         
-        def get_raw_xywh(self):return self.get_raw_abcd(self.data,self.AxisFormat.XYWH)
-        def get_raw_xyxy(self):return self.get_raw_abcd(self.data,self.AxisFormat.XYXY)
-        def get_raw_cxcywh(self):return self.get_raw_abcd(self.data,self.AxisFormat.CXCYWH)
+        def get_raw_xywh(self):return self.get_raw_abcd(self.data,BboxAxisFormat.XYWH)
+        def get_raw_xyxy(self):return self.get_raw_abcd(self.data,BboxAxisFormat.XYXY)
+        def get_raw_cxcywh(self):return self.get_raw_abcd(self.data,BboxAxisFormat.CXCYWH)
 
         # local edit
         def to_abcd(self, data, type):
@@ -1097,15 +1099,15 @@ class Model4Mat:
             self.format = type
             return self.controller.update(**{**self.model_dump(),'data':data}).model
         
-        def to_xywh(self):return self.to_abcd(self.data,self.AxisFormat.XYWH)
-        def to_xyxy(self):return self.to_abcd(self.data,self.AxisFormat.XYXY)
-        def to_cxcywh(self):return self.to_abcd(self.data,self.AxisFormat.CXCYWH)
+        def to_xywh(self):return self.to_abcd(self.data,BboxAxisFormat.XYWH)
+        def to_xyxy(self):return self.to_abcd(self.data,BboxAxisFormat.XYXY)
+        def to_cxcywh(self):return self.to_abcd(self.data,BboxAxisFormat.CXCYWH)
 
         def to_scale(self,scale):
             if self.scale==scale:return self
             if self.image_size is None:
                 raise ValueError("image_size must be set before scaling")
-            if scale not in [self.ScaleFormat.ZERO_ONE,self.ScaleFormat.RAW]:                
+            if scale not in [ScaleFormat.ZERO_ONE,ScaleFormat.RAW]:                
                 raise ValueError(f"Unknown scale format: {scale}")      
             
             f = self.format
@@ -1113,10 +1115,10 @@ class Model4Mat:
             xyxy = model.data
             width, height = self.image_size
 
-            if scale==self.ScaleFormat.ZERO_ONE:
+            if scale==ScaleFormat.ZERO_ONE:
                 xyxy[:, [0, 2]] /= float(width)
                 xyxy[:, [1, 3]] /= float(height)
-            elif scale==self.ScaleFormat.RAW:
+            elif scale==ScaleFormat.RAW:
                 xyxy[:, [0, 2]] *= float(width)
                 xyxy[:, [1, 3]] *= float(height)
                 

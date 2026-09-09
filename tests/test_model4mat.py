@@ -6,12 +6,14 @@ import numpy as np
 import pytest
 import torch
 
+
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from resultkit.MatModel import ColorFormat, Model4Mat, MatLib, DataType, MatStore, ImageShapeType
+from resultkit.MatModel import BboxAxisFormat, ColorFormat, Model4Mat, MatLib, DataType, MatStore, ImageShapeType
+from resultkit.geometry import ScaleFormat
 
 
 def add_to_store(model):
-    store = MatStore()
+    store = MatStore.build()
     return store.add_new_obj(model)
 
 
@@ -227,11 +229,11 @@ def test_torch_gray_to_numpy():
     out = img.to_numpy()
 
     assert out.lib == MatLib.NUMPY
-    assert out.shape_type == ImageShapeType.BHW
+    assert out.shape_type == ImageShapeType.HW
     assert out.BCHW == (1, 1, 2, 3)
-    assert out.data.shape == (1, 2, 3)
+    assert out.data.shape == (2, 3)
     assert out.data.dtype == np.uint8
-    np.testing.assert_array_equal(out.data, np.full((1, 2, 3), 255, dtype=np.uint8))
+    np.testing.assert_array_equal(out.data, np.full((2, 3), 255, dtype=np.uint8))
 
 
 def test_torch_rgb_to_numpy():
@@ -245,11 +247,11 @@ def test_torch_rgb_to_numpy():
     out = img.to_numpy()
 
     assert out.lib == MatLib.NUMPY
-    assert out.shape_type == ImageShapeType.BHWC
+    assert out.shape_type == ImageShapeType.HWC
     assert out.BCHW == (1, 3, 2, 4)
-    assert out.data.shape == (1, 2, 4, 3)
+    assert out.data.shape == (2, 4, 3)
     assert out.data.dtype == np.uint8
-    np.testing.assert_array_equal(out.data, np.full((1, 2, 4, 3), 255, dtype=np.uint8))
+    np.testing.assert_array_equal(out.data, np.full((2, 4, 3), 255, dtype=np.uint8))
 
 
 # -------------------------
@@ -259,8 +261,8 @@ def test_torch_rgb_to_numpy():
 def test_bounding_box_zero_one_is_valid():
     box = Model4Mat.BoundingBox(
         data=np.array([[0.1, 0.2, 0.8, 0.9]], dtype=np.float32),
-        scale=Model4Mat.BoundingBox.ScaleFormat.ZERO_ONE,
-        format=Model4Mat.BoundingBox.AxisFormat.XYXY,
+        scale=ScaleFormat.ZERO_ONE,
+        format=BboxAxisFormat.XYXY,
     )
 
     assert box.lib == MatLib.NUMPY
@@ -285,7 +287,7 @@ def test_bounding_box_zero_one_rejects_out_of_range():
     with pytest.raises(ValueError, match=r"\[0, 1\]"):
         Model4Mat.BoundingBox(
             data=np.array([[-0.1, 0.2, 1.2, 0.9]], dtype=np.float32),
-            scale=Model4Mat.BoundingBox.ScaleFormat.ZERO_ONE,
+            scale=ScaleFormat.ZERO_ONE,
         )
 
 
@@ -293,7 +295,7 @@ def test_bounding_box_raw_rejects_normalized_values():
     with pytest.raises(ValueError, match="raw pixels"):
         Model4Mat.BoundingBox(
             data=np.array([[0.1, 0.2, 0.8, 0.9]], dtype=np.float32),
-            scale=Model4Mat.BoundingBox.ScaleFormat.RAW,
+            scale=ScaleFormat.RAW,
         )
 
 
@@ -311,15 +313,15 @@ def test_bounding_box_xyxy_to_xywh_conversion():
     box = add_to_store(
         Model4Mat.BoundingBox(
             data=np.array([[10.0, 20.0, 30.0, 50.0]], dtype=np.float32),
-            scale=Model4Mat.BoundingBox.ScaleFormat.RAW,
-            format=Model4Mat.BoundingBox.AxisFormat.XYXY,
+            scale=ScaleFormat.RAW,
+            format=BboxAxisFormat.XYXY,
             image_size=(100, 100),
         )
     )
 
     out:Model4Mat.BoundingBox = box.to_xywh()
 
-    assert out.format == Model4Mat.BoundingBox.AxisFormat.XYWH
+    assert out.format == BboxAxisFormat.XYWH
     np.testing.assert_allclose(
         out.data,
         np.array([[10.0, 20.0, 20.0, 30.0]], dtype=np.float32),
@@ -336,15 +338,15 @@ def test_bounding_box_to_scale_raw_to_zero_one():
     box = add_to_store(
         Model4Mat.BoundingBox(
             data=np.array([[10.0, 20.0, 30.0, 50.0]], dtype=np.float32),
-            scale=Model4Mat.BoundingBox.ScaleFormat.RAW,
-            format=Model4Mat.BoundingBox.AxisFormat.XYXY,
+            scale=ScaleFormat.RAW,
+            format=BboxAxisFormat.XYXY,
             image_size=(100, 100),
         )
     )
 
-    out:Model4Mat.BoundingBox = box.to_scale(Model4Mat.BoundingBox.ScaleFormat.ZERO_ONE)
+    out:Model4Mat.BoundingBox = box.to_scale(ScaleFormat.ZERO_ONE)
 
-    assert out.scale == Model4Mat.BoundingBox.ScaleFormat.ZERO_ONE
+    assert out.scale == ScaleFormat.ZERO_ONE
     np.testing.assert_allclose(
         out.data,
         np.array([[0.1, 0.2, 0.3, 0.5]], dtype=np.float32),
