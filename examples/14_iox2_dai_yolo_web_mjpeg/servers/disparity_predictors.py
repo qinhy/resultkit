@@ -1,12 +1,8 @@
-"""Stereo disparity predictors with a shared interface.
+"""Stereo disparity predictors with a strict Torch prediction interface.
 
-Native outputs:
-- SGBMDisparityPredictor: NumPy
-- VPIStereoDisparityGPU: Torch CUDA
-- SGBMDisparityPredictorCuda: Torch CUDA
-- FastFoundationStereoDisparity: Torch (model device)
-
-Use ``predict_numpy`` when a CPU HxW float32 NumPy disparity map is required.
+Every ``predict(left, right)`` accepts Torch tensors and returns an HxW float32
+Torch tensor. OpenCV SGBM returns CPU Torch; GPU/model backends return Torch on
+their native device. ``predict_numpy`` remains available as a CPU convenience.
 """
 
 from __future__ import annotations
@@ -18,7 +14,7 @@ import inspect
 import math
 from pathlib import Path
 import sys
-from typing import Any, ClassVar, Generic, Literal, TypeVar
+from typing import Any, ClassVar, Literal
 import warnings
 
 import cv2
@@ -40,9 +36,8 @@ except ImportError:
 ColorOrder = Literal["RGB", "BGR"]
 ImageLayout = Literal["HWC", "CHW"]
 ValueRange = Literal["auto", "0_1", "0_255"]
-OutputBackend = Literal["numpy", "cupy", "torch"]
+OutputBackend = Literal["torch"]
 DeviceLike = str | Any
-DisparityT = TypeVar("DisparityT")
 
 
 def _unexpected(name: str, kwargs: dict[str, Any]) -> None:
@@ -63,7 +58,7 @@ def _resize_4d(x: torch.Tensor, size: tuple[int, int], down: bool = False) -> to
     return interpolate(x, size=size, mode="bilinear", align_corners=False)
 
 
-class DisparityPredictor(ABC, Generic[DisparityT]):
+class DisparityPredictor(ABC):
     """Base class shared by all stereo backends."""
 
     output_backend: ClassVar[OutputBackend]
@@ -73,7 +68,7 @@ class DisparityPredictor(ABC, Generic[DisparityT]):
         *,
         # Common stereo controls
         min_disparity: int = 0,
-        num_disparities: int = 128,
+        num_disparities: int = 256,
         block_size: int = 5,
         # VPI / SGM-style controls
         confidence_threshold: int = 32767,
@@ -141,13 +136,13 @@ class DisparityPredictor(ABC, Generic[DisparityT]):
         pass
 
     @abstractmethod
-    def predict(self, left: Any, right: Any, **kwargs: Any) -> DisparityT:
+    def predict(self, left: torch.Tensor, right: torch.Tensor, **kwargs: Any) -> torch.Tensor:
         raise NotImplementedError
 
-    def __call__(self, left: Any, right: Any, **kwargs: Any) -> DisparityT:
+    def __call__(self, left: torch.Tensor, right: torch.Tensor, **kwargs: Any) -> torch.Tensor:
         return self.predict(left, right, **kwargs)
 
-    def predict_numpy(self, left: Any, right: Any, **kwargs: Any) -> np.ndarray:
+    def predict_numpy(self, left: torch.Tensor, right: torch.Tensor, **kwargs: Any) -> np.ndarray:
         return _to_numpy_disparity(self.predict(left, right, **kwargs))
 
     def close(self) -> None:
@@ -161,28 +156,34 @@ class DisparityPredictor(ABC, Generic[DisparityT]):
         return False
 
 
-def _to_numpy_disparity(disparity: Any) -> np.ndarray:
-    if isinstance(disparity, np.ndarray):
-        array = disparity
-    elif cp is not None and isinstance(disparity, cp.ndarray):
-        array = cp.asnumpy(disparity)
-    elif isinstance(disparity, torch.Tensor):
-        array = disparity.detach().cpu().numpy()
-    else:
-        raise TypeError(f"Unsupported disparity type {type(disparity)!r}; expected NumPy, CuPy, or Torch")
-
-    _require(array.ndim == 2, f"Expected HxW disparity output, got shape {array.shape}")
-    return array.astype(np.float32, copy=False)
+def _require_tensor(image: Any, name: str = "image") -> torch.Tensor:
+    _require(isinstance(image, torch.Tensor), f"{name} must be a torch.Tensor, got {type(image)!r}", TypeError)
+    return image
 
 
-def _as_numpy_u8_gray(image: Any) -> np.ndarray:
-    array = np.asarray(image)
+def _require_tensor_pair(left: Any, right: Any) -> tuple[torch.Tensor, torch.Tensor]:
+    return _require_tensor(left, "left"), _require_tensor(right, "right")
+
+
+def _to_numpy_disparity(disparity: torch.Tensor) -> np.ndarray:
+    disparity = _require_tensor(disparity, "disparity")
+    _require(disparity.ndim == 2, f"Expected HxW disparity output, got shape {tuple(disparity.shape)}")
+    return disparity.detach().cpu().numpy().astype(np.float32, copy=False)
+
+
+def _as_numpy_u8_gray(image: torch.Tensor) -> np.ndarray:
+    """Convert a Torch HxW/HWC/CHW image to contiguous CPU uint8 grayscale."""
+    x = _require_tensor(image).detach()
+    if x.ndim == 3 and x.shape[0] <= 4 < x.shape[-1]:
+        x = x.permute(1, 2, 0)
+    array = x.cpu().numpy()
+
     if array.ndim == 3 and array.shape[2] >= 3:
         array = cv2.cvtColor(array[..., :3], cv2.COLOR_BGR2GRAY)
     elif array.ndim == 3 and array.shape[2] == 1:
         array = array[..., 0]
     elif array.ndim != 2:
-        raise ValueError(f"Expected grayscale/HWC image, got shape {array.shape}")
+        raise ValueError(f"Expected grayscale/HWC/CHW image, got shape {tuple(image.shape)}")
 
     if array.dtype == np.uint8:
         return np.ascontiguousarray(array)
@@ -197,14 +198,12 @@ def _as_numpy_u8_gray(image: Any) -> np.ndarray:
     return np.ascontiguousarray(np.clip(array, 0, 255).astype(np.uint8))
 
 
-def _as_vpi_u8_gray(image: Any):
+def _as_vpi_u8_gray(image: torch.Tensor):
     _require(vpi is not None, "NVIDIA VPI Python bindings are required for VPIStereoDisparityGPU", ImportError)
-    if isinstance(image, vpi.Image):
-        return image
     return vpi.asimage(_as_numpy_u8_gray(image), format=vpi.Format.U8)
 
 
-class VPIStereoDisparityGPU(DisparityPredictor[torch.Tensor]):
+class VPIStereoDisparityGPU(DisparityPredictor):
     """NVIDIA VPI CUDA stereo matcher returning Torch float32 disparity."""
 
     output_backend: ClassVar[OutputBackend] = "torch"
@@ -237,8 +236,9 @@ class VPIStereoDisparityGPU(DisparityPredictor[torch.Tensor]):
         self._shape = shape
         self._left_y16 = self._right_y16 = self._disparity = None
 
-    def predict(self, left: Any, right: Any, **kwargs: Any) -> torch.Tensor:
+    def predict(self, left: torch.Tensor, right: torch.Tensor, **kwargs: Any) -> torch.Tensor:
         _unexpected("VPI", kwargs)
+        left, right = _require_tensor_pair(left, right)
         left_vpi, right_vpi = _as_vpi_u8_gray(left), _as_vpi_u8_gray(right)
         _require(left_vpi.size == right_vpi.size, "Rectified left/right images must have matching size")
 
@@ -275,10 +275,10 @@ class VPIStereoDisparityGPU(DisparityPredictor[torch.Tensor]):
         return torch.from_dlpack(result)
 
 
-class SGBMDisparityPredictor(DisparityPredictor[np.ndarray]):
-    """OpenCV StereoSGBM predictor returning CPU NumPy float32 disparity."""
+class SGBMDisparityPredictor(DisparityPredictor):
+    """OpenCV StereoSGBM predictor returning CPU Torch float32 disparity."""
 
-    output_backend: ClassVar[OutputBackend] = "numpy"
+    output_backend: ClassVar[OutputBackend] = "torch"
 
     def _initialize_backend(self) -> None:
         _require(self.num_disparities > 0, "num_disparities must be positive")
@@ -297,17 +297,18 @@ class SGBMDisparityPredictor(DisparityPredictor[np.ndarray]):
             preFilterCap=self.pre_filter_cap, mode=cv2.STEREO_SGBM_MODE_SGBM_3WAY,
         )
 
-    def predict(self, left: Any, right: Any, **kwargs: Any) -> np.ndarray:
+    def predict(self, left: torch.Tensor, right: torch.Tensor, **kwargs: Any) -> torch.Tensor:
         _unexpected("SGBM", kwargs)
-        left, right = _as_numpy_u8_gray(left), _as_numpy_u8_gray(right)
-        _require(left.shape == right.shape, "Rectified left/right images must have the same shape")
-        disparity = self.matcher.compute(left, right).astype(np.float32) / 16.0
+        left, right = _require_tensor_pair(left, right)
+        left_np, right_np = _as_numpy_u8_gray(left), _as_numpy_u8_gray(right)
+        _require(left_np.shape == right_np.shape, "Rectified left/right images must have the same shape")
+        disparity = self.matcher.compute(left_np, right_np).astype(np.float32) / 16.0
         if self.invalid_to_nan:
             disparity[disparity < self.min_disparity] = np.nan
-        return disparity
+        return torch.from_numpy(disparity)
 
 
-class SGBMDisparityPredictorCuda(DisparityPredictor[torch.Tensor]):
+class SGBMDisparityPredictorCuda(DisparityPredictor):
     """libSGM CUDA stereo matcher returning a CUDA Torch float32 tensor."""
 
     output_backend: ClassVar[OutputBackend] = "torch"
@@ -344,9 +345,9 @@ class SGBMDisparityPredictorCuda(DisparityPredictor[torch.Tensor]):
         self.invalid = int(self.lib.sgm_invalid(self.handle))
 
     @torch.inference_mode()
-    def predict(self, left: Any, right: Any, **kwargs: Any) -> torch.Tensor:
+    def predict(self, left: torch.Tensor, right: torch.Tensor, **kwargs: Any) -> torch.Tensor:
         _unexpected("libSGM", kwargs)
-        _require(isinstance(left, torch.Tensor) and isinstance(right, torch.Tensor), "libSGM expects Torch tensors", TypeError)
+        left, right = _require_tensor_pair(left, right)
         _require(tuple(left.shape) == self.shape and tuple(right.shape) == self.shape, f"Expected images with shape {self.shape}")
         _require(left.dtype == right.dtype == torch.uint8, "Expected uint8 images")
         _require(left.device == right.device == self.device, f"Images must be on {self.device}; got {left.device} and {right.device}")
@@ -390,21 +391,14 @@ def _infer_layout(shape: tuple[int, ...], requested: ImageLayout | None) -> Imag
 
 
 def _to_torch_chw(
-    image: Any,
+    image: torch.Tensor,
     *,
     device: Any,
     color: ColorOrder,
     layout: ImageLayout | None,
     value_range: ValueRange,
 ) -> torch.Tensor:
-    if isinstance(image, torch.Tensor):
-        x = image
-    elif isinstance(image, np.ndarray):
-        x = torch.from_numpy(np.ascontiguousarray(image))
-    elif hasattr(image, "__dlpack__"):
-        x = torch.from_dlpack(image)
-    else:
-        x = torch.as_tensor(image)
+    x = _require_tensor(image)
 
     if x.ndim == 2:
         x = x.unsqueeze(0)
@@ -468,7 +462,7 @@ def _supports_kwarg(func: Any, name: str) -> bool | None:
     return name in params or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
 
 
-class FastFoundationStereoDisparity(DisparityPredictor[torch.Tensor]):
+class FastFoundationStereoDisparity(DisparityPredictor):
     """Fast-FoundationStereo predictor returning Torch disparity on the model device."""
 
     output_backend: ClassVar[OutputBackend] = "torch"
@@ -561,8 +555,8 @@ class FastFoundationStereoDisparity(DisparityPredictor[torch.Tensor]):
 
     def predict_cuda(
         self,
-        left_rectified: Any,
-        right_rectified: Any,
+        left_rectified: torch.Tensor,
+        right_rectified: torch.Tensor,
         *,
         input_color_order: ColorOrder = "RGB",
         input_layout: ImageLayout | None = None,
@@ -570,7 +564,7 @@ class FastFoundationStereoDisparity(DisparityPredictor[torch.Tensor]):
         model_scale: float = 1.0,
         remove_invisible: bool = True,
     ) -> torch.Tensor:
-        _require(left_rectified is not None and right_rectified is not None, "left_rectified and right_rectified are required")
+        left_rectified, right_rectified = _require_tensor_pair(left_rectified, right_rectified)
         _require(input_color_order in ("RGB", "BGR"), f"input_color_order must be 'RGB' or 'BGR', got {input_color_order!r}")
         _require(input_layout in (None, "HWC", "CHW"), f"input_layout must be None, 'HWC', or 'CHW', got {input_layout!r}")
         _require(model_scale > 0, f"model_scale must be positive, got {model_scale}")
@@ -613,8 +607,8 @@ class FastFoundationStereoDisparity(DisparityPredictor[torch.Tensor]):
 
     def predict(
         self,
-        left_rectified: Any,
-        right_rectified: Any,
+        left_rectified: torch.Tensor,
+        right_rectified: torch.Tensor,
         *,
         input_color_order: ColorOrder = "RGB",
         input_layout: ImageLayout | None = None,
