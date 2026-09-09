@@ -20,6 +20,7 @@ import cupy as cp
 from common import *
 from common import HookDispatcher
 from iox2_jsonrpc import EmptyParams, RpcModel
+from matops import MatDevice, MatLib, TorchMatOps, MatOps
 from store.custom_record_store import CustomRecord
 from resultkit.logger import logger
 
@@ -36,13 +37,32 @@ for path in (
     if path_text not in sys.path:
         sys.path.append(path_text)
         
-from pcd_utils import StereoRgbCalibration as StereoRgbCalibrationCpu
+from disparity_predictors import (DisparityPredictor,
+                                SGBMDisparityPredictor,
+                                FastFoundationStereoDisparity,
+                                SGBMDisparityPredictorCuda,
+                                VPIStereoDisparityGPU)
+
+from pcd_calculation import (StereoRectifier, StereoRgbCalibration, project_points_to_rgb_pixels, read_image, rectified_left_to_original_left, rgb8, save_pcd, split_cloud_uv,
+                             )
 
 PCD_BACKEND_MODULES = {
     "cpu": "pcd_backend_cpu",
     "cuda": "pcd_backend_cuda",
     "vpi": "pcd_backend_vpi",
 }
+ALL_PCD_BACKENDS = {
+        "cpu": (MatLib.TORCH, MatDevice.CPU,  TorchMatOps(),SGBMDisparityPredictor()),
+        "dnn": (MatLib.TORCH, MatDevice.CUDA, TorchMatOps(device=MatDevice.CUDA),FastFoundationStereoDisparity(
+                    repo_dir="./fast-foundationstereo",
+                    model_path="weights/23-36-37/model_best_bp2_serialize.pth",
+                )),
+        "cuda": (MatLib.TORCH, MatDevice.CUDA,TorchMatOps(device=MatDevice.CUDA),SGBMDisparityPredictorCuda(
+                    width=1280,height=800,
+                )),
+        # "vpi": (MatLib.TORCH, MatDevice.CUDA, TorchMatOps(device=MatDevice.CUDA),VPIStereoDisparityGPU()),
+    }
+
 
 @lru_cache(maxsize=None)
 def load_pcd_backend(name):
@@ -53,21 +73,6 @@ def load_pcd_backend(name):
 
     return importlib.import_module(module_name)
 
-try:  # noqa: E402
-    from pcd_dnn_utils import FastFoundationStereoDisparity
-    _DNN_IMPORT_ERROR: ImportError | None = None
-except ImportError as exc:  # noqa: E402
-    FastFoundationStereoDisparity = Any  # type: ignore[misc,assignment]  
-    _DNN_IMPORT_ERROR = exc
-
-logger(
-    f"[{LOG_SERVICE}:{LOG_CONTROLLER}:init] module loaded",
-    extra={
-        "module_dir": str(_THIS_DIR),
-        "dnn_available": _DNN_IMPORT_ERROR is None,
-        "dnn_error": None if _DNN_IMPORT_ERROR is None else str(_DNN_IMPORT_ERROR),
-    },
-)
 
 Resolution = tuple[int, int]
 ColorOrder = Literal["RGB", "BGR"]
@@ -80,90 +85,10 @@ Matrix3x3 = tuple[tuple[float, float, float], ...]
 Matrix4x4 = tuple[tuple[float, float, float, float], ...]
 DistortionCoefficients = tuple[float, ...]
 
-_DNN_CACHE_KEY_FIELDS = ("repo_dir", "model_path", "model_dir", "device", "valid_iters", "max_disp", "hiera")
-
-def _model_to_dict(value: Any) -> dict[str, Any]:
-    if value is None:
-        return {}
-    if isinstance(value, dict):
-        return dict(value)
-
-    for method_name in ("model_dump", "dict"):
-        if hasattr(value, method_name):
-            return getattr(value, method_name)()
-
-    raise TypeError(f"Expected a dict/RpcModel-compatible object, got {type(value)!r}")
-
 
 def _model_field_names(model_type: type[BaseModel]) -> tuple[str, ...]:
     fields = getattr(model_type, "model_fields", None) or getattr(model_type, "__fields__", {})
     return tuple(fields.keys())
-
-
-def _depth_statistics(points_m: np.ndarray) -> tuple[float | None, float | None, float | None]:
-    if not points_m.size:
-        return None, None, None
-
-    depth_values = np.asarray(points_m, dtype=np.float64)[:, 2]
-    depth_values = depth_values[np.isfinite(depth_values)]
-    if not depth_values.size:
-        return None, None, None
-
-    return tuple(float(value) for value in (depth_values.min(), depth_values.max(), depth_values.mean()))
-
-
-def _read_image_or_npy(path: str | Path, *, color: bool) -> np.ndarray:
-    image_path = Path(path).expanduser()
-
-    if image_path.suffix.lower() == ".npy":
-        array = np.load(image_path, allow_pickle=False)
-
-        if color:
-            if array.ndim != 3 or array.shape[2] < 3:
-                raise ValueError(
-                    f"Expected color .npy image with shape HxWx3 or HxWx4, "
-                    f"got {array.shape} from {image_path}"
-                )
-            array = array[:, :, :3]
-        else:
-            if array.ndim == 2:
-                pass
-            elif array.ndim == 3 and array.shape[2] == 1:
-                array = array[:, :, 0]
-            else:
-                raise ValueError(
-                    f"Expected grayscale .npy image with shape HxW or HxWx1, "
-                    f"got {array.shape} from {image_path}"
-                )
-
-        return np.ascontiguousarray(array)
-    
-    pcd_backend = load_pcd_backend(os.getenv("PCD_BACKEND","cpu"))
-    return pcd_backend.read_image(image_path, color=color)
-
-
-def _save_cloud_npz(path: str | Path, cloud: Any) -> Path:
-    output_path = Path(path).expanduser()
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    arrays: dict[str, np.ndarray] = {
-        "points_m": np.asarray(cloud.points_m),
-        "colors_rgb": np.asarray(cloud.colors_rgb),
-    }
-
-    if cloud.disparity is not None:
-        arrays["disparity"] = np.asarray(cloud.disparity)
-
-    np.savez(output_path, **arrays)
-    logger(
-        f"[{LOG_SERVICE}:{LOG_CONTROLLER}:save_cloud_npz] point cloud archive saved",
-        extra={
-            "output_path": str(output_path),
-            "point_count": int(arrays["points_m"].shape[0]),
-            "has_disparity": "disparity" in arrays,
-        },
-    )
-    return output_path
 
 
 @dataclass(frozen=True)
@@ -272,6 +197,7 @@ class ToPcdParams(BackendOverrides):
     left_path: str = ""
     right_path: str = ""
     rgb_path: str = ""
+    calib_path: str = ""
     output_pcd_path: str = "colored_cloud.pcd"
     calibration: DepthCalibrationParams | None = None
     input_color_order: ColorOrder = "BGR"
@@ -307,17 +233,64 @@ class ToPcdParams(BackendOverrides):
 
                 param = ToPcdParams(rgb_path=str(rgb), left_path=str(l), right_path=str(r))
                 param.output_pcd_path = str(pcd_path/f"{cam_name}.pcd")
+                param.calib_path = calib_path / f"{cam_name}.json"
                 
-                with open(calib_path / f"{cam_name}.json" ) as f:
-                    calib = json.load(f)
-                    allowed_fields = set(_model_field_names(DepthCalibrationParams))
-                    calibration_data = {key: value for key, value in calib.items() if key in allowed_fields}
-                    param.calibration = DepthCalibrationParams.model_validate(calibration_data)
+                # with open(calib_path / f"{cam_name}.json" ) as f:
+                #     calib = json.load(f)
+                #     allowed_fields = set(_model_field_names(DepthCalibrationParams))
+                #     calibration_data = {key: value for key, value in calib.items() if key in allowed_fields}
+                #     param.calibration = DepthCalibrationParams.model_validate(calibration_data)
 
                 res.append(param)
         return res
     
     def get_output_path(self):return self.output_pcd_path
+
+
+class ToYoloSegmentsParams(ToPcdParams):
+    output_dir: str = "detect_segments_out"
+    detection_path: RecordPath | None = None
+
+    @staticmethod
+    def from_db_record(db_record: CustomRecord) -> list[ToYoloSegmentsParams]:
+        if isinstance(db_record,dict):
+            db_record = CustomRecord.model_validate(db_record)
+        if db_record.is_empty():return []
+        
+        img_ext = db_record.listup_left_image_paths[0].suffix
+
+        left_parent_paths = db_record.listup_left_image_parent_paths
+        left_path = [p/f"left{img_ext}" for p in left_parent_paths]
+        right_path = [p/f"right{img_ext}" for p in left_parent_paths]
+        rgb_path = [p/f"rgb{img_ext}" for p in left_parent_paths]
+        pcd_path = db_record.expected_pcd_path
+        calib_path = db_record.expected_calib_path
+        yolo_path = db_record.expected_yolo_path
+
+        res = []
+        for rgb, l, r, lp in zip(rgb_path, left_path, right_path, left_parent_paths):
+            if rgb.exists() and l.exists() and r.exists():
+                cam_name = lp.name
+
+                param = ToPcdParams(rgb_path=str(rgb), left_path=str(l), right_path=str(r))
+                param.output_pcd_path = str(pcd_path/f"{cam_name}.pcd")
+                output_dir = str(Path(db_record.expected_pcd_path)/Path(param.get_output_path()).stem)                
+                seg_params:ToYoloSegmentsParams = ToYoloSegmentsParams.model_validate(param.model_dump())
+                seg_params.output_dir = output_dir
+                seg_params.calib_path = calib_path / f"{cam_name}.json"
+                seg_params.detection_path = list((yolo_path / cam_name).glob("*.json"))[0]
+                
+                # with open(calib_path / f"{cam_name}.json" ) as f:
+                #     calib:Dict = json.load(f)
+                #     allowed_fields = set(_model_field_names(DepthCalibrationParams))
+                #     calibration_data = {key: value for key, value in calib.items() if key in allowed_fields}
+                #     seg_params.calibration = DepthCalibrationParams.model_validate(calibration_data)
+
+                res.append(seg_params)
+        return res
+    
+    def get_output_path(self):return self.output_dir
+
 
 class ToPcdResult(DepthBaseModel):
     backend: DepthBackend
@@ -368,67 +341,6 @@ class YoloSegmentSummary(BaseModel):
     meta_path: str | None = None
 
 
-class ToYoloSegmentsParams(BackendOverrides):
-    db_record: CustomRecord | None = None
-    left_path: str = ""
-    right_path: str = ""
-    rgb_path: str = ""
-    output_dir: str = "detect_segments_out"
-    frame_name: str = "frame"
-    calibration: DepthCalibrationParams | None = None
-    input_color_order: ColorOrder = "BGR"
-    rgb_image_is_undistorted: bool = False
-
-    # Depth parameters
-    alpha: float = 0.0
-    max_depth_m: float | None = 2.0
-    output_frame: SegmentOutputFrame = "rgb"
-    save_binary_pcd: bool = True
-    min_disparity: int = 0
-    num_disparities: int = 128
-    block_size: int = 5
-    splat_px: int = Field(default=1, ge=0)
-    hook_urls: list[list[str]] = Field(default_factory=list)
-
-    @staticmethod
-    def from_db_record(db_record: CustomRecord) -> list[ToYoloSegmentsParams]:
-        if isinstance(db_record,dict):
-            db_record = CustomRecord.model_validate(db_record)
-        if db_record.is_empty():return []
-        
-        img_ext = db_record.listup_left_image_paths[0].suffix
-
-        left_parent_paths = db_record.listup_left_image_parent_paths
-        left_path = [p/f"left{img_ext}" for p in left_parent_paths]
-        right_path = [p/f"right{img_ext}" for p in left_parent_paths]
-        rgb_path = [p/f"rgb{img_ext}" for p in left_parent_paths]
-        pcd_path = db_record.expected_pcd_path
-        calib_path = db_record.expected_calib_path
-
-        res = []
-        for rgb, l, r, lp in zip(rgb_path, left_path, right_path, left_parent_paths):
-            if rgb.exists() and l.exists() and r.exists():
-                cam_name = lp.name
-
-                param = ToPcdParams(rgb_path=str(rgb), left_path=str(l), right_path=str(r))
-                param.output_pcd_path = str(pcd_path/f"{cam_name}.pcd")
-                output_dir = str(Path(db_record.expected_pcd_path)/Path(param.get_output_path()).stem)
-                
-                seg_params:ToYoloSegmentsParams = ToYoloSegmentsParams.model_validate(param.model_dump())
-                seg_params.output_dir = output_dir
-                
-                with open(calib_path / f"{cam_name}.json" ) as f:
-                    calib:Dict = json.load(f)
-                    allowed_fields = set(_model_field_names(DepthCalibrationParams))
-                    calibration_data = {key: value for key, value in calib.items() if key in allowed_fields}
-                    seg_params.calibration = DepthCalibrationParams.model_validate(calibration_data)
-
-                res.append(seg_params)
-        return res
-    
-    def get_output_path(self):return self.output_dir
-
-
 class ToDetectSegmentsResult(DepthBaseModel):
     backend: DepthBackend
     output_dir: str
@@ -446,32 +358,23 @@ class ToDetectSegmentsResult(DepthBaseModel):
     depth_mean_m: float | None = None
     segments: list[YoloSegmentSummary] = Field(default_factory=list)
 
-
+        
 @dataclass
 class PcdRunner:
-    """Owns all point-cloud processing and its single background worker.
-
-    The runner is the processing layer. It owns calibration/backend settings,
-    cached DNN resources, conversion functions, queue lifecycle, result state,
-    completion-hook dispatch. It intentionally
-    processes one heavy job at a time to avoid concurrent GPU/OpenCV pressure.
-    """
+    """Runs point-cloud processing on a single background worker."""
 
     input_queue: Queue[ToPcdParams | ToYoloSegmentsParams] = field(
-        default_factory=lambda: Queue(maxsize=128),
-        repr=False,
+        default_factory=lambda: Queue(maxsize=128), repr=False
     )
-    calibration_params: DepthCalibrationParams | None = None
-    backend_params: BackendParams = field(default_factory=BackendParams)
     hook_dispatcher: HookDispatcher = field(default_factory=HookDispatcher, repr=False)
+    backend_name: str = field(default="cpu")
 
     _dnn_predictor: Any | None = field(default=None, init=False, repr=False)
     _dnn_predictor_key: tuple[Any, ...] | None = field(default=None, init=False, repr=False)
-    _yolo_model: Any | None = field(default=None, init=False, repr=False)
-    _yolo_model_key: tuple[Any, ...] | None = field(default=None, init=False, repr=False)
 
     _stop_event: Event = field(default_factory=Event, init=False, repr=False)
     _thread: Thread | None = field(default=None, init=False, repr=False)
+
     _lifecycle_lock: Lock = field(default_factory=Lock, init=False, repr=False)
     _state_lock: Lock = field(default_factory=Lock, init=False, repr=False)
     _config_lock: RLock = field(default_factory=RLock, init=False, repr=False)
@@ -480,60 +383,70 @@ class PcdRunner:
     _exception: Exception | None = field(default=None, init=False, repr=False)
     _last_result: ToPcdResult | None = field(default=None, init=False, repr=False)
     _current_output_path: str | None = field(default=None, init=False, repr=False)
-    
-    _calibration_cpus: Dict[str,StereoRgbCalibrationCpu] = field(default_factory=dict)
-    _calibrations: Dict[str,Any] = field(default_factory=dict)
-    _rectifiers: Dict[str,Any] = field(default_factory=dict)
 
+    _backends = ALL_PCD_BACKENDS
+    _backend_params: tuple[str,str,MatOps,DisparityPredictor] | None = field(default=None, init=False, repr=False)
+    
+    _rectifiers: Dict[str,Any] = field(default_factory=dict)
 
     @property
     def is_running(self) -> bool:
-        thread = self._thread
-        return thread is not None and thread.is_alive()
+        return bool(self._thread and self._thread.is_alive())
 
-    def start(self) -> None:
+    def start(self) -> None:        
+        if self._backend_params is None:
+            self._backend_params = self._backends[self.backend_name]
+
         with self._lifecycle_lock:
-            if self.is_running:
-                return
+            if self.is_running: return
             self._stop_event.clear()
-            self._thread = Thread(target=self._run, name="PcdRunner", daemon=True)
+            self._thread = Thread(target=self._run,
+                name="PcdRunner",daemon=True,)
             self._thread.start()
 
     def stop(self, timeout: float = 5.0) -> None:
-        """Stop accepting queued work after the current conversion returns."""
+        """Stop after the current conversion returns."""
         self._stop_event.set()
-        thread = self._thread
-        if thread is not None and thread.is_alive():
-            thread.join(timeout=timeout)
+        if self.is_running: self._thread.join(timeout=timeout)
 
     def snapshot(self) -> tuple[str | None, ToPcdResult | None, Exception | None]:
         with self._state_lock:
             return self._current_output_path, self._last_result, self._exception
 
-    def _run(self) -> None:
+    def set_backend(self, name:Literal["cpu","dnn","cuda","vpi"]="cpu"):
+        if name not in self._backends:
+            raise ValueError(f"only supports {self._backends.keys()}, got {name}")
+        self.backend_name = name
+        self._backend_params = self._backends[name]
 
+    def _set_state(self,*,
+        output_path: str | None = None,
+        result: ToPcdResult | None = None,
+        exception: Exception | None = None,
+    ) -> None:
+        with self._state_lock:
+            self._current_output_path = output_path
+            if result is not None:
+                self._last_result = result
+            self._exception = exception
+
+    def _run(self) -> None:
         while not self._stop_event.is_set():
             try:
-                params: ToPcdParams | ToYoloSegmentsParams = self.input_queue.get(timeout=0.2)
+                params = self.input_queue.get(timeout=0.2)
             except Empty:
                 continue
-            output_path = params.get_output_path()
 
-            with self._state_lock:
-                self._current_output_path = output_path
-
+            self._set_state(output_path=params.get_output_path())
 
             try:
                 with self._process_lock:
-                    if isinstance(params, ToPcdParams):
-                        result = self._convert_to_pcd(params)
-                    elif isinstance(params, ToYoloSegmentsParams):
-                        result = self._detect_segments_to_pcd(params)
-
-                with self._state_lock:
-                    self._last_result = result
-                    self._exception = None
-
+                    result = self._convert_to_pcd(params,segments=hasattr(params, "detection_path"))
+                    
+                self._set_state(
+                    output_path=params.get_output_path(),
+                    result=result,
+                )
 
                 if params.hook_urls:
                     try:
@@ -545,398 +458,246 @@ class PcdRunner:
                         pass
 
             except Exception as exc:
-                with self._state_lock:
-                    self._exception = exc
+                self._set_state(
+                    output_path=params.get_output_path(),
+                    exception=exc,
+                )
             finally:
-                with self._state_lock:
-                    self._current_output_path = None
+                self._set_state(output_path=None)
                 self.input_queue.task_done()
 
-    def _build_calibration(self, params: DepthCalibrationParams | None = None):
-        if params is None:
-            with self._config_lock:
-                params = self.calibration_params
-        
-        key = params.device_id
-        if key is None or key not in self._calibrations: 
-            if key is None: key = "latest"
-            calibration_data = _model_to_dict(params)
-            calibration_data.pop("service", None)
-            translation_unit = calibration_data.pop("source_translation_unit", "cm")
-            calibration = StereoRgbCalibrationCpu.from_dict(
-                calibration_data,
-                source_translation_unit=translation_unit,
-            )
-            pcd_backend = load_pcd_backend(os.getenv("PCD_BACKEND", "cpu"))
-            self._calibration_cpus[key] = calibration
-            self._calibrations[key] = pcd_backend.StereoRgbCalibration.from_cpu(self._calibration_cpus)
-            self._rectifiers[key] = calibration.get_rectifier(alpha=0.0)
-            self._rectifiers[key].calibration = self._calibration_cpus[key]
-        return self._calibration_cpus[key],key
-
-    def _calibration_result(self, calibration: StereoRgbCalibrationCpu) -> SetDepthCalibrationResult:
-        result_fields = (
-            "source_translation_unit",
-            "rgb_resolution",
-            "left_resolution",
-            "right_resolution",
-            "stereo_baseline_m",
-            "stereo_baseline_cm",
-        )
-        return SetDepthCalibrationResult(
-            configured=True,
-            **{field_name: getattr(calibration, field_name) for field_name in result_fields},
-        )
-
-    def _backend_result(self) -> BackendStatusResult:
-        with self._config_lock:
-            backend_data = {key: getattr(self.backend_params, key) for key in BACKEND_KEYS}
-            predictor_loaded = self._dnn_predictor is not None
-        return BackendStatusResult(
-            configured=True,
-            predictor_loaded=predictor_loaded,
-            dnn_available=_DNN_IMPORT_ERROR is None,
-            dnn_error=None if _DNN_IMPORT_ERROR is None else str(_DNN_IMPORT_ERROR),
-            **backend_data,
-        )
-
-    def _dnn_cache_key(self, backend: BackendParams) -> tuple[Any, ...]:
-        values = [getattr(backend, key) for key in _DNN_CACHE_KEY_FIELDS]
-        values[4] = int(values[4])
-        values[5] = int(values[5])
-        values[6] = bool(values[6])
-        return tuple(values)
-
-    def _get_dnn_predictor(self, backend: BackendParams):
-        if _DNN_IMPORT_ERROR is not None:
-            raise ImportError("DNN depth backend is unavailable; could not import pcd_dnn_utils") from _DNN_IMPORT_ERROR
-
-        cache_key = self._dnn_cache_key(backend)
-        if self._dnn_predictor is None or self._dnn_predictor_key != cache_key:            
-            logger(f"[PcdRunner:get_dnn_predictor:info] loading dnn model")
-            self._dnn_predictor = FastFoundationStereoDisparity(
-                repo_dir=backend.repo_dir,
-                model_path=backend.model_path,
-                model_dir=backend.model_dir,
-                device=backend.device,
-                valid_iters=int(backend.valid_iters),
-                max_disp=int(backend.max_disp),
-                hiera=bool(backend.hiera),
-            )
-            self._dnn_predictor_key = cache_key
-
-        return self._dnn_predictor
-
-    def _effective_backend(self, params: Any) -> BackendParams:
-        with self._config_lock:
-            backend_data = {key: getattr(self.backend_params, key) for key in BACKEND_KEYS}
-        override_data = _model_to_dict(params)
-        backend_data.update({key: override_data[key] for key in BACKEND_KEYS if override_data.get(key) is not None})
-        return BackendParams(**backend_data)
-
-    def set_calibration(self, params: DepthCalibrationParams) -> SetDepthCalibrationResult:
-        with self._config_lock:
-            self.calibration_params = params
-        result = self._calibration_result(self._build_calibration(params)[0])
-        return result
-
-    def calibration(self, params: EmptyParams) -> SetDepthCalibrationResult:
-        del params
-        with self._config_lock:
-            configured = self.calibration_params
-        result = self._calibration_result(self._build_calibration(configured)[0])
-        return result
-
-    def set_backend(self, params: BackendParams) -> BackendStatusResult:
-        # pcd_backend = load_pcd_backend(os.getenv("PCD_BACKEND", "cpu"))
-        # Literal["sgbm", "dnn", "vpi"]
-        os.environ["PCD_BACKEND"] = {"sgbm":"cpu","dnn":"cuda",
-                                     "vpi":"vpi",}[params.backend]
-        
-        pcd_backend = load_pcd_backend(os.getenv("PCD_BACKEND", "cpu"))
-        logger(f"[PcdRunner:set_backend:info] set as {(params.backend,os.environ["PCD_BACKEND"])}",
-            extra={"pcd_backend":str(pcd_backend)})
-
-        with self._process_lock:
-            with self._config_lock:
-                old_cache_key = self._dnn_cache_key(self.backend_params)
-                self.backend_params = params
-                cache_reset = old_cache_key != self._dnn_cache_key(params)
-                if cache_reset:
-                    self._dnn_predictor = None
-                    self._dnn_predictor_key = None
-        result = self._backend_result()
-        return result
-
-    def backend(self, params: EmptyParams) -> BackendStatusResult:
-        del params
-        result = self._backend_result()
-        return result
-
-    def _compute_rgb_aligned_depth(
-        self,
-        *,
-        left_image: np.ndarray,
-        right_image: np.ndarray,
-        rgb_image: np.ndarray,
-        calibration: StereoRgbCalibrationCpu,
-        backend: BackendParams,
-        input_color_order: ColorOrder,
-        rgb_image_is_undistorted: bool,
-        alpha: float,
-        min_disparity: int,
-        num_disparities: int,
-        block_size: int,
-        max_depth_m: float | None,
-        device_id: str | None,
+    def _convert_to_pcd(self,
+        params: ToPcdParams | ToYoloSegmentsParams,
+        segments: bool = False,
     ):
-        pcd_backend = load_pcd_backend(os.getenv("PCD_BACKEND", "cpu"))
-        height, width = left_image.shape[:2]
-        
-        # calibration_cpu = calibration
-        # calibration = pcd_backend.StereoRgbCalibration.from_cpu(calibration_cpu)
-        # rectifier = calibration.get_rectifier(alpha=alpha)
-        # rectifier.calibration = calibration_cpu
-        calibration = self._calibration_cpus[device_id]
-        # calibration = self._calibrations[device_id]
-        rectifier = self._rectifiers[device_id]
-        left_rect, right_rect, rect = rectifier.rectify(left_image, right_image)
+        start_time = time.perf_counter()
+        min_disparity, max_depth_m, stride = 0.0, 5.0, 1
+        mathlib, calc_dev, op, disp_predictor = self._backend_params
+        effective_min_disparity = max(0.5, float(min_disparity))
 
-        confidence_u16 = None
-        if backend.backend == "sgbm" or backend.backend == "vpi":
-            predictor = pcd_backend.SGBMDisparityPredictor( width=width,height=height,
-                                                num_disparities=num_disparities,
-                                                min_disparity=min_disparity,
-                                                block_size=block_size,
-                                            )
-            disparity = predictor.predict(left_rect, right_rect)
-            if isinstance(disparity, tuple):
-                disparity,confidence_u16 = disparity
-        elif backend.backend == "dnn":
-            predictor = self._get_dnn_predictor(backend) # FastFoundationStereoDisparity
-            disparity = predictor.predict(left_rect, right_rect, input_color_order=input_color_order)
+        def safe(fn, default="<unknown>"):
+            try:
+                return fn()
+            except Exception:
+                return default
 
+        def shape(x):
+            return safe(lambda: tuple(op.shape(x)), safe(lambda: tuple(x.shape)))
+
+        def length(x):
+            return 0 if x is None else safe(lambda: len(x))
+
+        def meta(x, device=True):
+            parts = [f"shape={shape(x)}", f"dtype={safe(lambda: str(x.dtype))}"]
+            if device:
+                parts.append(f"device={safe(lambda: str(x.device))}")
+            return ", ".join(parts)
+
+        def elapsed():
+            return f"{time.perf_counter() - start_time:.3f}s"
+
+        def log(stage, message):
+            logger(f"[PcdRunner:to_pcd:{stage}] {message}")
+
+        def load_image(name, path, color):
+            image = read_image(path, ops=op, color=color)
+            log("LOAD", f"{name} loaded {meta(image)}")
+            return image
+
+        log(
+            "START",
+            f"segments={segments}, backend={self.backend_name}, mathlib={mathlib}, "
+            f"calc_dev={calc_dev}, predictor={type(disp_predictor).__name__}, params={params}",
+        )
+        log(
+            "CONFIG",
+            f"min_disparity={min_disparity}, effective_min_disparity={effective_min_disparity}, "
+            f"max_depth_m={max_depth_m}, stride={stride}",
+        )
+        log(
+            "PATHS",
+            f"left={params.left_path}, right={params.right_path}, rgb={params.rgb_path}, "
+            f"calib={params.calib_path}",
+        )
+        log(
+            "PATHS",
+            f"detection={params.detection_path}, output_dir={params.output_dir}"
+            if segments
+            else f"output_pcd={params.output_pcd_path}",
+        )
+
+        log("LOAD", f"loading images... elapsed={elapsed()}")
+        left_img = load_image("left", params.left_path, "gray")
+        right_img = load_image("right", params.right_path, "gray")
+        rgb_img = load_image("rgb", params.rgb_path, "RGB")
+        log("LOAD", f"images ready elapsed={elapsed()}")
+
+        log("CALIB", f"loading calibration from {params.calib_path}")
+        calib_json = json.loads(Path(params.calib_path).read_text())
+        raw_device_id = calib_json.get("device_id")
+        cache_key = str(raw_device_id) if raw_device_id is not None else None
+        log("CALIB", f"device_id={raw_device_id!r}, cache_key={cache_key!r}")
+
+        # Calibration is still needed even when the rectifier is cached.
+        calib = StereoRgbCalibration.from_dict(calib_json, ops=op)
+        log(
+            "CALIB",
+            f"calibration created left_resolution={getattr(calib, 'left_resolution', '<unknown>')}, "
+            f"elapsed={elapsed()}",
+        )
+
+        device_cache = self._rectifiers.get(cache_key) if cache_key is not None else None
+        cached = device_cache.get(self.backend_name) if device_cache else None
+
+        if cache_key is None:
+            log("CACHE", "device_id is missing; rectifier will not be cached")
+        elif not device_cache:
+            log("CACHE", f"MISS device={cache_key!r}: device has no rectifier cache")
         else:
-            raise ValueError(f"Unsupported backend: {backend.backend}")
-        
-        logger(f"[PcdRunner:compute_rgb_aligned_depth:info] got disparity",
-            extra={"predictor": str(predictor), "pcd_backend":str(pcd_backend)})
-        
-        arg_com = dict(
-            disparity=disparity,
-            min_disparity=max(0.5, float(min_disparity)),
+            log("CACHE", f"device cache found for {cache_key!r}; cached_backends={list(device_cache)}")
+            log("CACHE", f"{'HIT' if cached else 'MISS'} device={cache_key!r}, backend={self.backend_name!r}")
+
+        if cached:
+            rectifier, rect = cached
+            log("RECTIFIER", f"using cached rectifier={type(rectifier).__name__}")
+        else:
+            log("RECTIFIER", "creating StereoRectifier")
+            rectifier = StereoRectifier(calib, ops=op)
+            rect = rectifier.make(calib.left_resolution)
+            log("RECTIFIER", f"rectification model created type={type(rect).__name__}")
+            if cache_key is not None:
+                self._rectifiers.setdefault(cache_key, {})[self.backend_name] = (rectifier, rect)
+                log("CACHE", f"stored rectifier device={cache_key!r}, backend={self.backend_name!r}")
+
+        log("RECTIFY", f"starting stereo rectification left_shape={shape(left_img)}, right_shape={shape(right_img)}")
+        left_rect, right_rect, rect = rectifier.rectify(left_img, right_img)
+        log(
+            "RECTIFY",
+            f"complete left_rect={shape(left_rect)}, right_rect={shape(right_rect)}, "
+            f"left_dtype={safe(lambda: str(left_rect.dtype))}, right_dtype={safe(lambda: str(right_rect.dtype))}, "
+            f"elapsed={elapsed()}",
+        )
+
+        log("DISPARITY", f"starting predictor={type(disp_predictor).__name__}")
+        disparity = disp_predictor.predict(left_rect, right_rect)
+        log("DISPARITY", f"prediction complete {meta(disparity)}, elapsed={elapsed()}")
+        try:
+            log("DISPARITY", f"finite_mask_shape={shape(op.isfinite(disparity))}")
+        except Exception as exc:
+            log("DISPARITY:DEBUG", f"could not calculate finite disparity mask: {type(exc).__name__}: {exc}")
+
+        log("REPROJECT", "converting disparity to rectified 3D points")
+        points_rect, _ = rect.disparity_to_points_rectified(
+            disparity,
+            min_disparity=effective_min_disparity,
             max_depth_m=max_depth_m,
-            stride=1
+            stride=stride,
         )
-        if confidence_u16 is not None:
-            arg_com["confidence_u16"] = confidence_u16
-        points_rect, _xy = rect.disparity_to_points_rectified(**arg_com)
-
-        if len(points_rect) == 0: return None,None
-            
-        rgb_image = pcd_backend.image_gpu(rgb_image)        
-        points_left = pcd_backend.rectified_left_to_original_left(points_rect, rect)
-        uv, _ = pcd_backend.project_points_to_rgb_pixels(
-            points_left,
-            rgb_image,
-            calibration,
-            rgb_image_is_undistorted=rgb_image_is_undistorted,
-        )
-        return points_left,uv
-    
-    def _convert_to_pcd(self, params: ToPcdParams) -> ToPcdResult:
-        if Path(params.get_output_path()).exists():
-            return ToPcdResult(
-                backend=self.backend_params.backend,
-                output_path=str(params.get_output_path()),
-                point_count=-1,
-                color_count=-1,
-                size_bytes=-1,
-                error=f"output path already exists: {params.get_output_path()}",
+        log("REPROJECT", f"generated points_rect count={length(points_rect)}, {meta(points_rect)}, elapsed={elapsed()}")
+        if len(points_rect) == 0:
+            log(
+                "ERROR",
+                f"no valid 3D points reconstructed. disparity_shape={shape(disparity)}, "
+                f"min_disparity={effective_min_disparity}, max_depth_m={max_depth_m}",
             )
+            raise RuntimeError("No valid 3D points reconstructed from disparity")
 
-        calibration,device_id = self._build_calibration(params.calibration)
-        output_path = Path(params.get_output_path()).expanduser()
-        output_suffix = output_path.suffix.lower()
-        if output_suffix not in {".pcd", ".npz"}:
-            raise ValueError(f"output_path must end with .pcd or .npz, got: {output_path}")
+        log("TRANSFORM", f"transforming {len(points_rect)} points from rectified-left to original-left coordinates")
+        points_left = rectified_left_to_original_left(points_rect, rect)
+        log("TRANSFORM", f"points_left count={length(points_left)}, {meta(points_left)}, elapsed={elapsed()}")
 
-        backend = self._effective_backend(params)
-        rgb_image=_read_image_or_npy(params.rgb_path, color=True)
-        points_left,rgb_uv = self._compute_rgb_aligned_depth(
-            left_image=_read_image_or_npy(params.left_path, color=False),
-            right_image=_read_image_or_npy(params.right_path, color=False),
-            rgb_image=rgb_image,
-            calibration=calibration,
-            backend=backend,
-            input_color_order=params.input_color_order,
-            rgb_image_is_undistorted=params.rgb_image_is_undistorted,
-            alpha=params.alpha,
-            min_disparity=float(params.min_disparity),
-            num_disparities=params.num_disparities,
-            block_size=params.block_size,
-            max_depth_m=params.max_depth_m,
-            device_id=device_id,
-        )
-        pcd_backend = load_pcd_backend(os.getenv("PCD_BACKEND", "cpu"))
-
-        uv_finite = np.isfinite(rgb_uv).all(axis=1)
-        safe_uv = np.where(np.isfinite(rgb_uv), rgb_uv, 0)
-        u = np.rint(safe_uv[:, 0]).astype(np.int64)
-        v = np.rint(safe_uv[:, 1]).astype(np.int64)
-        rgb_h,rgb_w = rgb_image.shape[:2]
-        inside = (
-            uv_finite
-            & (u >= 0)
-            & (u < rgb_w)
-            & (v >= 0)
-            & (v < rgb_h)
-        )
-        points_left = points_left[inside]
-        u = u[inside]
-        v = v[inside]
-        if len(points_left) == 0:
-            raise RuntimeError("No 3D points project inside the RGB image")
-        
-        sampled_colors = rgb_image[v, u, :3]
-        colors_rgb = pcd_backend.rgb8(sampled_colors)        
-        pcd_backend.save_point_cloud(
-            output_path,
+        log("RGB_PROJECT", f"projecting {length(points_left)} 3D points into RGB image shape={shape(rgb_img)}")
+        rgb_uv, _ = project_points_to_rgb_pixels(
             points_left,
-            colors_rgb,
-            binary_pcd=True,
+            rgb_img,
+            calib,
+            rgb_image_is_undistorted=False,
+        )
+        log("RGB_PROJECT", f"projection complete rgb_uv_{meta(rgb_uv)}, elapsed={elapsed()}")
+
+        if rgb_uv is None:
+            log("ERROR", "RGB projection returned rgb_uv=None")
+            raise RuntimeError("RGB projection returned no UV coordinates")
+        if length(rgb_uv) != length(points_left):
+            log("WARNING", f"point/UV count mismatch: points_left={length(points_left)}, rgb_uv={length(rgb_uv)}")
+
+        if segments:
+            log("SEGMENTS", f"loading detections from {params.detection_path}")
+            with params.detection_path.open("r", encoding="utf-8") as handle:
+                detections = json.load(handle)
+            log("SEGMENTS", f"detections loaded count={length(detections)}")
+            log(
+                "SEGMENTS",
+                f"splitting point cloud points={length(points_left)}, rgb_uv={length(rgb_uv)}, output_dir={params.output_dir}",
+            )
+            try:
+                split_cloud_uv(
+                    op.to_numpy(points_left),
+                    op.to_numpy(rgb_uv),
+                    op.to_numpy(rgb_img),
+                    detections,
+                    params.output_dir,
+                    min_points=1,
+                    erode_pixels=0,
+                    exclusive=False,
+                    save_background=False,
+                    save_full_cloud=True,
+                    binary_pcd=True,
+                )
+            except Exception as exc:
+                log("error", str(exc))
+            log("DONE", f"segmented point-cloud export completed elapsed={elapsed()}")
+            return
+
+        log("UV_FILTER", "checking projected RGB coordinates")
+        finite_uv_mask = op.isfinite(rgb_uv)
+        uv_finite = op.all(finite_uv_mask)  # Preserves the original reduction behavior.
+        safe_uv = op.where(finite_uv_mask, rgb_uv, 0)
+        u = op.astype_int64(op.round(safe_uv[:, 0]))
+        v = op.astype_int64(op.round(safe_uv[:, 1]))
+        rgb_h, rgb_w = op.shape(rgb_img)[:2]
+        inside = uv_finite & (u >= 0) & (v >= 0) & (u < rgb_w) & (v < rgb_h)
+        log("UV_FILTER", f"finite_mask_shape={shape(uv_finite)}, RGB bounds width={rgb_w}, height={rgb_h}")
+        log("UV_FILTER", f"inside_mask_shape={shape(inside)}")
+
+        before_filter_count = length(points_left)
+        points_left, u, v = points_left[inside], u[inside], v[inside]
+        after_filter_count = length(points_left)
+        rejected_count = safe(lambda: before_filter_count - after_filter_count)
+        log(
+            "UV_FILTER",
+            f"before={before_filter_count}, inside={after_filter_count}, rejected={rejected_count}",
         )
 
-        result = ToPcdResult(
-            backend=backend.backend,
-            output_path=str(output_path),
-            point_count=-1,#int(cloud.points_m.shape[0]),
-            color_count=-1,#int(cloud.colors_rgb.shape[0]),
-            size_bytes=int(output_path.stat().st_size),
-            # depth_min_m=depth_min_m,
-            # depth_max_m=depth_max_m,
-            # depth_mean_m=depth_mean_m,
-            # disparity_width=disparity_width,
-            # disparity_height=disparity_height,
-            calibration=str(calibration),
-        )
+        if len(points_left) == 0:
+            log("ERROR", "all reconstructed 3D points were rejected during RGB-image bounds filtering")
+            raise RuntimeError("No 3D points project inside the RGB image")
 
-        return result
+        log("COLOR", f"sampling RGB colors for {len(points_left)} points")
+        sampled_colors = rgb_img[v, u, :3]
+        log("COLOR", f"sampled_colors {meta(sampled_colors, device=False)}")
+        colors_rgb8 = rgb8(sampled_colors, ops=op)
+        log("COLOR", f"colors_rgb8 {meta(colors_rgb8, device=False)}")
 
-    def _pcd_async_result(
-        self,
-        params: ToPcdParams | None = None,
-        *,
-        queued: bool = False,
-        error: str | None = None,
-    ) -> PcdAsyncResult:
-        current_output, last_result, exception = self.snapshot()
-        runner_error = None
-        if exception is not None:
-            runner_error = f"{exception.__class__.__name__}: {exception}"
-
-        return PcdAsyncResult(
-            running=self.is_running,
-            queued=queued,
-            queue_size=self.input_queue.qsize(),
-            requested_output_path=params.get_output_path() if params is not None else None,
-            current_output_path=current_output,
-            last_result=last_result,
-            error=error or runner_error,
-        )
+        log("SAVE", f"saving PCD path={params.output_pcd_path}, points={len(points_left)}, binary=True")
+        save_pcd(params.output_pcd_path, points_left, colors_rgb8, ops=op, binary=True)
+        log("DONE", f"PCD saved successfully path={params.output_pcd_path}, points={len(points_left)}, elapsed={elapsed()}")
 
     def submit_to_pcd(self, params: ToPcdParams | ToYoloSegmentsParams) -> PcdAsyncResult:
         """Queue a conversion and return immediately."""
         if not self.is_running: self.start()
 
-
         try:
             self.input_queue.put_nowait(params)
         except Full:
-            return self._pcd_async_result(
-                params,
-                error=f"PCD queue is full (capacity={self.input_queue.maxsize})",
-            )
-
-        return self._pcd_async_result(params, queued=True)
-
-    def to_pcd_status(self, params: EmptyParams) -> PcdAsyncResult:
-        del params
-        result = self._pcd_async_result()
-        return result
-
-    def to_pcd_stop(self, params: EmptyParams) -> PcdAsyncResult:
-        del params
-        self.stop()
-        return self._pcd_async_result()
-
-    def convert_to_pcd_sync(self, params: ToPcdParams) -> ToPcdResult:
-        """Run through the same complete processor without the queue."""
-        with self._process_lock:
-            return self._convert_to_pcd(params)
-
-    def _detect_segments_to_pcd(self, params: ToYoloSegmentsParams, architecture="yolo"):
-
-        output_dir = Path(params.output_dir).expanduser()
-        output_dir.mkdir(parents=True, exist_ok=True)
-
-        backend = self._effective_backend(params)
-        calibration,device_id = self._build_calibration(params.calibration)
-
-        left_image = _read_image_or_npy(params.left_path, color=False)
-        right_image = _read_image_or_npy(params.right_path, color=False)
-        rgb_image = _read_image_or_npy(params.rgb_path, color=True)
-
-        detections = json.loads(Path(
-                        params.rgb_path.replace("imgs",architecture
-                                       ).replace("rgb.jpg","rgb.json")
-                                       ).read_text(encoding="utf-8"))
-        
-        points_left,rgb_uv = self._compute_rgb_aligned_depth(
-            left_image=left_image,
-            right_image=right_image,
-            rgb_image=rgb_image,
-            calibration=calibration,
-            backend=backend,
-            input_color_order=params.input_color_order,
-            rgb_image_is_undistorted=params.rgb_image_is_undistorted,
-            alpha=params.alpha,
-            min_disparity=params.min_disparity,
-            num_disparities=params.num_disparities,
-            block_size=params.block_size,
-            max_depth_m=params.max_depth_m,
-            device_id=device_id,
-        )
-
-        pcd_backend = load_pcd_backend(os.getenv("PCD_BACKEND", "cpu"))
-        pcd_backend.split_cloud_uv(
-            points_left,
-            rgb_uv,
-            rgb_image,
-            detections,
-            output_dir,
-            min_points=1,
-            erode_pixels=0,
-            exclusive=False,
-            save_background=False,
-            save_full_cloud=True,
-            binary_pcd=True,
-        )
-        
-        return ToPcdResult(
-            backend=backend.backend,
-            output_path=str(output_dir),
-            point_count=len(points_left),
-            color_count=len(points_left),
-            size_bytes=-1,
-            calibration=str(calibration),
-        )
-
-    def detect_segments_to_pcd(self, params: ToYoloSegmentsParams) -> ToDetectSegmentsResult:
-        with self._process_lock:
-            return self._detect_segments_to_pcd(params)
-
-
+            return PcdAsyncResult()
+            # return self._pcd_async_result(
+            #     params,
+            #     error=f"PCD queue is full (capacity={self.input_queue.maxsize})",
+            # )
+        return PcdAsyncResult()
+        # return self._pcd_async_result(params, queued=True)
+                
 @dataclass
 class DepthController:
     """Thin JSON-RPC facade; all processing lives in ``PcdRunner``."""
@@ -951,7 +712,7 @@ class DepthController:
             extra={
                 "service_name": self.service_name,
                 "controller_name": self.controller_name,
-                "backend": self.runner.backend_params.backend,
+                "backend": self.runner.backend_name,
                 "queue_capacity": self.runner.input_queue.maxsize,
             },
         )
@@ -959,17 +720,17 @@ class DepthController:
     def status(self, params: EmptyParams) -> PcdStatusResult:
         return PcdStatusResult(msg=f"{self.runner.snapshot()}")
 
-    def set_calibration(self, params: DepthCalibrationParams) -> SetDepthCalibrationResult:
-        return self.runner.set_calibration(params)
+    # def set_calibration(self, params: DepthCalibrationParams) -> SetDepthCalibrationResult:
+    #     return self.runner.set_calibration(params)
 
-    def calibration(self, params: EmptyParams) -> SetDepthCalibrationResult:
-        return self.runner.calibration(params)
+    # def calibration(self, params: EmptyParams) -> SetDepthCalibrationResult:
+    #     return self.runner.calibration(params)
 
     def set_backend(self, params: BackendParams) -> BackendStatusResult:
         return self.runner.set_backend(params)
 
-    def backend(self, params: EmptyParams) -> BackendStatusResult:
-        return self.runner.backend(params)
+    # def backend(self, params: EmptyParams) -> BackendStatusResult:
+    #     return self.runner.backend(params)
 
     def to_pcd(self, params: ToPcdParams) -> PcdAsyncResult:
         has_db_record = bool(params.db_record)
@@ -1014,14 +775,14 @@ class DepthController:
             )
             raise
 
-    def to_pcd_status(self, params: EmptyParams) -> PcdAsyncResult:
-        return self.runner.to_pcd_status(params)
+    # def to_pcd_status(self, params: EmptyParams) -> PcdAsyncResult:
+    #     return self.runner.to_pcd_status(params)
 
-    def to_pcd_stop(self, params: EmptyParams) -> PcdAsyncResult:
-        return self.runner.to_pcd_stop(params)
+    # def to_pcd_stop(self, params: EmptyParams) -> PcdAsyncResult:
+    #     return self.runner.to_pcd_stop(params)
 
-    def to_pcd_sync(self, params: ToPcdParams) -> ToPcdResult:
-        return self.runner.convert_to_pcd_sync(params)
+    # def to_pcd_sync(self, params: ToPcdParams) -> ToPcdResult:
+    #     return self.runner.convert_to_pcd_sync(params)
 
     def detect_segments_to_pcd(self, params: ToYoloSegmentsParams) -> ToDetectSegmentsResult:        
         has_db_record = bool(params.db_record)

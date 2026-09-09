@@ -1,6 +1,7 @@
 from dataclasses import dataclass, field
 import json
 from pathlib import Path
+import re
 from typing import Any, Literal
 import cv2
 import numpy as np
@@ -485,7 +486,7 @@ def read_image(path, ops:MatOps, color: Literal["RGB", "BGR", "gray"]="BGR"):
         image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     return ops.from_numpy(image)
 
-def save_pcd(path: str | Path, points_m, colors_rgb, ops: MatOps, *, binary=True):
+def save_pcd(path: str | Path, points_m, colors_rgb, *, ops: MatOps=NumpyMatOps(), binary=True):
     path = Path(path); path.parent.mkdir(parents=True, exist_ok=True)
     ps, cs = ops.to_numpy(points_m), colors_rgb
     rgb, n = rgb_float(cs,ops=ops), len(ps)
@@ -503,13 +504,155 @@ def save_pcd(path: str | Path, points_m, colors_rgb, ops: MatOps, *, binary=True
             f.writelines(f"{x:.8f} {y:.8f} {z:.8f} {float(r):.9e}\n" for (x, y, z), r in zip(ps, rgb))
     return path
 
-from disparity_predictors import (DisparityPredictor,
-                                SGBMDisparityPredictor,
-                                FastFoundationStereoDisparity,
-                                SGBMDisparityPredictorCuda,
-                                VPIStereoDisparityGPU)
+def safe_name(value: str) -> str: return re.sub(r"[^A-Za-z0-9_.-]+", "_", value.strip()) or "object"
+
+def detection_mask(detection: dict[str, Any], height: int, width: int) -> np.ndarray:
+    mask = np.zeros((height, width), np.uint8)
+    mask_info = detection.get("mask") or {}
+    if mask_info.get("format") != "polygon":
+        bbox = detection.get("bbox_xyxy")
+        if bbox is None or len(bbox) != 4:
+            return mask.astype(bool)
+        x1, y1 = np.floor(bbox[:2]).astype(int)
+        x2, y2 = np.ceil(bbox[2:]).astype(int)
+        x1, x2 = np.clip((x1, x2), 0, width)
+        y1, y2 = np.clip((y1, y2), 0, height)
+        if x2 > x1 and y2 > y1:
+            mask[y1:y2, x1:x2] = 1
+        return mask.astype(bool)
+    polygons = mask_info.get("polygons", [])
+    for is_hole, value in ((False, 1), (True, 0)):
+        contours = [
+            np.rint(points).astype(np.int32)
+            for polygon in polygons
+            if bool(polygon.get("is_hole", False)) == is_hole
+            if len(points := np.asarray(polygon.get("points_xy", []), np.float32)) >= 3
+        ]
+        if contours:
+            cv2.fillPoly(mask, contours, value)
+    return mask.astype(bool)
+
+def split_cloud_uv(points_left: Any, uv: Any, rgb_image: Any,
+    detections_json: dict[str, Any],
+    output_dir: str | Path,
+    *,
+    rgb_image_color_order: str = "BGR",
+    min_points: int = 30,
+    erode_pixels: int = 0,
+    exclusive: bool = False,
+    save_background: bool = False,
+    save_full_cloud: bool = False,
+    binary_pcd: bool = True,
+    ops: MatOps=NumpyMatOps(),
+) -> list[dict[str, Any]]:
+    """Split a stereo 3D cloud using masks/detections in RGB-image coordinates."""
+
+    if points_left.ndim != 2 or points_left.shape[1] != 3:
+        raise ValueError(f"points_left must be Nx3, got {points_left.shape}")
+    if uv.ndim != 2 or uv.shape[1] != 2:
+        raise ValueError(f"uv must be Nx2, got {uv.shape}")
+    if len(points_left) != len(uv):
+        raise ValueError(f"points_left and uv must have same length, got {len(points_left)} and {len(uv)}")
+    if rgb_image.ndim != 3 or rgb_image.shape[2] < 3:
+        raise ValueError(f"rgb_image must be HxWx3, got {rgb_image.shape}")
+
+    rgb_h, rgb_w = rgb_image.shape[:2]
+    detection_size = (int(detections_json["image_width"]), int(detections_json["image_height"]))
+    if (rgb_w, rgb_h) != detection_size:
+        raise ValueError(f"RGB image size {(rgb_w, rgb_h)} differs from detection size {detection_size}")
+
+    finite = np.isfinite(uv).all(axis=1)
+    safe_uv = np.where(np.isfinite(uv), uv, 0)
+    u, v = np.rint(safe_uv).astype(np.int64).T
+    inside = finite & (u >= 0) & (u < rgb_w) & (v >= 0) & (v < rgb_h)
+
+    points_left, u, v = points_left[inside], u[inside], v[inside]
+    if not len(points_left):
+        raise RuntimeError("No 3D points project inside the RGB image")
+
+    colors_rgb = rgb8(rgb_image[v, u, :3], order=rgb_image_color_order, ops=ops)
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    detections = list(enumerate(detections_json.get("detections", [])))
+    if exclusive:
+        detections.sort(key=lambda item: float(item[1].get("confidence", 0)), reverse=True)
+
+    kernel = None
+    if erode_pixels > 0:
+        radius = int(erode_pixels)
+        kernel = np.ones((2 * radius + 1, 2 * radius + 1), np.uint8)
+
+    claimed = np.zeros(len(points_left), dtype=bool)
+    union = np.zeros(len(points_left), dtype=bool)
+    manifest: list[dict[str, Any]] = []
+
+    for detection_index, detection in detections:
+        mask = detection_mask(detection, rgb_h, rgb_w)
+        if mask.shape != (rgb_h, rgb_w):
+            raise ValueError(
+                f"Detection {detection_index} mask has shape {mask.shape}, expected {(rgb_h, rgb_w)}"
+            )
+        if kernel is not None:
+            mask = cv2.erode(mask.astype(np.uint8), kernel).astype(bool)
+
+        covered = mask[v, u]
+        union |= covered
+        keep = covered & ~claimed if exclusive else covered
+        count = int(keep.sum())
+
+        if count < min_points:
+            print(f"skip detection {detection_index}: {count} points ({detection.get('class_name', 'unknown')})")
+            continue
+        if exclusive:
+            claimed |= keep
+
+        class_id = int(detection.get("class_id", -1))
+        class_name = str(detection.get("class_name", "object"))
+        confidence = float(detection.get("confidence", 0))
+        filename = (
+            f"{detection_index:03d}_class{class_id}_{safe_name(class_name)}_"
+            f"{confidence:.3f}_{count}pts.pcd"
+        )
+
+        save_pcd(output_dir / filename, points_left[keep], colors_rgb[keep], binary=binary_pcd)
+        manifest.append({
+            "detection_index": detection_index,
+            "class_id": class_id,
+            "class_name": class_name,
+            "confidence": confidence,
+            "point_count": count,
+            "pcd": filename,
+        })
+        print(f"saved {output_dir / filename} ({count} points)")
+
+    if save_full_cloud:
+        save_pcd(output_dir / "full.pcd", points_left, colors_rgb, binary=binary_pcd)
+        print(f"saved {output_dir / 'full.pcd'} ({len(points_left)} points)")
+
+    if save_background:
+        background = ~(claimed if exclusive else union)
+        count = int(background.sum())
+        if count:
+            filename = f"background_{count}pts.pcd"
+            save_pcd(
+                output_dir / filename,
+                points_left[background],
+                colors_rgb[background],
+                binary=binary_pcd,
+            )
+            print(f"saved background ({count} points)")
+
+    return manifest
+
 
 if __name__ == "__main__":
+    from disparity_predictors import (DisparityPredictor,
+                                    SGBMDisparityPredictor,
+                                    FastFoundationStereoDisparity,
+                                    SGBMDisparityPredictorCuda,
+                                    VPIStereoDisparityGPU)
     OPS: dict[tuple[str,str,str], tuple[MatOps,DisparityPredictor]] = {
         # (MatLib.NUMPY, MatDevice.CPU): NumpyMatOps(),
         ("cpu", MatLib.TORCH, MatDevice.CPU):  (TorchMatOps(),SGBMDisparityPredictor()),
@@ -534,7 +677,7 @@ if __name__ == "__main__":
             stride=1
             alpha=0.0
 
-            root = Path("./recording/dual_rgb/2026-09-07/field_all/122825.590133625JST/")
+            root = Path("./")
             calib_json = json.loads(((root/"calib"/"rgbd_left.json").read_text()))
             calib = StereoRgbCalibration.from_dict(calib_json, ops=op)
             rectifier = StereoRectifier(calib, ops=op)

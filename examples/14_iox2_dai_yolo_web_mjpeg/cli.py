@@ -127,12 +127,41 @@ def run_api(host: str, port: int, reload: bool = False) -> None:
     app.add_api_route("/debug/yolo",
         yolo_debug,methods=["GET"],tags=["debug"],)
     
+    import logging.config
+    LOGGING_CONFIG = {
+        "version": 1,
+        "disable_existing_loggers": False,
+        "formatters": {
+            "access": {
+                "()": "uvicorn.logging.AccessFormatter",
+                "fmt": "%(asctime)s | %(levelprefix)s %(client_addr)s - \"%(request_line)s\" %(status_code)s",
+                "datefmt": "%Y-%m-%d %H:%M:%S",
+            },
+        },
+        "handlers": {
+            "access": {
+                "formatter": "access",
+                "class": "logging.StreamHandler",
+                "stream": "ext://sys.stdout",
+            },
+        },
+        "loggers": {
+            "uvicorn.access": {
+                "handlers": ["access"],
+                "level": "INFO",
+                "propagate": False,
+            },
+        },
+    }
+
+    logging.config.dictConfig(LOGGING_CONFIG)
     uvicorn.run(
         app=app,
         factory=reload,
         host=host,
         port=port,
         reload=reload,
+        log_config=LOGGING_CONFIG,
     )
 
 
