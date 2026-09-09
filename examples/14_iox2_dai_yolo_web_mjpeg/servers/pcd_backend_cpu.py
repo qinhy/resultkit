@@ -11,9 +11,10 @@ from pcd_utils import (
     rgb_depth_to_points_rgb,
     save_point_cloud,
     transform_points,
+    project_points_to_rgb_pixels,
 )
 
-from pcd_yolo_utils import split_cloud
+from pcd_yolo_utils import split_cloud,split_cloud_uv
 
 
 def image_gpu(img):

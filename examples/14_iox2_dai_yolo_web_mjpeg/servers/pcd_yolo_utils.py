@@ -165,13 +165,13 @@ def split_cloud(
 
 
 def split_cloud_uv(
-    points_left: ArrayLike,
-    uv: ArrayLike,
-    rgb_image: ArrayLike,
+    points_left: Any,
+    uv: Any,
+    rgb_image: Any,
     detections_json: dict[str, Any],
     output_dir: str | Path,
     *,
-    rgb_image_color_order: ColorOrder = "BGR",
+    rgb_image_color_order: str = "BGR",
     min_points: int = 30,
     erode_pixels: int = 0,
     exclusive: bool = False,

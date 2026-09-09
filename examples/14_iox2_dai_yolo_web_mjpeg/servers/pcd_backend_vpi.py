@@ -15,3 +15,4 @@ from pcd_vpi_utils import (
 )
 
 from pcd_yolo_vpi_utils import split_cloud_vpi as split_cloud
+from pcd_yolo_utils import split_cloud_uv
