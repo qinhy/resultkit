@@ -444,14 +444,27 @@ def project_camera_points_opencv_model(points_camera, K, distortion=None, *, dty
 def project_points_to_rgb_pixels(
     points_left_m: ArrayLike, rgb_image: ArrayLike, calibration: StereoRgbCalibration, *,
     rgb_image_is_undistorted: bool = False,
+    only_inside: bool = True,
 ) -> tuple[ArrayLike, ArrayLike]:
     ops = calibration.ops
     rgb_h, rgb_w = ops.shape(rgb_image)[:2]
     K = scale_K(calibration.rgb_intrinsics, calibration.rgb_resolution, (rgb_w, rgb_h), ops)
     points_rgb = transform_points(points_left_m, calibration.left_to_rgb, ops)
     distortion = None if rgb_image_is_undistorted else calibration.rgb_distortion
-    pixels = project_camera_points_opencv_model(points_rgb, K, distortion, ops=ops)
-    return (pixels, points_rgb)
+    rgb_uv = project_camera_points_opencv_model(points_rgb, K, distortion, ops=ops)
+    if only_inside:
+        uv_finite = ops.all(ops.isfinite(rgb_uv), dim=1)
+        safe_uv = ops.where(ops.isfinite(rgb_uv),rgb_uv,0)
+        u = ops.astype_int64(ops.round(safe_uv[:, 0]))
+        v = ops.astype_int64(ops.round(safe_uv[:, 1]))
+        inside = (
+            uv_finite & (points_rgb[:, 2] > 0)
+            & (u >= 0) & (v >= 0)
+            & (u < rgb_w) & (v < rgb_h)
+        )
+        rgb_uv = rgb_uv[inside]
+        points_left_m = points_left_m[inside]
+    return rgb_uv, points_left_m
 
 def build_rgb_indexed_cloud(
     left_image: np.ndarray, right_image: np.ndarray, rgb_image: np.ndarray,
@@ -468,7 +481,7 @@ def build_rgb_indexed_cloud(
     )
     if len(points_rect) == 0: return None,None        
     points_left = rectified_left_to_original_left(points_rect, rect)
-    uv, _ = project_points_to_rgb_pixels(
+    uv, points_left = project_points_to_rgb_pixels(
         points_left,
         rgb_image,
         calibration,
@@ -547,6 +560,8 @@ def split_cloud_uv(points_left: Any, uv: Any, rgb_image: Any,
 ) -> list[dict[str, Any]]:
     """Split a stereo 3D cloud using masks/detections in RGB-image coordinates."""
 
+    if not len(points_left):
+        raise RuntimeError("No 3D points project inside the RGB image")
     if points_left.ndim != 2 or points_left.shape[1] != 3:
         raise ValueError(f"points_left must be Nx3, got {points_left.shape}")
     if uv.ndim != 2 or uv.shape[1] != 2:
@@ -555,21 +570,13 @@ def split_cloud_uv(points_left: Any, uv: Any, rgb_image: Any,
         raise ValueError(f"points_left and uv must have same length, got {len(points_left)} and {len(uv)}")
     if rgb_image.ndim != 3 or rgb_image.shape[2] < 3:
         raise ValueError(f"rgb_image must be HxWx3, got {rgb_image.shape}")
-
     rgb_h, rgb_w = rgb_image.shape[:2]
     detection_size = (int(detections_json["image_width"]), int(detections_json["image_height"]))
     if (rgb_w, rgb_h) != detection_size:
         raise ValueError(f"RGB image size {(rgb_w, rgb_h)} differs from detection size {detection_size}")
-
-    finite = np.isfinite(uv).all(axis=1)
-    safe_uv = np.where(np.isfinite(uv), uv, 0)
-    u, v = np.rint(safe_uv).astype(np.int64).T
-    inside = finite & (u >= 0) & (u < rgb_w) & (v >= 0) & (v < rgb_h)
-
-    points_left, u, v = points_left[inside], u[inside], v[inside]
-    if not len(points_left):
-        raise RuntimeError("No 3D points project inside the RGB image")
-
+    
+    u = op.astype_int64(op.round(rgb_uv[:, 0]))
+    v = op.astype_int64(op.round(rgb_uv[:, 1]))
     colors_rgb = rgb8(rgb_image[v, u, :3], order=rgb_image_color_order, ops=ops)
 
     output_dir = Path(output_dir)
@@ -657,7 +664,7 @@ if __name__ == "__main__":
         # (MatLib.NUMPY, MatDevice.CPU): NumpyMatOps(),
         ("cpu", MatLib.TORCH, MatDevice.CPU):  (TorchMatOps(),SGBMDisparityPredictor()),
         ("dnn", MatLib.TORCH, MatDevice.CUDA): (TorchMatOps(device=MatDevice.CUDA),FastFoundationStereoDisparity(
-            repo_dir="./examples/14_iox2_dai_yolo_web_mjpeg/fast-foundationstereo",
+            repo_dir="./fast-foundationstereo",
             model_path="weights/23-36-37/model_best_bp2_serialize.pth",
         )),
         ("cuda", MatLib.TORCH, MatDevice.CUDA): (TorchMatOps(device=MatDevice.CUDA),SGBMDisparityPredictorCuda(
@@ -696,25 +703,16 @@ if __name__ == "__main__":
                 points_left,rgb_uv = None,None
             else:
                 points_left = rectified_left_to_original_left(points_rect, rect)
-                rgb_img = read_image(root/"imgs"/"rgbd_left"/"rgb.jpg",ops=op,color="RGB")
-                rgb_uv, _ = project_points_to_rgb_pixels(
-                    points_left, rgb_img, calib,
+                rgb_image = read_image(root/"imgs"/"rgbd_left"/"rgb.jpg",ops=op,color="RGB")
+                rgb_uv, points_left = project_points_to_rgb_pixels(
+                    points_left, rgb_image, calib,
                     rgb_image_is_undistorted=False,
+                    only_inside=True,
                 )
-                
-            uv_finite = op.all(op.isfinite(rgb_uv))
-            safe_uv = op.where(op.isfinite(rgb_uv), rgb_uv, 0)
-            u = op.astype_int64(op.round(safe_uv[:, 0]))
-            v = op.astype_int64(op.round(safe_uv[:, 1]))
-            rgb_h,rgb_w = op.shape(rgb_img)[:2]
-            inside = (uv_finite
-                & (u >= 0) & (v >= 0)
-                & (u < rgb_w) & (v < rgb_h))            
-            points_left = points_left[inside]
-            u = u[inside]
-            v = v[inside]
             if len(points_left) == 0: raise RuntimeError("No 3D points project inside the RGB image")            
-            sampled_colors = rgb_img[v, u, :3]
+            sampled_u = op.astype_int64(op.round(rgb_uv[:, 0]))
+            sampled_v = op.astype_int64(op.round(rgb_uv[:, 1]))
+            sampled_colors = rgb_image[sampled_v, sampled_u, :3]
             colors_rgb8 = rgb8(sampled_colors,ops=op)
             output_path = name+".pcd" # f"{lib}{device}{op}{disp_predictor}.pcd".replace(":","").replace("<","").replace(">","")
             save_pcd(output_path, points_left, colors_rgb8, ops=op, binary=True)

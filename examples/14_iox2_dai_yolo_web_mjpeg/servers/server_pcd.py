@@ -607,11 +607,12 @@ class PcdRunner:
         log("TRANSFORM", f"points_left count={length(points_left)}, {meta(points_left)}, elapsed={elapsed()}")
 
         log("RGB_PROJECT", f"projecting {length(points_left)} 3D points into RGB image shape={shape(rgb_img)}")
-        rgb_uv, _ = project_points_to_rgb_pixels(
+        rgb_uv, points_left = project_points_to_rgb_pixels(
             points_left,
             rgb_img,
             calib,
             rgb_image_is_undistorted=False,
+            only_inside=True,
         )
         log("RGB_PROJECT", f"projection complete rgb_uv_{meta(rgb_uv)}, elapsed={elapsed()}")
 
@@ -649,31 +650,13 @@ class PcdRunner:
             log("DONE", f"segmented point-cloud export completed elapsed={elapsed()}")
             return
 
-        log("UV_FILTER", "checking projected RGB coordinates")
-        finite_uv_mask = op.isfinite(rgb_uv)
-        uv_finite = op.all(finite_uv_mask)  # Preserves the original reduction behavior.
-        safe_uv = op.where(finite_uv_mask, rgb_uv, 0)
-        u = op.astype_int64(op.round(safe_uv[:, 0]))
-        v = op.astype_int64(op.round(safe_uv[:, 1]))
-        rgb_h, rgb_w = op.shape(rgb_img)[:2]
-        inside = uv_finite & (u >= 0) & (v >= 0) & (u < rgb_w) & (v < rgb_h)
-        log("UV_FILTER", f"finite_mask_shape={shape(uv_finite)}, RGB bounds width={rgb_w}, height={rgb_h}")
-        log("UV_FILTER", f"inside_mask_shape={shape(inside)}")
-
-        before_filter_count = length(points_left)
-        points_left, u, v = points_left[inside], u[inside], v[inside]
-        after_filter_count = length(points_left)
-        rejected_count = safe(lambda: before_filter_count - after_filter_count)
-        log(
-            "UV_FILTER",
-            f"before={before_filter_count}, inside={after_filter_count}, rejected={rejected_count}",
-        )
-
         if len(points_left) == 0:
             log("ERROR", "all reconstructed 3D points were rejected during RGB-image bounds filtering")
             raise RuntimeError("No 3D points project inside the RGB image")
 
         log("COLOR", f"sampling RGB colors for {len(points_left)} points")
+        u = op.astype_int64(op.round(rgb_uv[:, 0]))
+        v = op.astype_int64(op.round(rgb_uv[:, 1]))
         sampled_colors = rgb_img[v, u, :3]
         log("COLOR", f"sampled_colors {meta(sampled_colors, device=False)}")
         colors_rgb8 = rgb8(sampled_colors, ops=op)
