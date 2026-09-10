@@ -147,27 +147,13 @@ def yolo_set_model(params={"model_name": "yolo11l-seg.pt",
 def set_dnn_pcd():
     logging.info(call_method("pcd", "set_backend",{
         "backend": "dnn",
-        "repo_dir": "./examples/14_iox2_dai_yolo_web_mjpeg/fast-foundationstereo",
-        "model_path": "weights/23-36-37/model_best_bp2_serialize.pth",
-        "model_dir": None,
-        "device": "cuda",
-        "valid_iters": 8,
-        "max_disp": 192,
-        "hiera": False,
-        "model_scale": 1,
-        "stereo_input_color_order": "RGB",
-        "remove_invisible": True
+        "depth_max_m": 2.0,
     }))
     
 def pcd_set_backend(backend="sgbm"):
     logging.info(call_method("pcd", "set_backend",{
         "backend": backend,
-        "valid_iters": 8,
-        "max_disp": 192,
-        "hiera": False,
-        "model_scale": 1,
-        "stereo_input_color_order": "RGB",
-        "remove_invisible": True
+        "depth_max_m": 2.0,
     }))
 
 def pcd_to_pcd(params):

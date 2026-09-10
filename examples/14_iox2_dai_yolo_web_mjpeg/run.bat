@@ -5,6 +5,10 @@ REM ============================================================================
 REM Configuration
 REM ============================================================================
 
+set IOX2_LOG_LEVEL=Fatal
+set IOX2_PAL_SILENT=1
+set IOX2_JSONRPC_FORCE_REMOVE_SERVICES=1
+
 set "APP_DIR=examples\14_iox2_dai_yolo_web_mjpeg"
 set "SERVER_DIR=%APP_DIR%\servers\server_"
 

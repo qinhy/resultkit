@@ -575,8 +575,8 @@ def split_cloud_uv(points_left: Any, uv: Any, rgb_image: Any,
     if (rgb_w, rgb_h) != detection_size:
         raise ValueError(f"RGB image size {(rgb_w, rgb_h)} differs from detection size {detection_size}")
     
-    u = op.astype_int64(op.round(rgb_uv[:, 0]))
-    v = op.astype_int64(op.round(rgb_uv[:, 1]))
+    u = ops.astype_int64(ops.round(uv[:, 0]))
+    v = ops.astype_int64(ops.round(uv[:, 1]))
     colors_rgb = rgb8(rgb_image[v, u, :3], order=rgb_image_color_order, ops=ops)
 
     output_dir = Path(output_dir)

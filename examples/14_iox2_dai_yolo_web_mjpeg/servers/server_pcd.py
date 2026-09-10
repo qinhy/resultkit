@@ -63,20 +63,9 @@ ALL_PCD_BACKENDS = {
         # "vpi": (MatLib.TORCH, MatDevice.CUDA, TorchMatOps(device=MatDevice.CUDA),VPIStereoDisparityGPU()),
     }
 
-
-@lru_cache(maxsize=None)
-def load_pcd_backend(name):
-    try:
-        module_name = PCD_BACKEND_MODULES[name]
-    except KeyError:
-        raise ValueError(f"Unsupported backend: {name}")
-
-    return importlib.import_module(module_name)
-
-
 Resolution = tuple[int, int]
 ColorOrder = Literal["RGB", "BGR"]
-DepthBackend = Literal["sgbm", "dnn", "vpi"]
+DepthBackend = Literal["sgbm","cpu","dnn","cuda","vpi"]
 OutputFrame = Literal["left", "left_rectified"]
 SegmentOutputFrame = Literal["rgb", "left"]
 TranslationUnit = Literal["m", "cm", "mm"]
@@ -84,11 +73,6 @@ YoloOverlapPolicy = Literal["highest_confidence", "first", "none"]
 Matrix3x3 = tuple[tuple[float, float, float], ...]
 Matrix4x4 = tuple[tuple[float, float, float, float], ...]
 DistortionCoefficients = tuple[float, ...]
-
-
-def _model_field_names(model_type: type[BaseModel]) -> tuple[str, ...]:
-    fields = getattr(model_type, "model_fields", None) or getattr(model_type, "__fields__", {})
-    return tuple(fields.keys())
 
 
 @dataclass(frozen=True)
@@ -171,18 +155,16 @@ class BackendOverrides(BaseModel):
     remove_invisible: bool | None = None
 
 
-BACKEND_KEYS = _model_field_names(BackendOverrides)
-
-
 class BackendParams(BackendOverrides):
     backend: DepthBackend = "dnn" #"sgbm"
-    device: str = "cuda"
-    valid_iters: int = 8
-    max_disp: int = 192
-    hiera: bool = False
-    model_scale: float = 1.0
-    stereo_input_color_order: ColorOrder = "RGB"
-    remove_invisible: bool = True
+    depth_max_m: float = 2.0
+    # device: str = "cuda"
+    # valid_iters: int = 8
+    # max_disp: int = 192
+    # hiera: bool = False
+    # model_scale: float = 1.0
+    # stereo_input_color_order: ColorOrder = "RGB"
+    # remove_invisible: bool = True
 
 
 class BackendStatusResult(BackendParams):
@@ -199,7 +181,6 @@ class ToPcdParams(BackendOverrides):
     rgb_path: str = ""
     calib_path: str = ""
     output_pcd_path: str = "colored_cloud.pcd"
-    calibration: DepthCalibrationParams | None = None
     input_color_order: ColorOrder = "BGR"
     rgb_image_is_undistorted: bool = False
     alpha: float = 0.0
@@ -234,12 +215,6 @@ class ToPcdParams(BackendOverrides):
                 param = ToPcdParams(rgb_path=str(rgb), left_path=str(l), right_path=str(r))
                 param.output_pcd_path = str(pcd_path/f"{cam_name}.pcd")
                 param.calib_path = calib_path / f"{cam_name}.json"
-                
-                # with open(calib_path / f"{cam_name}.json" ) as f:
-                #     calib = json.load(f)
-                #     allowed_fields = set(_model_field_names(DepthCalibrationParams))
-                #     calibration_data = {key: value for key, value in calib.items() if key in allowed_fields}
-                #     param.calibration = DepthCalibrationParams.model_validate(calibration_data)
 
                 res.append(param)
         return res
@@ -279,12 +254,6 @@ class ToYoloSegmentsParams(ToPcdParams):
                 seg_params.output_dir = output_dir
                 seg_params.calib_path = calib_path / f"{cam_name}.json"
                 seg_params.detection_path = list((yolo_path / cam_name).glob("*.json"))[0]
-                
-                # with open(calib_path / f"{cam_name}.json" ) as f:
-                #     calib:Dict = json.load(f)
-                #     allowed_fields = set(_model_field_names(DepthCalibrationParams))
-                #     calibration_data = {key: value for key, value in calib.items() if key in allowed_fields}
-                #     seg_params.calibration = DepthCalibrationParams.model_validate(calibration_data)
 
                 res.append(seg_params)
         return res
@@ -368,6 +337,7 @@ class PcdRunner:
     )
     hook_dispatcher: HookDispatcher = field(default_factory=HookDispatcher, repr=False)
     backend_name: str = field(default="cpu")
+    depth_max_m: float | None = field(default=None, init=False, repr=False)
 
     _dnn_predictor: Any | None = field(default=None, init=False, repr=False)
     _dnn_predictor_key: tuple[Any, ...] | None = field(default=None, init=False, repr=False)
@@ -413,10 +383,11 @@ class PcdRunner:
         with self._state_lock:
             return self._current_output_path, self._last_result, self._exception
 
-    def set_backend(self, name:Literal["cpu","dnn","cuda","vpi"]="cpu"):
+    def set_backend(self, name:Literal["cpu","dnn","cuda","vpi"]="cpu", depth_max_m:float=None):
         if name not in self._backends:
             raise ValueError(f"only supports {self._backends.keys()}, got {name}")
         self.backend_name = name
+        self.depth_max_m=depth_max_m
         self._backend_params = self._backends[name]
 
     def _set_state(self,*,
@@ -471,7 +442,7 @@ class PcdRunner:
         segments: bool = False,
     ):
         start_time = time.perf_counter()
-        min_disparity, max_depth_m, stride = 0.0, 5.0, 1
+        min_disparity, max_depth_m, stride = 0.0, self.depth_max_m, 1
         mathlib, calc_dev, op, disp_predictor = self._backend_params
         effective_min_disparity = max(0.5, float(min_disparity))
 
@@ -638,6 +609,7 @@ class PcdRunner:
                     op.to_numpy(rgb_img),
                     detections,
                     params.output_dir,
+                    rgb_image_color_order="RGB",
                     min_points=1,
                     erode_pixels=0,
                     exclusive=False,
@@ -674,12 +646,7 @@ class PcdRunner:
             self.input_queue.put_nowait(params)
         except Full:
             return PcdAsyncResult()
-            # return self._pcd_async_result(
-            #     params,
-            #     error=f"PCD queue is full (capacity={self.input_queue.maxsize})",
-            # )
         return PcdAsyncResult()
-        # return self._pcd_async_result(params, queued=True)
                 
 @dataclass
 class DepthController:
@@ -703,17 +670,14 @@ class DepthController:
     def status(self, params: EmptyParams) -> PcdStatusResult:
         return PcdStatusResult(msg=f"{self.runner.snapshot()}")
 
-    # def set_calibration(self, params: DepthCalibrationParams) -> SetDepthCalibrationResult:
-    #     return self.runner.set_calibration(params)
-
-    # def calibration(self, params: EmptyParams) -> SetDepthCalibrationResult:
-    #     return self.runner.calibration(params)
-
     def set_backend(self, params: BackendParams) -> BackendStatusResult:
-        return self.runner.set_backend(params)
+        backend = str(params.backend)
+        if backend == "sgbm":backend="cpu"
+        self.runner.set_backend(backend,params.depth_max_m)
+        return BackendStatusResult()
 
-    # def backend(self, params: EmptyParams) -> BackendStatusResult:
-    #     return self.runner.backend(params)
+    def backend(self, params: EmptyParams) -> BackendStatusResult:
+        return BackendStatusResult(backend=self.runner.backend_name)
 
     def to_pcd(self, params: ToPcdParams) -> PcdAsyncResult:
         has_db_record = bool(params.db_record)
@@ -757,15 +721,6 @@ class DepthController:
                 extra={"output_path": params.get_output_path()},
             )
             raise
-
-    # def to_pcd_status(self, params: EmptyParams) -> PcdAsyncResult:
-    #     return self.runner.to_pcd_status(params)
-
-    # def to_pcd_stop(self, params: EmptyParams) -> PcdAsyncResult:
-    #     return self.runner.to_pcd_stop(params)
-
-    # def to_pcd_sync(self, params: ToPcdParams) -> ToPcdResult:
-    #     return self.runner.convert_to_pcd_sync(params)
 
     def detect_segments_to_pcd(self, params: ToYoloSegmentsParams) -> ToDetectSegmentsResult:        
         has_db_record = bool(params.db_record)
