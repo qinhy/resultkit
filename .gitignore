@@ -189,3 +189,4 @@ examples/14_iox2_dai_yolo_web_mjpeg/fast-foundationstereo/
 tmp/
 *.pcd
 /libSGM
+/fast-foundationstereo
