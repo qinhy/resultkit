@@ -376,7 +376,9 @@ class StereoRectifier:
             R1, R2, P1, P2, Q,
             tuple(map(int, roi1)), tuple(map(int, roi2)),
         ).as_ops(self.ops)
-        self.left_remapper = self.right_remapper = None
+        r = self.rectification
+        self.left_remapper = BilinearRemap(r.left_map_x, r.left_map_y, r.image_size, self.ops)
+        self.right_remapper = BilinearRemap(r.right_map_x, r.right_map_y, r.image_size, self.ops)
         return self.rectification
 
     def rectify(self, left: ArrayLike, right: ArrayLike):
@@ -385,13 +387,10 @@ class StereoRectifier:
         if (lh, lw) != (rh, rw):
             raise ValueError(f'Left/right sizes differ: {(lw, lh)} != {(rw, rh)}')
         r = self.make((lw, lh))
-        if self.left_remapper is None:
-            self.left_remapper = BilinearRemap(r.left_map_x, r.left_map_y, r.image_size, self.ops)
-            self.right_remapper = BilinearRemap(r.right_map_x, r.right_map_y, r.image_size, self.ops)
         return (self.left_remapper.remap(left), self.right_remapper.remap(right), r)
 
 def rectified_left_to_original_left(points_rectified_m: ArrayLike, rectification: StereoRectification) -> ArrayLike:
-    ops = rectification.ops
+    ops:MatOps = rectification.ops
     p = ops.astype_float64(points_rectified_m)
     if ops.ndim(p) != 2 or ops.shape(p)[1] != 3:
         raise ValueError(f'points must be Nx3, got {ops.shape(p)}')
@@ -446,7 +445,7 @@ def project_points_to_rgb_pixels(
     rgb_image_is_undistorted: bool = False,
     only_inside: bool = True,
 ) -> tuple[ArrayLike, ArrayLike]:
-    ops = calibration.ops
+    ops:MatOps = calibration.ops
     rgb_h, rgb_w = ops.shape(rgb_image)[:2]
     K = scale_K(calibration.rgb_intrinsics, calibration.rgb_resolution, (rgb_w, rgb_h), ops)
     points_rgb = transform_points(points_left_m, calibration.left_to_rgb, ops)
@@ -467,11 +466,11 @@ def project_points_to_rgb_pixels(
     return rgb_uv, points_left_m
 
 def build_rgb_indexed_cloud(
-    left_image: np.ndarray, right_image: np.ndarray, rgb_image: np.ndarray,
-    calibration: StereoRgbCalibration, disparity_predictor: Any, *,
+    left_image: ArrayLike, right_image: ArrayLike, rgb_image: ArrayLike,
+    calibration: StereoRgbCalibration, disparity_predictor: DisparityPredictor, *,
     min_disparity=0, max_depth_m=5.0, stride=1, alpha=0.0,
     rgb_image_is_undistorted=False
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+):
     rectifier = calibration.get_rectifier(alpha)
     left, right, rect = rectifier.rectify(left_image, right_image)
     disparity = disparity_predictor.predict(left, right)
@@ -560,20 +559,22 @@ def split_cloud_uv(points_left: Any, uv: Any, rgb_image: Any,
 ) -> list[dict[str, Any]]:
     """Split a stereo 3D cloud using masks/detections in RGB-image coordinates."""
 
-    if not len(points_left):
+    if ops.shape(points_left)[0] == 0:
         raise RuntimeError("No 3D points project inside the RGB image")
-    if points_left.ndim != 2 or points_left.shape[1] != 3:
-        raise ValueError(f"points_left must be Nx3, got {points_left.shape}")
-    if uv.ndim != 2 or uv.shape[1] != 2:
-        raise ValueError(f"uv must be Nx2, got {uv.shape}")
-    if len(points_left) != len(uv):
-        raise ValueError(f"points_left and uv must have same length, got {len(points_left)} and {len(uv)}")
-    if rgb_image.ndim != 3 or rgb_image.shape[2] < 3:
-        raise ValueError(f"rgb_image must be HxWx3, got {rgb_image.shape}")
-    rgb_h, rgb_w = rgb_image.shape[:2]
-    detection_size = (int(detections_json["image_width"]), int(detections_json["image_height"]))
+    if ops.ndim(points_left) != 2 or ops.shape(points_left)[1] != 3:
+        raise ValueError(f"points_left must be Nx3, got {ops.shape(points_left)}")
+    if ops.ndim(uv) != 2 or ops.shape(uv)[1] != 2:
+        raise ValueError(f"uv must be Nx2, got {ops.shape(uv)}")
+    if ops.shape(points_left)[0] != ops.shape(uv)[0]:
+        raise ValueError(f"points_left and uv must have same length, got "
+            f"{ops.shape(points_left)[0]} and {ops.shape(uv)[0]}")
+    if ops.ndim(rgb_image) != 3 or ops.shape(rgb_image)[2] < 3:
+        raise ValueError(f"rgb_image must be HxWx3, got {ops.shape(rgb_image)}")
+    rgb_h, rgb_w = ops.shape(rgb_image)[:2]
+    detection_size = (int(detections_json["image_width"]),int(detections_json["image_height"]))
     if (rgb_w, rgb_h) != detection_size:
-        raise ValueError(f"RGB image size {(rgb_w, rgb_h)} differs from detection size {detection_size}")
+        raise ValueError(f"RGB image size {(rgb_w, rgb_h)} differs from "
+            f"detection size {detection_size}")
     
     u = ops.astype_int64(ops.round(uv[:, 0]))
     v = ops.astype_int64(ops.round(uv[:, 1]))
@@ -602,7 +603,7 @@ def split_cloud_uv(points_left: Any, uv: Any, rgb_image: Any,
                 f"Detection {detection_index} mask has shape {mask.shape}, expected {(rgb_h, rgb_w)}"
             )
         if kernel is not None:
-            mask = cv2.erode(mask.astype(np.uint8), kernel).astype(bool)
+            mask = ops.from_numpy(cv2.erode(mask.astype(np.uint8), kernel).astype(bool))
 
         covered = mask[v, u]
         union |= covered
@@ -660,61 +661,79 @@ if __name__ == "__main__":
                                     FastFoundationStereoDisparity,
                                     SGBMDisparityPredictorCuda,
                                     VPIStereoDisparityGPU)
-    OPS: dict[tuple[str,str,str], tuple[MatOps,DisparityPredictor]] = {
-        # (MatLib.NUMPY, MatDevice.CPU): NumpyMatOps(),
-        ("cpu", MatLib.TORCH, MatDevice.CPU):  (TorchMatOps(),SGBMDisparityPredictor()),
-        ("dnn", MatLib.TORCH, MatDevice.CUDA): (TorchMatOps(device=MatDevice.CUDA),FastFoundationStereoDisparity(
-            repo_dir="./fast-foundationstereo",
-            model_path="weights/23-36-37/model_best_bp2_serialize.pth",
-        )),
-        ("cuda", MatLib.TORCH, MatDevice.CUDA): (TorchMatOps(device=MatDevice.CUDA),SGBMDisparityPredictorCuda(
-            width=1280,height=800,
-        )),
-        # ("vpi", MatLib.TORCH, MatDevice.CUDA): (TorchMatOps(device=MatDevice.CUDA),VPIStereoDisparityGPU()),
-    }
-
-    for (name, lib, device), (op,disp_predictor) in OPS.items():
+    
+    ALL_PCD_BACKENDS:dict[str,tuple[MatLib,MatDevice,MatOps,DisparityPredictor]] = {
+            "cpu": (MatLib.TORCH, MatDevice.CPU,  TorchMatOps(),SGBMDisparityPredictor()),
+            "dnn": (MatLib.TORCH, MatDevice.CUDA, TorchMatOps(device=MatDevice.CUDA),FastFoundationStereoDisparity(
+                        repo_dir="./fast-foundationstereo",
+                        model_path="weights/23-36-37/model_best_bp2_serialize.pth",
+                    )),
+            "cuda": (MatLib.TORCH, MatDevice.CUDA,TorchMatOps(device=MatDevice.CUDA),SGBMDisparityPredictorCuda(
+                        width=1280,height=800,
+                    )),
+            # "vpi": (MatLib.TORCH, MatDevice.CUDA, TorchMatOps(device=MatDevice.CUDA),VPIStereoDisparityGPU()),
+        }
+    
+    for name, (matlib,device,ops,disp_predictor) in ALL_PCD_BACKENDS.items():
         print()
         print('=' * 80)
-        print(f'Testing: {lib} / {device}')
+        print(f'Testing: {matlib} / {device}')
         print('=' * 80)
         try:
-            min_disparity = 0.0
-            max_depth_m = 5.0
-            stride=1
-            alpha=0.0
+            # Config
+            root: Path = Path("./")
+            img_dir: Path = root / "imgs/rgbd_left"
+            calib_path: Path = root / "calib/rgbd_left.json"
+            output_path: Path = root / f"{name}.pcd"
 
-            root = Path("./")
-            calib_json = json.loads(((root/"calib"/"rgbd_left.json").read_text()))
-            calib = StereoRgbCalibration.from_dict(calib_json, ops=op)
-            rectifier = StereoRectifier(calib, ops=op)
-            rect = rectifier.make(calib.left_resolution)
-            
-            left_img = read_image(root/"imgs"/"rgbd_left"/"left.jpg",ops=op,color="gray")
-            right_img = read_image(root/"imgs"/"rgbd_left"/"right.jpg",ops=op,color="gray")
-            left_rect, right_rect, rect = rectifier.rectify(left_img,right_img)
-            disparity = disp_predictor.predict(left_rect, right_rect)
-            points_rect, _ = rect.disparity_to_points_rectified(
-                disparity, min_disparity=max(0.5, float(min_disparity)),
-                max_depth_m=max_depth_m, stride=stride,
+            min_disparity: float = 0.5
+            max_depth_m: float = 5.0
+            stride: int = 1
+            binary: bool = True
+
+            # Calibration
+            calib = StereoRgbCalibration.from_dict(
+                json.loads(calib_path.read_text()), ops=ops
+            )
+            rectifier = StereoRectifier(calib, ops=ops)
+
+            # Stereo
+            left  = read_image(img_dir / "left.jpg", ops=ops, color="gray")
+            right = read_image(img_dir / "right.jpg", ops=ops, color="gray")
+            left, right, rect = rectifier.rectify(left, right)
+
+            # Disparity -> 3D
+            disparity = disp_predictor.predict(left, right)
+            points, _ = rect.disparity_to_points_rectified(
+                disparity,
+                min_disparity=min_disparity,
+                max_depth_m=max_depth_m,
+                stride=stride,
             )
 
-            if len(points_rect) == 0: 
-                points_left,rgb_uv = None,None
-            else:
-                points_left = rectified_left_to_original_left(points_rect, rect)
-                rgb_image = read_image(root/"imgs"/"rgbd_left"/"rgb.jpg",ops=op,color="RGB")
-                rgb_uv, points_left = project_points_to_rgb_pixels(
-                    points_left, rgb_image, calib,
-                    rgb_image_is_undistorted=False,
-                    only_inside=True,
-                )
-            if len(points_left) == 0: raise RuntimeError("No 3D points project inside the RGB image")            
-            sampled_u = op.astype_int64(op.round(rgb_uv[:, 0]))
-            sampled_v = op.astype_int64(op.round(rgb_uv[:, 1]))
-            sampled_colors = rgb_image[sampled_v, sampled_u, :3]
-            colors_rgb8 = rgb8(sampled_colors,ops=op)
-            output_path = name+".pcd" # f"{lib}{device}{op}{disp_predictor}.pcd".replace(":","").replace("<","").replace(">","")
-            save_pcd(output_path, points_left, colors_rgb8, ops=op, binary=True)
+            if not len(points):
+                raise RuntimeError("No valid 3D points")
+
+            points = rectified_left_to_original_left(points, rect)
+
+            # RGB projection
+            rgb = read_image(img_dir / "rgb.jpg", ops=ops, color="RGB")
+            uv, points = project_points_to_rgb_pixels(
+                points, rgb, calib,
+                rgb_image_is_undistorted=False,
+                only_inside=True,
+            )
+
+            if not len(points):
+                raise RuntimeError("No 3D points inside RGB image")
+
+            # Color
+            u = ops.astype_int64(ops.round(uv[:, 0]))
+            v = ops.astype_int64(ops.round(uv[:, 1]))
+            colors = rgb8(rgb[v, u, :3], ops=ops)
+
+            # Save
+            save_pcd(output_path, points, colors, ops=ops, binary=binary)
+
         except Exception as e:
-            print(f'FAILED: {type(e).__name__}: {e}')
+            print(f"FAILED: {type(e).__name__}: {e}")

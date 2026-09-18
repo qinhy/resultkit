@@ -69,6 +69,7 @@ def last_capture_record(store_name:str="store_dual")->CustomRecord:
     res = store_status["last_capture"]["captures"][-1]["db_record"]
     return CustomRecord(**res)
 
+
 def last_capture_record_rgb(store_name:str="store_dual"):
     store_status = call_localhost(store_name,"status")
     res = store_status["last_capture"]["captures"][-1]["db_record"]
@@ -80,6 +81,7 @@ def last_capture_record_rgb(store_name:str="store_dual"):
             detail=f"File not found: {file_path}",
         )
     return FileResponse(file_path)
+
 
 def last_ai_records()->List[Dict]:
     store_status = call_localhost("yolo","status")
