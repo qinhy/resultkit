@@ -305,7 +305,7 @@ if __name__ == "__main__":
 
     parser.add_argument(
         "--backend",
-        choices=["sgbm", "dnn"],
+        # choices=["sgbm", "dnn", "vpi"],
         default=None,
         help="Set PCD backend"
     )
